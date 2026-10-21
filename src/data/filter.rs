@@ -7,6 +7,8 @@
 //! t["VDD_LEAK"] between 0 and 1  # test by name
 //! wafer ~ "^W0[1-3]$"            # regex match
 //! $match and not pass            # named part set (e.g. from matching two files)
+//! fail(1013) and n_fails = 1     # parts that failed test 1013 (and only that test)
+//! first_fail = 1013              # parts whose first failing test is 1013
 //! ```
 //!
 //! Fields: part_id, file, head, site, x, y, xy, hbin, sbin, pass, fail,
@@ -139,6 +141,8 @@ pub enum Expr {
     Regex(Operand, Regex, bool),
     Const(bool),
     Set(Arc<Vec<bool>>),
+    /// part failed any of these tests (tester flag or outside limits)
+    Fails(Vec<usize>),
 }
 
 /// Compiled filter bound to a dataset's test table.
@@ -313,6 +317,36 @@ impl<'a> Parser<'a> {
             self.i += 1;
             return Ok(Expr::Const(false));
         }
+        if (self.is_kw("fail") || self.is_kw("fails") || self.is_kw("failed"))
+            && matches!(self.t.get(self.i + 1), Some(Tok::Sym(s)) if s == "(")
+        {
+            self.i += 2;
+            let mut tests = vec![];
+            loop {
+                let q = match self.next() {
+                    Some(Tok::Num(_, s)) | Some(Tok::Str(s)) | Some(Tok::Ident(s)) => s,
+                    other => bail!("expected a test number or name in fail(...), got {other:?}"),
+                };
+                let hits: Vec<usize> = match q.parse::<u32>() {
+                    // every test with that number (MPR pins share it)
+                    Ok(n) => (0..self.ds.n_tests())
+                        .filter(|&t| self.ds.tests[t].num == n)
+                        .collect(),
+                    Err(_) => self.ds.find_test(&q).into_iter().collect(),
+                };
+                if hits.is_empty() {
+                    bail!("unknown test '{q}' in fail(...)");
+                }
+                tests.extend(hits);
+                if self.is_sym(",") {
+                    self.i += 1;
+                    continue;
+                }
+                break;
+            }
+            self.expect_sym(")")?;
+            return Ok(Expr::Fails(tests));
+        }
         if let Some(Tok::Set(name)) = self.peek().cloned() {
             self.i += 1;
             let set = (self.sets)(&name).ok_or_else(|| {
@@ -436,6 +470,10 @@ fn eval(e: &Expr, ds: &Dataset, row: usize) -> bool {
     match e {
         Expr::Const(b) => *b,
         Expr::Set(s) => s.get(row).copied().unwrap_or(false),
+        Expr::Fails(ts) => ts.iter().any(|&t| {
+            let v = ds.value(t, row);
+            ds.parts[row].has_fail(t) || (v.is_finite() && !ds.tests[t].within_limits(v))
+        }),
         Expr::And(a, b) => eval(a, ds, row) && eval(b, ds, row),
         Expr::Or(a, b) => eval(a, ds, row) || eval(b, ds, row),
         Expr::Not(a) => !eval(a, ds, row),

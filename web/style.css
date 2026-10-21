@@ -220,3 +220,4 @@ dialog.dlg { border: 1px solid var(--border); border-radius: 12px; background: v
 dialog.dlg::backdrop { background: rgba(0,0,0,.35); }
 .help code { white-space: nowrap; }
 [hidden] { display: none !important; }
+#ds { max-width: 280px; text-overflow: ellipsis; }

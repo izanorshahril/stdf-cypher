@@ -80,6 +80,8 @@ pub struct Part {
     pub first_fail: Option<u32>,
     /// tests whose result carried the alarm flag (TEST_FLG bit 0)
     pub alarms: Vec<u32>,
+    /// tests the tester flagged as failed for this part
+    pub fails: Vec<u32>,
 }
 
 impl Part {
@@ -88,6 +90,9 @@ impl Part {
     }
     pub fn has_alarm(&self, t: usize) -> bool {
         self.alarms.contains(&(t as u32))
+    }
+    pub fn has_fail(&self, t: usize) -> bool {
+        self.fails.contains(&(t as u32))
     }
 }
 
@@ -160,8 +165,26 @@ impl FieldValue {
 }
 
 pub const PART_FIELDS: &[&str] = &[
-    "part_id", "file", "head", "site", "x", "y", "hbin", "sbin", "pass", "wafer", "lot",
-    "num_test", "test_t", "part_txt", "index", "xy", "retest", "alarm",
+    "part_id",
+    "file",
+    "head",
+    "site",
+    "x",
+    "y",
+    "hbin",
+    "sbin",
+    "pass",
+    "wafer",
+    "lot",
+    "num_test",
+    "test_t",
+    "part_txt",
+    "index",
+    "xy",
+    "retest",
+    "alarm",
+    "first_fail",
+    "n_fails",
 ];
 
 impl Dataset {
@@ -299,6 +322,11 @@ impl Dataset {
             "index" | "row" => FieldValue::Num(row as f64),
             "retest" => FieldValue::Bool(p.part_flg & 0x03 != 0),
             "alarm" => FieldValue::Bool(!p.alarms.is_empty()),
+            "first_fail" => p
+                .first_fail
+                .map(|f| FieldValue::Num(self.tests[f as usize].num as f64))
+                .unwrap_or(FieldValue::Missing),
+            "n_fails" => FieldValue::Num(p.fails.len() as f64),
             _ => FieldValue::Missing,
         }
     }
@@ -447,6 +475,9 @@ impl Dataset {
                 }
                 p.first_fail = p.first_fail.map(|f| tmap[f as usize] as u32);
                 p.alarms
+                    .iter_mut()
+                    .for_each(|a| *a = tmap[*a as usize] as u32);
+                p.fails
                     .iter_mut()
                     .for_each(|a| *a = tmap[*a as usize] as u32);
                 out.parts.push(p);

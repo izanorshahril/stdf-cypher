@@ -333,15 +333,19 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                 }
             }
             first_mpr = false;
-            // traceability datalog: a unique wafer+X/Y code, then wafer, X and Y
+            // traceability datalog: a unique wafer+X/Y code, then wafer and the die
+            // position inside its 4x4 reticle plus the reticle offset (X = raw + offset)
             for (site, x, y, _, _, _) in &results {
                 let code =
                     (wi as f64 + 1.0) * 10000.0 + (*x as f64 + 50.0) * 100.0 + (*y as f64 + 50.0);
+                let (ox, oy) = (x.div_euclid(4) * 4, y.div_euclid(4) * 4);
                 for (num, name, v) in [
                     (500, "DIE_ID", code),
-                    (501, "WAFER_NUM", wi as f64 + 1.0),
-                    (502, "DIE_X", *x as f64),
-                    (503, "DIE_Y", *y as f64),
+                    (80100, "WAFER_NUM", wi as f64 + 1.0),
+                    (80101, "DIE_X_RAW", (*x - ox) as f64),
+                    (80102, "DIE_Y_RAW", (*y - oy) as f64),
+                    (80103, "RETICLE_OX", ox as f64),
+                    (80104, "RETICLE_OY", oy as f64),
                 ] {
                     w.write(&Record::PTR(Ptr {
                         test_num: num,

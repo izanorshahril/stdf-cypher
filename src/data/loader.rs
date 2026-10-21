@@ -39,6 +39,7 @@ struct Pending {
     results: Vec<(u32, f32)>,
     first_fail: Option<u32>,
     alarms: Vec<u32>,
+    fails: Vec<u32>,
 }
 
 struct Builder<'o> {
@@ -190,6 +191,9 @@ impl<'o> Builder<'o> {
         p.results.push((t as u32, value));
         if alarm {
             p.alarms.push(t as u32);
+        }
+        if failed && !p.fails.contains(&(t as u32)) {
+            p.fails.push(t as u32);
         }
         if failed && p.first_fail.is_none() {
             p.first_fail = Some(t as u32);
@@ -420,6 +424,7 @@ impl<'o> Builder<'o> {
                     part_txt: p.part_txt,
                     first_fail: pend.first_fail,
                     alarms: pend.alarms,
+                    fails: pend.fails,
                 });
             }
             _ => {}
@@ -520,6 +525,12 @@ impl<'o> Builder<'o> {
                     let r = remap[f as usize];
                     (r != u32::MAX).then_some(r)
                 });
+                p.fails = p
+                    .fails
+                    .iter()
+                    .map(|&a| remap[a as usize])
+                    .filter(|&r| r != u32::MAX)
+                    .collect();
                 p.alarms = p
                     .alarms
                     .iter()

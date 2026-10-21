@@ -128,13 +128,14 @@ stdf-cypher ml explain lot.stdf --target hbin
 
 | Syntax | Example |
 |---|---|
-| Fields | `part_id file head site x y xy hbin sbin pass fail wafer lot sublot num_test test_t part_txt index retest alarm` |
+| Fields | `part_id file head site x y xy hbin sbin pass fail wafer lot sublot num_test test_t part_txt index retest alarm first_fail n_fails` |
 | Test values | `t[1000]` (test number), `t["VDD_LEAK"]` (name), `t["1000:VDD_LEAK"]` (key) |
 | Comparison | `=  ==  !=  <  <=  >  >=` |
 | Sets / ranges | `hbin in (2, 5..9)`, `site not in (3)`, `t[1000] between 0.1 and 0.4` |
 | Regex | `wafer ~ "W0[1-3]$"`, `part_txt !~ "RETEST"` |
 | List file | `part_id in @ids.txt` (one value per line, `#` comments allowed) |
 | Boolean | `and or not ( )`, also `&& || !`; bare `pass` / `fail` / `retest` / `alarm` (any test with the TEST_FLG alarm bit) |
+| Failed tests | `fail(1013)` (failed test 1013: tester flag or outside limits), `fail(1013, 1020)`, `first_fail = 1013`, `fail(1013) and n_fails = 1` (failed only that test) |
 | Part sets | `$match`, `not $match and pass`: parts matched to another file in *Match & trace* (dashboard only) |
 
 ## Dashboard views
@@ -145,9 +146,10 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
 * **Overview**: KPIs, hard/soft-bin pareto, yield by site/wafer/file, stacked bin map, fail pareto (click a test to open it), bins, source files
 * **Chart options** (every chart view): axis range *within limits*, *results* or *both (adaptive)*; 2D or 3D (overlaid histograms become bar layers, series get their own depth lane, test-value wafer maps become surfaces); opacity for overlapping layers. Parts can be coloured good/bad, by alarm, by test site, bin, wafer or file.
 * **Test explorer**: searchable test list; histogram, box, CDF and trend coloured by any factor; per-group stats; scatter against a second test
-* **Wafer maps**: gallery or single wafer, coloured by hard bin, soft bin, pass/fail or any test value. Die coordinates come from PRR X/Y + WIR, or are **rebuilt from datalogged tests** (e.g. wafer, X, Y in tests 501, 502, 503)
+* **Wafer maps**: gallery or single wafer, coloured by hard bin, soft bin, pass/fail or any test value. Die coordinates come from PRR X/Y + WIR, or are **rebuilt from datalogged tests**: wafer, X, Y and X/Y offsets (defaults 80100–80104, die X = X + offset; subtract and flip X/Y are available)
 * **Compare**: file A vs file B, or group vs rest (within the current filter); volcano plot, bin deltas, per-test table, click for overlay histogram/CDF/box
-* **Match & trace**: find the same physical parts in two files by PRR part text, part ID, X/Y, wafer + X/Y, or datalogged PTR results (one test with a unique code, or several tests such as wafer/X/Y; each file can use different test numbers). Creates a `$name` part set in both files; from there: analyse matched/unmatched parts, compare matched vs unmatched within a file, split a file into matched/unmatched STDFs, a **dual view** (test X of file A against test Y of file B over the same units: two histograms, a paired scatter and a per-unit difference), and **trace** one unit to see all its results in both files side by side
+* **Marker candidates** (top of every Compare): every test ranked at once by how well it separates the affected group (B) from the reference (A): rank AUC, robust shift, KS, Mann–Whitney q, Levene p, share beyond ±3σ of the reference, and a class-balanced random forest (importance weighted by the model's hold-out skill). With *same units in file* (group mode, or *Find marker tests* in Match & trace) it adds per-unit drift between the two files, the residual from the reference file-1 → file-2 fit, and the correlation break. Top-10 lists per view, top-candidate overlays, a per-part ±3σ outlier count, CSV export
+* **Match & trace**: find the same physical parts in two files by PRR part text, part ID, X/Y, wafer + X/Y, or datalogged PTR results (one test with a unique code, or several tests such as wafer/X/Y; each file can use different test numbers). Each side has a quick filter (good/bad/bin 1 parts failing a given test). Creates a `$name` part set in both files; from there: **find marker tests** (matched vs unmatched within that side's filter, with drift against the other file), create **matched / unmatched datasets** and compare them, analyse matched/unmatched parts, compare matched vs unmatched within a file, split a file into matched/unmatched STDFs, a **dual view** (test X of file A against test Y of file B over the same units: two histograms, a paired scatter and a per-unit difference), and **trace** one unit to see all its results in both files side by side
 * **Correlation**: unit correlation (tester ↔ tester), test-to-test matrix, drivers of a target
 * **ANOVA**: effect sizes; click a test for group means and box plots
 * **Abnormal parts**: all five detectors, anomaly wafer map, per-part drill-down, "use as filter"

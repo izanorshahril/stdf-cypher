@@ -93,8 +93,8 @@ fn dataset_shape_limits_and_multipin() {
     let d = tempfile::tempdir().unwrap();
     let ds = load(&gen(d.path(), "a.stdf", SampleSpec::default()));
     assert_eq!(ds.wafers.len(), 3);
-    // 40 PTR tests + 4 traceability PTRs + 4 MPR pins + 1 FTR
-    assert_eq!(ds.n_tests(), 49);
+    // 40 PTR tests + 6 traceability PTRs + 4 MPR pins + 1 FTR
+    assert_eq!(ds.n_tests(), 51);
     let t = ds.find_test("1000").unwrap();
     assert!(ds.tests[t].lo.is_some() && ds.tests[t].hi.is_some());
     assert_eq!(ds.tests[t].units, "uA");
@@ -498,7 +498,7 @@ fn match_trace_and_split_by_identity() {
     for (ka, kb) in [
         ("part_txt", "part_txt"),
         ("tests:500", "500"),
-        ("501,502,503", "wafer_xy"),
+        ("80100,80101,80102", "wafer_xy"),
     ] {
         let m = api::run(
             &reg,
@@ -517,7 +517,7 @@ fn match_trace_and_split_by_identity() {
     let m = api::run(
         &reg,
         "match",
-        &json!({"a": 0, "b": 1, "key_a": "500", "filter_b": "t[501] = 1", "name": "w1"}),
+        &json!({"a": 0, "b": 1, "key_a": "500", "filter_b": "t[80100] = 1", "name": "w1"}),
     )
     .unwrap();
     let matched = m["matched_a"].as_u64().unwrap() as usize;
@@ -570,11 +570,11 @@ fn match_trace_and_split_by_identity() {
     // split by a pasted part list and by a PTR value
     let r = api::run(&reg, "split", &json!({"ds": 0, "by": "list", "list_key": "part_id", "list": "1\n2, 3", "rest": "", "out_dir": out.to_string_lossy(), "prefix": "l"})).unwrap();
     assert_eq!(r["outputs"][0]["parts"], 3);
-    let r = api::run(&reg, "split", &json!({"ds": 0, "by": "test", "test": "501", "out_dir": out.to_string_lossy(), "prefix": "w"})).unwrap();
+    let r = api::run(&reg, "split", &json!({"ds": 0, "by": "test", "test": "80100", "out_dir": out.to_string_lossy(), "prefix": "w"})).unwrap();
     assert_eq!(r["outputs"].as_array().unwrap().len(), 3);
 
     // wafer maps rebuilt from logged wafer/X/Y tests
-    let w = api::run(&reg, "chart", &json!({"ds": 0, "kind": "wafer", "coords": "tests", "wafer_test": "501", "x_test": "502", "y_test": "503"})).unwrap();
+    let w = api::run(&reg, "chart", &json!({"ds": 0, "kind": "wafer", "coords": "tests", "wafer_test": "80100", "x_test": "80101", "y_test": "80102", "ox_test": "80103", "oy_test": "80104"})).unwrap();
     assert_eq!(w["wafers"], json!(["1", "2", "3"]));
     assert_eq!(w["maps"].as_array().unwrap().len(), 3);
 
@@ -612,4 +612,115 @@ fn match_trace_and_split_by_identity() {
     assert!(h["hist"]["layout"]["xaxis"]["range"].is_array());
     let alarms: usize = ds0.parts.iter().filter(|p| !p.alarms.is_empty()).count();
     assert!(alarms > 0, "sample sets some alarm flags");
+}
+
+#[test]
+fn marker_tests_fail_filters_and_offset_wafer_maps() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let a = gen(d.path(), "s1.stdf", SampleSpec::default());
+    let b = gen(
+        d.path(),
+        "s2.stdf",
+        SampleSpec {
+            meas_noise: 0.3,
+            ..SampleSpec::default()
+        },
+    );
+    let reg = api::Registry::app();
+    api::run(
+        &reg,
+        "load",
+        &json!({"paths": [a.to_string_lossy(), b.to_string_lossy()]}),
+    )
+    .unwrap();
+    let ds = reg.get(0).unwrap().0;
+
+    // fail(...) / first_fail / n_fails
+    let t = ds.find_test("1160").unwrap();
+    let expect = (0..ds.n_parts())
+        .filter(|&r| {
+            let v = ds.value(t, r);
+            ds.parts[r].has_fail(t) || (v.is_finite() && !ds.tests[t].within_limits(v))
+        })
+        .count();
+    assert!(expect > 0);
+    assert_eq!(reg.rows(0, &ds, "fail(1160)").unwrap().len(), expect);
+    let first = reg.rows(0, &ds, "first_fail = 1160").unwrap();
+    assert!(!first.is_empty() && first.len() <= expect);
+    assert!(
+        reg.rows(0, &ds, "fail(1160) and n_fails = 1")
+            .unwrap()
+            .len()
+            <= expect
+    );
+    assert!(reg.rows(0, &ds, "fail(999999)").is_err());
+
+    // workflow: bin-1 parts of file 1 matched to parts of file 2 that fail a test
+    let m = api::run(&reg, "match", &json!({"a": 0, "b": 1, "key_a": "part_txt", "filter_a": "hbin = 1", "filter_b": "not pass", "name": "became_bad"})).unwrap();
+    let affected = m["matched_a"].as_u64().unwrap() as usize;
+    assert!(affected > 0, "some bin-1 parts fail on the second file");
+    // two new datasets from the match, then compare them
+    let s1 = api::run(
+        &reg,
+        "subset_ds",
+        &json!({"ds": 0, "filter": "hbin = 1 and $became_bad", "name": "affected"}),
+    )
+    .unwrap();
+    let s2 = api::run(
+        &reg,
+        "subset_ds",
+        &json!({"ds": 0, "filter": "hbin = 1 and not $became_bad", "name": "unaffected"}),
+    )
+    .unwrap();
+    assert_eq!(s1["parts"].as_u64().unwrap() as usize, affected);
+    let mk = api::run(
+        &reg,
+        "markers",
+        &json!({"mode": "datasets", "a": s2["id"], "b": s1["id"], "trees": 30}),
+    )
+    .unwrap();
+    assert_eq!(mk["n_aff"].as_u64().unwrap() as usize, affected);
+    assert!(mk["rows"].as_array().unwrap().len() > 30);
+    assert!(
+        api::run(&reg, "records", &json!({"ds": s1["id"]})).is_err(),
+        "derived datasets have no file"
+    );
+
+    // a planted marker must come out on top: affected = top 4% of test 1050 (one wafer-sort test)
+    let t1050 = ds.find_test("1050").unwrap();
+    let mut v = ds.values_of(t1050, None);
+    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let cut = v[(v.len() as f64 * 0.96) as usize];
+    let sel = format!("t[1050] > {cut}");
+    let mk = api::run(&reg, "markers", &json!({"mode": "group", "a": 0, "select": sel, "vs": format!("not ({sel})"), "later": 1, "key_a": "part_txt", "trees": 40})).unwrap();
+    let top = &mk["rows"][0];
+    assert_eq!(top["num"], 1050, "planted marker ranks first: {top}");
+    assert!(top["separation"].as_f64().unwrap() > 0.9);
+    assert!(
+        top["drift_sep"].is_number() && top["r_ref"].is_number(),
+        "drift view uses the later file"
+    );
+    assert!(mk["forest_auc"].as_f64().unwrap() > 0.9);
+    assert_eq!(mk["figures"]["top"].as_array().unwrap().len(), 6);
+
+    // wafer maps from logged wafer / raw X,Y + offsets reproduce the PRR die grid
+    let w = api::run(&reg, "chart", &json!({"ds": 0, "kind": "wafer", "coords": "tests", "wafer": "1", "wafer_test": "80100", "x_test": "80101", "y_test": "80102", "ox_test": "80103", "oy_test": "80104"})).unwrap();
+    let xs = w["maps"][0]["figure"]["data"][0]["x"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let minx = ds.parts.iter().map(|p| p.x).min().unwrap();
+    let maxx = ds.parts.iter().map(|p| p.x).max().unwrap();
+    assert_eq!(xs.first().unwrap().as_i64().unwrap(), minx as i64);
+    assert_eq!(xs.last().unwrap().as_i64().unwrap(), maxx as i64);
+    let raw = api::run(&reg, "chart", &json!({"ds": 0, "kind": "wafer", "coords": "tests", "wafer": "1", "wafer_test": "80100", "x_test": "80101", "y_test": "80102"})).unwrap();
+    assert_eq!(
+        raw["maps"][0]["figure"]["data"][0]["x"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4,
+        "without offsets only the 4 reticle columns remain"
+    );
 }

@@ -295,7 +295,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             let v = reg.items.read().unwrap();
             Ok(json!(v.iter().enumerate().filter_map(|(i, e)| e.as_ref().map(|e| json!({
                 "id": i, "name": e.name, "paths": e.paths, "n_parts": e.ds.n_parts(), "n_tests": e.ds.n_tests(),
-                "yield": n(e.ds.yield_pct(&e.ds.all_rows())), "wafers": e.ds.wafers, "files": e.ds.sources.len(),
+                "yield": n(e.ds.yield_pct(&e.ds.all_rows())), "wafers": e.ds.wafers, "files": e.ds.sources.len(), "derived": e.paths.is_empty(),
                 "lots": e.ds.sources.iter().map(|s| s.lot_id.clone()).collect::<Vec<_>>(),
             }))).collect::<Vec<_>>()))
         }
@@ -691,6 +691,8 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "match" => match_op(reg, &pp),
         "match_dual" => match_dual_op(reg, &pp),
         "trace" => trace_op(reg, &pp),
+        "markers" => markers_op(reg, &pp),
+        "subset_ds" => subset_op(reg, &pp),
         "part_detail" => {
             let id = pp.usize("ds", 0);
             let (ds, _) = reg.get(id)?;
@@ -1058,9 +1060,32 @@ fn chart(reg: &Registry, pp: &P) -> Result<Value> {
             } else {
                 Some(test_ref(&ds, &wq).context("wafer test")?)
             };
+            // optional per-part offsets (e.g. reticle / stepping origin logged next to X/Y)
+            let opt_test = |k: &str, what: &str| -> Result<Option<usize>> {
+                let q = pp.str(k);
+                if q.trim().is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(test_ref(&ds, &q).context(what.to_string())?))
+                }
+            };
+            let tox = opt_test("ox_test", "X offset test")?;
+            let toy = opt_test("oy_test", "Y offset test")?;
+            let sign = if pp.str("offset_mode") == "sub" {
+                -1.0
+            } else {
+                1.0
+            };
+            let (fx, fy) = (pp.bool("flip_x", false), pp.bool("flip_y", false));
             let coord = |row: usize| -> Option<(i16, i16)> {
-                let (x, y) = (ds.value(tx, row), ds.value(ty, row));
+                let off = |t: Option<usize>| match t {
+                    Some(t) => ds.value(t, row),
+                    None => 0.0,
+                };
+                let x = ds.value(tx, row) + sign * off(tox);
+                let y = ds.value(ty, row) + sign * off(toy);
                 let ok = |v: f64| v.is_finite() && v.abs() < 32767.0;
+                let (x, y) = (if fx { -x } else { x }, if fy { -y } else { y });
                 (ok(x) && ok(y)).then(|| (x.round() as i16, y.round() as i16))
             };
             let mut by_wafer: IndexMap<String, Vec<usize>> = IndexMap::new();
@@ -1242,6 +1267,9 @@ fn u4_at(d: &[u8], o: usize, e: crate::stdf::Endian) -> Option<u32> {
 /// Source file of a dataset and the dataset row of that file's first PRR,
 /// when rows map 1:1 to the file's PRRs (no de-duplication).
 fn file_of(ds: &Dataset, paths: &[String], file: usize) -> Result<(String, Option<usize>)> {
+    if paths.is_empty() {
+        bail!("this dataset was created in the app, so it has no STDF file to read raw records from; use the dataset it came from");
+    }
     let path = paths
         .get(file)
         .cloned()
@@ -1645,6 +1673,189 @@ fn trace_op(reg: &Registry, pp: &P) -> Result<Value> {
         "b": match (&side_b, rb) { (Some((d, _)), Some(r)) => part_json(d, r), _ => Value::Null },
         "b_hits": side_b.as_ref().map(|s| s.1.clone()).unwrap_or_default(),
         "tests": tests,
+    }))
+}
+
+/// A new in-memory dataset holding the parts of `ds` that match `filter`
+/// (e.g. `$match` / `not $match`). It has no source file of its own, so raw
+/// records and STDF split are not available on it.
+fn subset_op(reg: &Registry, pp: &P) -> Result<Value> {
+    let id = pp.usize("ds", 0);
+    let (ds, _) = reg.get(id)?;
+    let filter = pp.str("filter");
+    let r = reg.rows(id, &ds, &filter)?;
+    if r.is_empty() {
+        bail!("no parts match '{filter}'");
+    }
+    let mut sub = ds.subset(&r);
+    let name = pp.str_or("name", &format!("{} [{filter}]", reg.name(id)));
+    sub.name = name.clone();
+    let new_id = reg.add(name.clone(), vec![], sub);
+    Ok(json!({"id": new_id, "name": name, "parts": r.len()}))
+}
+
+/// Marker tests: affected group (B / `select`) against a reference group
+/// (A / `vs`), optionally with the same units in a later file for drift.
+fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::analysis::markers::{self, Group, Later, MarkerOptions};
+    let a_id = pp.usize("a", 0);
+    let (da, _) = reg.get(a_id)?;
+    let mode = pp.str_or("mode", "datasets");
+    let (db, ra, rb, la, lb) = if mode == "group" {
+        let sel = pp.str("select");
+        if sel.is_empty() {
+            bail!("enter a selection expression for the affected group");
+        }
+        let vs = pp.str("vs");
+        let (ra, rb) = group_rows(reg, a_id, &da, &sel, &vs, &pp.str("filter"))?;
+        let lab = if vs.is_empty() {
+            "rest".to_string()
+        } else {
+            vs
+        };
+        (da.clone(), ra, rb, lab, sel)
+    } else {
+        let b_id = pp.usize("b", a_id);
+        let (db, _) = reg.get(b_id)?;
+        let ra = reg.rows(a_id, &da, &pp.str("filter_a"))?;
+        let rb = reg.rows(b_id, &db, &pp.str("filter_b"))?;
+        (db, ra, rb, reg.name(a_id), reg.name(b_id))
+    };
+    // same units in a later file: pair every part of A with B by identity
+    let later_ds;
+    let later = match pp.opt_usize("later") {
+        Some(l) if mode == "group" && l != a_id => {
+            let (dl, _) = reg.get(l)?;
+            later_ds = dl;
+            let ka_s = pp.str_or("key_a", "part_txt");
+            let ka = data::matching::KeySpec::parse(&ka_s, &da)?;
+            let kb = data::matching::KeySpec::parse(&pp.str_or("key_b", &ka_s), &later_ds)?;
+            let m = data::matching::match_parts(
+                &da,
+                &da.all_rows(),
+                &ka,
+                &later_ds,
+                &later_ds.all_rows(),
+                &kb,
+            );
+            Some(Later {
+                ds: &later_ds,
+                pairs: m.pairs.iter().map(|(x, y, _)| (*x, *y)).collect(),
+                name: reg.name(l),
+            })
+        }
+        _ => None,
+    };
+    let opt = MarkerOptions {
+        forest: pp.bool("forest", true),
+        trees: pp.usize("trees", 150),
+        match_by: pp.str_or("match_by", "key"),
+        min_n: pp.usize("min_n", 5),
+    };
+    let rep = markers::find(
+        &Group {
+            ds: &da,
+            rows: ra.clone(),
+        },
+        &Group {
+            ds: &db,
+            rows: rb.clone(),
+        },
+        later.as_ref(),
+        &opt,
+    );
+    let range = viz::RangeMode::parse(&pp.str("range"));
+    // overlays of the top candidates
+    let top: Vec<Value> = rep
+        .rows
+        .iter()
+        .take(pp.usize("top_charts", 6))
+        .filter_map(|m| {
+            let ta = da.find_test(&m.key)?;
+            let tb = if std::ptr::eq(&*da, &*db) {
+                ta
+            } else {
+                db.test_index
+                    .get(&m.key)
+                    .copied()
+                    .or_else(|| db.find_test(&m.num.to_string()))?
+            };
+            let g = vec![
+                ("reference".to_string(), da.values_of(ta, Some(&ra))),
+                ("affected".to_string(), db.values_of(tb, Some(&rb))),
+            ];
+            let mut f = viz::histogram_r(&da.tests[ta], &g, None, true, range);
+            f["layout"]["title"]["text"] = json!(format!(
+                "{} · {} (score {:.2})",
+                da.tests[ta].label(),
+                m.why,
+                m.score
+            ));
+            Some(f)
+        })
+        .collect();
+    let bars: Vec<&markers::MarkerRow> = rep.rows.iter().take(20).collect();
+    let why_color = |w: &str| match w {
+        "separation" => "@s1",
+        "tails" => "@s2",
+        "drift" => "@s3",
+        "correlation break" => "@s7",
+        "residual" => "@s4",
+        _ => "@s5",
+    };
+    let mut whys: Vec<&str> = bars.iter().map(|r| r.why.as_str()).collect();
+    whys.sort();
+    whys.dedup();
+    let score_fig = json!({"data": whys.iter().map(|w| {
+        let sel: Vec<&&markers::MarkerRow> = bars.iter().filter(|r| r.why == *w).collect();
+        json!({"type": "bar", "orientation": "h", "name": w, "y": sel.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+            "x": sel.iter().map(|r| r.score).collect::<Vec<_>>(), "marker": {"color": why_color(w)},
+            "hovertemplate": "%{y}<br>score %{x:.2f}<extra>%{fullData.name}</extra>"})
+    }).collect::<Vec<_>>(), "layout": {
+        "title": {"text": format!("Top marker candidates ({} affected vs {} reference)", rep.n_aff, rep.n_ref), "x": 0.01, "xanchor": "left", "font": {"size": 15}},
+        "xaxis": {"title": {"text": "candidate score (strongest signal)"}, "range": [0, 1.02]},
+        "yaxis": {"autorange": "reversed", "type": "category", "categoryorder": "array", "categoryarray": bars.iter().map(|r| r.key.clone()).collect::<Vec<_>>()},
+        "barmode": "overlay", "margin": {"l": 190, "r": 20, "t": 64, "b": 50},
+        "legend": {"orientation": "h", "x": 1, "xanchor": "right", "y": 1.0, "yanchor": "bottom"}}});
+    let cinfo = data::TestInfo {
+        key: "sdc".into(),
+        num: 0,
+        name: "tests beyond ±3σ of reference".into(),
+        kind: data::TestKind::Parametric,
+        units: "tests per part".into(),
+        lo: None,
+        hi: None,
+        lo_spec: None,
+        hi_spec: None,
+        res_scal: 0,
+        exec_count: 0,
+        fail_count: 0,
+    };
+    let f = |v: &[usize]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
+    let mut sdc = viz::histogram_r(
+        &cinfo,
+        &[
+            ("reference".into(), f(&rep.sdc.counts_ref)),
+            ("affected".into(), f(&rep.sdc.counts_aff)),
+        ],
+        None,
+        true,
+        viz::RangeMode::Data,
+    );
+    sdc["layout"]["title"]["text"] = json!(format!(
+        "Sigma-deviation count per part (AUC {:.2})",
+        rep.sdc.aff_auc
+    ));
+    let rows: Vec<Value> = rep
+        .rows
+        .iter()
+        .map(|r| serde_json::to_value(r).unwrap_or(Value::Null))
+        .collect();
+    Ok(json!({
+        "label_ref": la, "label_aff": lb, "n_ref": rep.n_ref, "n_aff": rep.n_aff, "n_tests": rep.n_tests,
+        "later": rep.later, "forest_auc": rep.forest_auc.map(n), "forest_error": rep.forest_error,
+        "sdc_auc": n(rep.sdc.aff_auc), "rows": rows,
+        "figures": {"scores": score_fig, "top": top, "sdc": sdc},
     }))
 }
 

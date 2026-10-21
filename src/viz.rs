@@ -30,6 +30,8 @@ pub fn series_color(name: &str, i: usize) -> String {
         "bad" => "@fail".into(),
         "alarm" => "@warn".into(),
         "no alarm" => "@s1".into(),
+        "reference" => "@s1".into(),
+        "affected" => "@fail".into(),
         _ => slot(i),
     }
 }

@@ -308,21 +308,28 @@ async function viewExplorer(el) {
 // ---- Wafer maps
 async function viewWafer(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
-  el.append(h("h1", {}, "Wafer maps"), h("p", { class: "lead" }, "Bin, pass/fail or test-value maps per wafer. Die coordinates come from the PRR X/Y (wafers from WIR), or are rebuilt from datalogged test results, e.g. wafer, X and Y logged in tests 501, 502 and 503."));
+  el.append(h("h1", {}, "Wafer maps"), h("p", { class: "lead" }, "Bin, pass/fail or test-value maps per wafer. Die coordinates come from the PRR X/Y (wafers from WIR), or are rebuilt from datalogged test results, e.g. wafer, X, Y and an X/Y offset logged in tests 80100–80104 (die X = X + X offset). If the map still looks off, try subtracting the offset or flipping an axis."));
   if (!S.wcoords) S.wcoords = ds && ds.wafers.length ? "prr" : "tests";
   const coords = select([["prr", "PRR X/Y + WIR wafer"], ["tests", "from test results (PTR)"]], S.wcoords, (v) => { S.wcoords = v; S.wafer = "all"; renderCtl(); draw(); });
   const mode = select([["hbin", "hard bin"], ["sbin", "soft bin"], ["pass", "pass / fail"], ["test", "test value"]], S.wmode || "hbin", (v) => { S.wmode = v; draw(); });
   const test = testInput("wt", S.wtest || S.explorerTest || "");
   test.addEventListener("change", () => { S.wtest = test.value; if ((S.wmode || "hbin") === "test") draw(); });
   const small = (inp) => { inp.style.minWidth = "120px"; inp.style.width = "130px"; return inp; };
-  const wt = small(testInput("wwt", S.wTestW ?? "501", "none = one map"));
-  const xt = small(testInput("wxt", S.wTestX ?? "502", "X test"));
-  const yt = small(testInput("wyt", S.wTestY ?? "503", "Y test"));
-  for (const i of [wt, xt, yt]) i.addEventListener("change", () => { S.wTestW = wt.value; S.wTestX = xt.value; S.wTestY = yt.value; S.wafer = "all"; draw(); });
+  const wc = S.wcal || (S.wcal = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false });
+  const wt = small(testInput("wwt", wc.w, "none = one map"));
+  const xt = small(testInput("wxt", wc.x, "X test"));
+  const yt = small(testInput("wyt", wc.y, "Y test"));
+  const oxt = small(testInput("woxt", wc.ox, "none"));
+  const oyt = small(testInput("woyt", wc.oy, "none"));
+  const omode = select([["add", "X + offset"], ["sub", "X − offset"]], wc.mode, () => cal());
+  const fx = h("input", { type: "checkbox", checked: wc.fx, onchange: () => cal() });
+  const fy = h("input", { type: "checkbox", checked: wc.fy, onchange: () => cal() });
+  function cal() { Object.assign(wc, { w: wt.value, x: xt.value, y: yt.value, ox: oxt.value, oy: oyt.value, mode: omode.value, fx: fx.checked, fy: fy.checked }); S.wafer = "all"; draw(); }
+  for (const i of [wt, xt, yt, oxt, oyt]) i.addEventListener("change", cal);
   const wafer = select([["all", "all wafers (gallery)"]], "all", (v) => { S.wafer = v; draw(); });
   const ctl = h("div", { class: "controls" });
   function renderCtl() {
-    ctl.replaceChildren(field("Coordinates", coords), ...(S.wcoords === "tests" ? [field("Wafer test", wt), field("X test", xt), field("Y test", yt)] : []), field("Color by", mode), field("Test (for test value)", test), field("Wafer", wafer));
+    ctl.replaceChildren(field("Coordinates", coords), ...(S.wcoords === "tests" ? [field("Wafer test", wt), field("X test", xt), field("Y test", yt), field("X offset test", oxt), field("Y offset test", oyt), field("Offset", omode), h("label", { class: "chk" }, fx, "flip X"), h("label", { class: "chk" }, fy, "flip Y")] : []), field("Color by", mode), field("Test (for test value)", test), field("Wafer", wafer));
   }
   renderCtl();
   const out = h("div");
@@ -330,7 +337,7 @@ async function viewWafer(el) {
   async function draw() {
     loading(out);
     try {
-      const d = await api("chart", P({ kind: "wafer", mode: S.wmode || "hbin", test: test.value, wafer: S.wafer || "all", coords: S.wcoords, wafer_test: wt.value, x_test: xt.value, y_test: yt.value }));
+      const d = await api("chart", P({ kind: "wafer", mode: S.wmode || "hbin", test: test.value, wafer: S.wafer || "all", coords: S.wcoords, wafer_test: wc.w, x_test: wc.x, y_test: wc.y, ox_test: wc.ox, oy_test: wc.oy, offset_mode: wc.mode, flip_x: wc.fx, flip_y: wc.fy }));
       const names = d.wafers || [];
       if (S.wafer && S.wafer !== "all" && !names.includes(S.wafer)) S.wafer = "all";
       wafer.replaceChildren(...[["all", "all wafers (gallery)"], ...names.map((w) => [w, w])].map(([v, l]) => h("option", { value: v, selected: v === (S.wafer || "all") }, l)));
@@ -360,13 +367,17 @@ async function viewCompare(el) {
     const sel = h("input", { type: "text", class: "filter-input", placeholder: "group, e.g. site = 3  or  $match  or  part_id in @ids.txt", value: S.cmpSel || "", style: { minWidth: "300px" } });
     const vs = h("input", { type: "text", class: "filter-input", placeholder: "versus (blank = all other parts)", value: S.cmpVs || "" });
     const matchBy = select([["key", "number + name"], ["num", "test number"], ["name", "test name"]], S.cmpMatch || "key", (v) => (S.cmpMatch = v));
+    const later = select([["", "none"], ...dsOptions().filter(([v]) => +v !== S.ds)], S.cmpLater ?? "", (v) => { S.cmpLater = v; keys.hidden = !v; });
+    const ka = keyPicker("a"), kb = keyPicker("b");
+    const keys = h("div", { class: "row tight", hidden: !S.cmpLater }, ka.el, h("span", { class: "muted small" }, "↔"), kb.el);
     const run = h("button", { class: "primary", onclick: () => {
       S.cmpFA = fa.value; S.cmpFB = fb.value; S.cmpSel = sel.value; S.cmpVs = vs.value;
       const params = m === "group" ? { mode: "group", a: S.ds, select: sel.value, vs: vs.value, filter: scoped(S.filter), match_by: matchBy.value } : { mode: "datasets", a: +a.value, b: +b.value, filter_a: scoped(fa.value), filter_b: scoped(fb.value), match_by: matchBy.value };
+      if (m === "group" && later.value) Object.assign(params, { later: +later.value, key_a: ka.value(), key_b: kb.value() });
       runCompare(out, params);
     } }, "Compare");
     ctl.replaceChildren(field("Mode", mode));
-    if (m === "group") ctl.append(field("Group (B)", sel), field("Versus (A)", vs));
+    if (m === "group") ctl.append(field("Group (B)", sel), field("Versus (A)", vs), field("Same units in file (drift)", later), field("identified by", keys));
     else ctl.append(field("A", a), field("Filter A", fa), field("B", b), field("Filter B", fb));
     ctl.append(field("Match tests by", matchBy), run);
     return run;
@@ -376,10 +387,15 @@ async function viewCompare(el) {
 }
 async function runCompare(out, params) {
   loading(out);
+  const mkBox = h("div");
+  const mkP = api("markers", Object.assign({}, params, { range: S.co.range })).catch((e) => e);
   try {
     const d = await api("compare", params);
     const r = d.report;
-    out.replaceChildren(h("div", { class: "kpis" },
+    let pick = null;
+    mkBox.replaceChildren(h("h2", {}, "Marker candidates"), h("div", { class: "loading" }, "Ranking every test (statistics + random forest)…"));
+    mkP.then((mk) => (mk instanceof Error ? showErr(mkBox, mk) : renderMarkers(mkBox, mk, (row) => pick && pick(row))));
+    out.replaceChildren(mkBox, h("h2", {}, "Full comparison"), h("div", { class: "kpis" },
       kpi(r.label_a, pct(r.yield_a), `${r.n_a.toLocaleString()} parts`),
       kpi(r.label_b, pct(r.yield_b), `${r.n_b.toLocaleString()} parts`),
       kpi("Yield delta", (r.yield_b - r.yield_a >= 0 ? "+" : "") + (r.yield_b - r.yield_a).toFixed(2) + " pt"),
@@ -418,6 +434,7 @@ async function runCompare(out, params) {
         if (scroll) detail.scrollIntoView({ behavior: "smooth", block: "start" });
       } catch (e) { showErr(detail, e); }
     };
+    pick = (row) => showTest(row, true);
     table(tb, cols, rows, {
       onClick: (row) => showTest(row, true),
       tools: h("button", { onclick: () => SC.download("compare.csv", SC.toCSV(cols, rows)) }, "Download CSV"),
@@ -427,6 +444,68 @@ async function runCompare(out, params) {
     out.append(sy);
     table(sy, [{ key: "0", label: "Site" }, { key: "1", label: "Yield A", num: true, fmt: (v) => pct(v) }, { key: "2", label: "N A", num: true }, { key: "3", label: "Yield B", num: true, fmt: (v) => pct(v) }, { key: "4", label: "N B", num: true }], r.site_yield.map((x) => ({ 0: x[0], 1: x[1], 2: x[2], 3: x[3], 4: x[4] })), { search: false });
   } catch (e) { showErr(out, e); }
+}
+
+// ---- Marker candidates
+function renderMarkers(box, mk, onPick) {
+  const hasDrift = !!mk.later;
+  const p1 = (v) => (v === null || v === undefined ? "–" : (v * 100).toFixed(1));
+  const f2 = (v) => (v === null || v === undefined ? "–" : fmt(v, 2));
+  const whyKind = (w) => ({ separation: "bad", tails: "warn", drift: "warn", "correlation break": "warn", residual: "warn" })[w] || "neutral";
+  const cols = [
+    { key: "rank", label: "#", num: true },
+    { key: "key", label: "Test" },
+    { key: "why", label: "Strongest signal", render: (v) => badge(v, whyKind(v)) },
+    { key: "score", label: "Score", num: true, fmt: f2, title: "strongest normalized signal, 0–1" },
+    { key: "auc", label: "AUC", num: true, fmt: f2, title: "P(affected > reference); 0.5 = no difference" },
+    { key: "shift_sigma", label: "Shift σ", num: true, fmt: f2, title: "median shift in robust σ of the reference" },
+    { key: "ks_d", label: "KS D", num: true, fmt: f2 },
+    { key: "q", label: "q", num: true, fmt: fmtP, title: "Mann–Whitney, Benjamini–Hochberg corrected" },
+    { key: "sigma_ratio", label: "σ ratio", num: true, fmt: f2 },
+    { key: "levene_p", label: "Levene p", num: true, fmt: fmtP, title: "spread difference" },
+    { key: "tail_ref", label: "±3σ ref %", num: true, fmt: p1 },
+    { key: "tail_aff", label: "±3σ aff %", num: true, fmt: p1 },
+    { key: "fail_ref", label: "Fail ref %", num: true, fmt: p1 },
+    { key: "fail_aff", label: "Fail aff %", num: true, fmt: p1 },
+  ];
+  if (hasDrift) cols.push(
+    { key: "drift_sep", label: "Drift sep", num: true, fmt: f2, title: "separation of the per-unit change between the two files" },
+    { key: "drift_shift_sigma", label: "Drift σ", num: true, fmt: f2 },
+    { key: "r_ref", label: "r ref", num: true, fmt: f2, title: "file-1 vs file-2 correlation, reference units" },
+    { key: "r_aff", label: "r aff", num: true, fmt: f2, title: "file-1 vs file-2 correlation, affected units" },
+    { key: "resid_sigma", label: "Resid σ", num: true, fmt: f2, title: "affected units vs the reference file-1 → file-2 fit" });
+  cols.push({ key: "importance", label: "RF imp", num: true, fmt: f2, title: "random-forest importance (relative to the top test)" });
+  const views = [["score", "Overall"], ["separation", "Separation"], ["tail_excess", "Tails (±3σ)"]];
+  if (hasDrift) views.push(["drift_sep", "Drift between files"], ["corr_break", "Correlation break"], ["resid_abs", "Residual"]);
+  views.push(["importance", "Random forest"]);
+  const rows = mk.rows.map((r) => Object.assign({ resid_abs: r.resid_sigma === null ? null : Math.abs(r.resid_sigma) }, r));
+  const tabs = h("div", { class: "tabs" });
+  const tb = h("div");
+  const setView = (k) => {
+    S.mkView = k;
+    tabs.replaceChildren(...views.map(([v, l]) => h("button", { class: v === k ? "active" : "", onclick: () => setView(v) }, l)));
+    const sorted = rows.filter((r) => r[k] !== null && r[k] !== undefined).sort((a, b) => b[k] - a[k]).map((r, i) => Object.assign({}, r, { rank: i + 1 }));
+    table(tb, cols, sorted, { limit: 10, search: true, placeholder: "Search tests…", onClick: onPick, tools: h("button", { onclick: () => SC.download("marker_tests.csv", SC.toCSV(cols, sorted)) }, "Download CSV") });
+  };
+  const k = [
+    kpi("Affected", mk.n_aff.toLocaleString(), mk.label_aff),
+    kpi("Reference", mk.n_ref.toLocaleString(), mk.label_ref),
+    kpi("Tests ranked", mk.n_tests.toLocaleString()),
+    kpi("Model AUC", mk.forest_auc == null ? "–" : fmt(mk.forest_auc, 3), mk.forest_error || "random forest, hold-out: can all tests together tell the groups apart?"),
+    kpi("Outlier-count AUC", fmt(mk.sdc_auc, 3), "tests beyond ±3σ per part"),
+  ];
+  if (hasDrift) k.push(kpi("Drift file", mk.later, "same units, matched by identity"));
+  box.replaceChildren(h("h2", {}, "Marker candidates"),
+    h("p", { class: "lead" }, "Every test ranked by how well it separates the affected parts from the reference: rank AUC and shift, tails beyond ±3σ of the reference" + (hasDrift ? ", how the same units changed in the other file (drift, residual, correlation break)" : "") + ", and random-forest importance. The score is the strongest of these signals. Click a test for its distributions."),
+    h("div", { class: "kpis" }, ...k));
+  const g = h("div", { class: "grid2" });
+  box.append(g);
+  for (const f of [mk.figures.scores, mk.figures.sdc]) { const [card, c] = chartBox("tall"); g.append(card); plot(c, f); }
+  box.append(h("h3", {}, "Top 10"), tabs, tb, h("h3", {}, "Top candidates: reference vs affected"));
+  const g3 = h("div", { class: "grid3" });
+  box.append(g3);
+  for (const f of mk.figures.top) { const [card, c] = chartBox(); g3.append(card); plot(c, f); }
+  setView(views.some(([v]) => v === S.mkView) ? S.mkView : "score");
 }
 
 // ---- Correlation
@@ -830,14 +909,29 @@ function viewMatch(el) {
     try { S.mres = await api("match", { a: st.a, b: st.b, key_a: st.ka, key_b: st.kb, filter_a: st.fa, filter_b: st.fb, name: st.name }); renderMatch(out, S.mres, traceBox); } catch (e) { showErr(out, e); }
   };
   if (!two) el.append(h("div", { class: "help" }, "Open a second STDF file (without 'combine') to match parts between files. You can still trace a part by its identity in this file below."));
-  el.append(h("div", { class: "controls" }, field("File A", a), field("Identify A parts by", ka.el), field("Filter A", fa)),
-    two ? h("div", { class: "controls" }, field("File B", b), field("Identify B parts by", kb.el), field("Filter B", fb), field("Part set name", name), h("button", { class: "primary", onclick: run }, "Match parts")) : "");
+  el.append(h("div", { class: "controls" }, field("File A", a), field("Identify A parts by", ka.el), field("Filter A", fa), quickFilter(fa, "qa")),
+    two ? h("div", { class: "controls" }, field("File B", b), field("Identify B parts by", kb.el), field("Filter B", fb), quickFilter(fb, "qb"), field("Part set name", name), h("button", { class: "primary", onclick: run }, "Match parts")) : "",
+    two ? h("div", { class: "help" }, "Example – parts that were bin 1 in file A but failed test 1013 in file B: Filter A ", h("code", {}, "hbin = 1"), ", Filter B ", h("code", {}, "fail(1013)"), " (or ", h("code", {}, "first_fail = 1013"), ", or ", h("code", {}, "fail(1013) and n_fails = 1"), " for that test only). Then use “Find marker tests” on file A.") : "");
   // trace a single unit by its identity
   const tv = h("input", { type: "text", placeholder: "the A identity value, e.g. LOTA-W01-X3Y-2  or  11253  or  1|3|-2", style: { minWidth: "300px", flex: "1" }, onkeydown: (e) => { if (e.key === "Enter") doTrace(); } });
   const doTrace = () => { sync(); trace(traceBox, { a: st.a, b: two && st.a !== st.b ? st.b : null, key_a: st.ka, key_b: st.kb, value: tv.value }); };
   el.append(h("div", { class: "controls" }, field("Trace a part", tv), h("button", { onclick: doTrace }, "Trace"), h("span", { class: "muted small", style: { paddingBottom: "8px" } }, "Several test values: separate with | in the order of the tests.")), out, traceBox);
   if (S.mres && S.mres.a === st.a && S.mres.b === st.b && ids.includes(st.a) && ids.includes(st.b)) renderMatch(out, S.mres, traceBox);
 }
+/** Builds a filter like  not pass and fail(1013)  into `input`. */
+function quickFilter(input, key) {
+  const st = (S.qf = S.qf || {})[key] || (S.qf[key] = { parts: "", test: "", how: "fail" });
+  const parts = select([["", "any part"], ["pass", "good parts"], ["not pass", "bad parts"], ["hbin = 1", "hard bin 1"]], st.parts, (v) => { st.parts = v; apply(); });
+  const test = h("input", { type: "text", value: st.test, placeholder: "test #", style: { width: "90px" }, onchange: (e) => { st.test = e.target.value.trim(); apply(); } });
+  const how = select([["fail", "fails it"], ["first", "fails it first"], ["only", "fails only it"]], st.how, (v) => { st.how = v; apply(); });
+  function apply() {
+    const t = st.test.replace(/:.*/, "");
+    const tc = !t ? "" : st.how === "first" ? `first_fail = ${t}` : st.how === "only" ? `fail(${t}) and n_fails = 1` : `fail(${t})`;
+    input.value = [st.parts, tc].filter(Boolean).join(" and ");
+  }
+  return field("Quick filter", h("div", { class: "row tight" }, parts, h("span", { class: "muted small" }, "failing test"), test, how));
+}
+const andF = (base, x) => (base && base.trim() ? `(${base}) and ${x}` : x);
 function useFilter(id, expr) {
   setDs(id);
   document.getElementById("filter").value = expr;
@@ -867,20 +961,47 @@ function renderMatch(out, m, traceBox) {
   const sideCard = (id, label) => {
     const d = S.datasets.find((x) => x.id === id);
     const base = baseName(d);
+    const isA = id === m.a;
+    const sideFilter = ((isA ? S.m.fa : S.m.fb) || "").trim();
+    const other = isA ? m.b : m.a;
+    const keys = isA ? { key_a: S.m.ka, key_b: S.m.kb } : { key_a: S.m.kb, key_b: S.m.ka };
     const [dirP, dirF] = pathField("folder", nearDs(d, `${base}_${m.name}_split`), { title: "Choose output folder", placeholder: "output folder" });
     const res = h("div");
-    const single = d && d.files === 1;
-    return h("div", { class: "card pad" }, h("h2", { style: { marginTop: 0 } }, `${label}: ${dsName(id)}`),
+    const single = d && d.files === 1 && !d.derived;
+    const within = h("input", { type: "checkbox", checked: !!sideFilter });
+    const scopeNote = sideFilter ? h("p", { class: "muted small" }, "Unmatched = parts within Filter ", label, " (", h("code", {}, sideFilter), ") that did not match.") : null;
+    const markers = () => {
+      runCompare(cmpOut, Object.assign({ mode: "group", a: id, select: set, vs: `not ${set}`, filter: scoped(sideFilter), match_by: "key", later: other }, keys));
+      cmpOut.scrollIntoView({ behavior: "smooth" });
+    };
+    const mkDatasets = async (thenCompare) => {
+      busy("Creating datasets…");
+      const made = [];
+      try {
+        for (const [what, f] of [["matched", andF(sideFilter, set)], ["unmatched", andF(sideFilter, `not ${set}`)]]) {
+          try { made.push(Object.assign({ what }, await api("subset_ds", { ds: id, filter: f, name: `${dsName(id)} · ${m.name} ${what}` }))); }
+          catch (e) { toast(`No ${what} dataset: ${e.message}`, "bad", 8000); }
+        }
+        await refreshDatasets(S.ds);
+        if (made.length) toast("Created " + made.map((x) => `“${x.name}” (${x.parts})`).join(" and "), "good", 7000);
+        if (thenCompare && made.length === 2) { S.cmpMode = "datasets"; S.cmpA = made[1].id; S.cmpB = made[0].id; S.cmpFA = ""; S.cmpFB = ""; S.cmpAuto = true; go("compare"); }
+      } finally { busy(null); }
+    };
+    return h("div", { class: "card pad" }, h("h2", { style: { marginTop: 0 } }, `${label}: ${dsName(id)}`), scopeNote,
       h("div", { class: "row" },
-        h("button", { onclick: () => useFilter(id, set) }, "Analyse matched parts"),
-        h("button", { onclick: () => useFilter(id, `not ${set}`) }, "Analyse unmatched parts"),
-        h("button", { onclick: () => { runCompare(cmpOut, { mode: "group", a: id, select: set, vs: `not ${set}`, filter: scoped(""), match_by: "key" }); cmpOut.scrollIntoView({ behavior: "smooth" }); } }, "Compare matched vs unmatched")),
+        h("button", { class: "primary", onclick: markers, title: "Rank every test: matched vs unmatched parts of this file, plus drift of the same units in the other file" }, "Find marker tests"),
+        h("button", { onclick: () => mkDatasets(true) }, "New datasets: matched / unmatched → compare"),
+        h("button", { onclick: () => mkDatasets(false) }, "Only create the datasets")),
+      h("div", { class: "row" },
+        h("button", { onclick: () => useFilter(id, andF(sideFilter, set)) }, "Analyse matched parts"),
+        h("button", { onclick: () => useFilter(id, andF(sideFilter, `not ${set}`)) }, "Analyse unmatched parts")),
       single ? h("div", { class: "row" }, dirF) : null,
+      single && sideFilter ? h("label", { class: "chk" }, within, ` write only parts within Filter ${label}`) : null,
       single ? h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => {
         if (!dirP.value) return toast("Choose an output folder", "bad");
         busy("Splitting…");
         try {
-          const r = await api("split", { ds: id, by: "groups", groups: [{ name: "matched", expr: set }], rest: "unmatched", out_dir: dirP.value, prefix: base });
+          const r = await api("split", { ds: id, by: "groups", groups: [{ name: "matched", expr: set }], rest: "unmatched", out_dir: dirP.value, prefix: base, filter: within.checked ? sideFilter : "" });
           const t = h("div");
           res.replaceChildren(resultLine(`${r.outputs.length} file(s) written to ${r.out_dir}`, r.out_dir), t);
           table(t, [{ key: "name", label: "Output" }, { key: "parts", label: "Parts", num: true }, { key: "good", label: "Good", num: true }, { key: "path", label: "File" }], r.outputs, { search: false });
@@ -1139,7 +1260,7 @@ function resultLine(msg, path) {
 function viewExport(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
   const base = (ds ? ds.name : "export").replace(/\.(stdf|std)(\.gz)?$/i, "").replace(/\.gz$/i, "");
-  const single = ds && ds.files === 1;
+  const single = ds && ds.files === 1 && !ds.derived;
   const srcDir = ds && ds.paths.length ? dirname(ds.paths[0]) : "";
   const sep = srcDir.includes("\\") ? "\\" : "/";
   const near = (name) => (srcDir ? srcDir + sep + name : "");
@@ -1170,7 +1291,7 @@ function viewExport(el) {
     } }, "Export CSV")), csvOut));
 
   if (!single) {
-    el.append(h("div", { class: "card pad section" }, h("h2", {}, "Split / extract STDF"), h("p", { class: "muted" }, "Splitting and extracting work on datasets opened from a single file. Open the file on its own (without 'combine') to use them.")));
+    el.append(h("div", { class: "card pad section" }, h("h2", {}, "Split / extract STDF"), h("p", { class: "muted" }, ds && ds.derived ? "This dataset was created in the app, so it has no STDF file of its own. Split the file it came from instead (e.g. with its part set in “my own groups”)." : "Splitting and extracting work on datasets opened from a single file. Open the file on its own (without 'combine') to use them.")));
     return;
   }
   // extract
