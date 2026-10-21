@@ -12,6 +12,10 @@
 //! * **tails**: share of affected parts beyond ±3 robust σ of the reference
 //!   minus the reference's own share (sigma-deviation counting, as used for
 //!   latent-defect screening);
+//! * **PAT**: the same excess beyond static Part Average Testing limits of the
+//!   reference (median ± 6 robust σ, clipped to the test limits, AEC-Q001);
+//! * **ANOVA**: one-way F test and η² (share of variance explained by the
+//!   group), reported alongside;
 //! * **drift** (when the same units are known in a second file): how much the
 //!   per-unit change between the two files differs between the groups, how
 //!   far affected units sit from the reference's file-1 → file-2 regression
@@ -53,6 +57,8 @@ pub struct MarkerOptions {
     pub trees: usize,
     /// test pairing between datasets: "key", "num" or "name"
     pub match_by: String,
+    /// test numbers left out (e.g. identity tests: wafer, X/Y, die ID)
+    pub exclude: Vec<u32>,
 }
 
 impl Default for MarkerOptions {
@@ -62,6 +68,7 @@ impl Default for MarkerOptions {
             forest: true,
             trees: 150,
             match_by: "key".into(),
+            exclude: vec![],
         }
     }
 }
@@ -91,6 +98,13 @@ pub struct MarkerRow {
     pub tail_ref: f64,
     pub tail_aff: f64,
     pub tail_excess: f64,
+    /// share outside the reference's PAT limits (median ± 6σ within limits)
+    pub pat_ref: f64,
+    pub pat_aff: f64,
+    pub pat_excess: f64,
+    /// one-way ANOVA affected vs reference
+    pub anova_p: f64,
+    pub eta2: f64,
     pub fail_ref: f64,
     pub fail_aff: f64,
     // cross-file (same units)
@@ -128,6 +142,18 @@ pub struct MarkerReport {
     pub forest_error: Option<String>,
     /// sigma-deviation count per part (how many tests sit outside ±3σ)
     pub sdc: PartScore,
+}
+
+/// Static PAT limits: median ± 6 robust σ, never wider than the test limits.
+pub fn pat_limits(center: f64, sigma: f64, lo: Option<f64>, hi: Option<f64>) -> (f64, f64) {
+    let (mut a, mut b) = (center - 6.0 * sigma, center + 6.0 * sigma);
+    if let Some(l) = lo {
+        a = a.max(l);
+    }
+    if let Some(h) = hi {
+        b = b.min(h);
+    }
+    (a, b)
 }
 
 /// Rank-based AUC: P(affected > reference) with ties counted half.
@@ -179,6 +205,7 @@ pub fn find(refg: &Group, aff: &Group, later: Option<&Later>, opt: &MarkerOption
     let tests: Vec<(usize, usize)> = dr
         .numeric_tests()
         .into_iter()
+        .filter(|&t| !opt.exclude.contains(&dr.tests[t].num))
         .filter_map(|t| {
             if std::ptr::eq(dr, da) {
                 Some((t, t))
@@ -207,6 +234,16 @@ pub fn find(refg: &Group, aff: &Group, later: Option<&Later>, opt: &MarkerOption
             let fails = |v: &[f64]| {
                 v.iter().filter(|&&x| !info.within_limits(x)).count() as f64 / v.len() as f64
             };
+            let (plo, phi) = pat_limits(mr, sr, info.lo, info.hi);
+            let pat = |v: &[f64]| {
+                v.iter().filter(|&&x| x < plo || x > phi).count() as f64 / v.len() as f64
+            };
+            let (pat_ref, pat_aff) = if sr > 0.0 {
+                (pat(&vr), pat(&va))
+            } else {
+                (0.0, 0.0)
+            };
+            let (_, anova_p, eta2, _, _) = anova::one_way(&[vr.clone(), va.clone()]);
             let mut row = MarkerRow {
                 key: info.key.clone(),
                 num: info.num,
@@ -227,6 +264,11 @@ pub fn find(refg: &Group, aff: &Group, later: Option<&Later>, opt: &MarkerOption
                 tail_ref,
                 tail_aff,
                 tail_excess: tail_aff - tail_ref,
+                pat_ref,
+                pat_aff,
+                pat_excess: pat_aff - pat_ref,
+                anova_p,
+                eta2,
                 fail_ref: fails(&vr),
                 fail_aff: fails(&va),
                 ..Default::default()
@@ -314,6 +356,7 @@ pub fn find(refg: &Group, aff: &Group, later: Option<&Later>, opt: &MarkerOption
                 "separation",
             ),
             ((r.tail_excess * 2.0).clamp(0.0, 1.0), "tails"),
+            ((r.pat_excess * 4.0).clamp(0.0, 1.0), "PAT"),
         ];
         if let Some(d) = r.drift_sep {
             cands.push((d, "drift"));
@@ -415,6 +458,17 @@ fn forest_importance(
     let fo = features::FeatureOptions {
         min_coverage: 0.5,
         max_features: 5000,
+        // an explicit list skips the coverage check, so apply it here
+        tests: (!opt.exclude.is_empty()).then(|| {
+            ds.numeric_tests()
+                .into_iter()
+                .filter(|&t| !opt.exclude.contains(&ds.tests[t].num))
+                .filter(|&t| {
+                    let have = rows.iter().filter(|&&r| ds.value(t, r).is_finite()).count();
+                    have as f64 >= 0.5 * rows.len() as f64
+                })
+                .collect()
+        }),
         ..Default::default()
     };
     let fm = features::build(&ds, &rows, &fo);

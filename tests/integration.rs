@@ -724,3 +724,83 @@ fn marker_tests_fail_filters_and_offset_wafer_maps() {
         "without offsets only the 4 reticle columns remain"
     );
 }
+
+#[test]
+fn bad_candidates_profile_without_splitting() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let a = gen(d.path(), "s1.stdf", SampleSpec::default());
+    let b = gen(
+        d.path(),
+        "s2.stdf",
+        SampleSpec {
+            meas_noise: 0.3,
+            ..SampleSpec::default()
+        },
+    );
+    let reg = api::Registry::app();
+    api::run(
+        &reg,
+        "load",
+        &json!({"paths": [a.to_string_lossy(), b.to_string_lossy()]}),
+    )
+    .unwrap();
+    // good in file 1, bad in file 2: marked in file 1 as $bad_candidate
+    let m = api::run(&reg, "match", &json!({"a": 0, "b": 1, "key_a": "part_txt", "filter_a": "hbin = 1", "filter_b": "not pass", "name": "bad_candidate"})).unwrap();
+    let n = m["pairs"].as_u64().unwrap();
+    assert!(n > 0);
+
+    let excl = "500, 80100-80104";
+    let c = api::run(&reg, "candidates", &json!({"a": 0, "filter": "hbin = 1", "name": "bad_candidate", "exclude": excl, "coords": "tests",
+        "wafer_test": "80100", "x_test": "80101", "y_test": "80102", "ox_test": "80103", "oy_test": "80104"})).unwrap();
+    assert_eq!(c["n_aff"].as_u64().unwrap(), n);
+    assert_eq!(c["parts"].as_array().unwrap().len() as u64, n);
+    let inds = c["indicators"].as_array().unwrap();
+    assert!(inds.len() >= 4);
+    assert!(inds
+        .iter()
+        .all(|i| (0.0..=1.0).contains(&i["auc"].as_f64().unwrap())));
+    let keys: Vec<&str> = c["factors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["key"].as_str().unwrap())
+        .collect();
+    assert!(
+        keys.contains(&"wafer") && keys.contains(&"field"),
+        "{keys:?}"
+    );
+    assert!(c["b_fails"][0]["share"].as_f64().unwrap() > 0.0);
+    assert!(!c["stack"].as_array().unwrap().is_empty());
+    assert!(
+        api::run(
+            &reg,
+            "candidates",
+            &json!({"a": 0, "filter": "hbin = 1", "name": "nope"})
+        )
+        .is_err(),
+        "an unknown part set is an error"
+    );
+
+    // the marker ranking leaves the identity tests out and reports PAT and ANOVA
+    let mk = api::run(&reg, "markers", &json!({"mode": "group", "a": 0, "select": "$bad_candidate", "vs": "", "filter": "hbin = 1", "exclude": excl, "trees": 30})).unwrap();
+    let rows = mk["rows"].as_array().unwrap();
+    assert!(rows.iter().all(|r| {
+        let num = r["num"].as_u64().unwrap();
+        num != 500 && !(80100..=80104).contains(&num)
+    }));
+    assert!(rows
+        .iter()
+        .all(|r| r["eta2"].is_number() && r["pat_aff"].is_number()));
+
+    // charts can be colored by the part set
+    let h = api::run(&reg, "chart", &json!({"ds": 0, "kind": "hist", "filter": "hbin = 1", "test": rows[0]["key"], "group_by": "$bad_candidate"})).unwrap();
+    let names: Vec<&str> = h["hist"]["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(names.len(), 2);
+    assert!(names[1].starts_with("$bad_candidate"), "{names:?}");
+}

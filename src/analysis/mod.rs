@@ -2,6 +2,7 @@
 
 pub mod anomaly;
 pub mod anova;
+pub mod candidates;
 pub mod compare;
 pub mod correlation;
 pub mod markers;

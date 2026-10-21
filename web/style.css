@@ -221,3 +221,9 @@ dialog.dlg::backdrop { background: rgba(0,0,0,.35); }
 .help code { white-space: nowrap; }
 [hidden] { display: none !important; }
 #ds { max-width: 280px; text-overflow: ellipsis; }
+th[title]:not([title=""]) { text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+details.help ul { margin: 4px 0 8px; padding-left: 18px; }
+details.help li { margin: 2px 0; }
+details.help p { margin: 6px 0; }
+.findings { margin: 4px 0 16px; padding-left: 20px; line-height: 1.6; }
+.findings li { margin: 2px 0; }

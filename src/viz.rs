@@ -32,6 +32,9 @@ pub fn series_color(name: &str, i: usize) -> String {
         "no alarm" => "@s1".into(),
         "reference" => "@s1".into(),
         "affected" => "@fail".into(),
+        // part sets: "$name" and "not $name"
+        n if n.starts_with("not $") => "@s1".into(),
+        n if n.starts_with('$') => "@fail".into(),
         _ => slot(i),
     }
 }
@@ -258,11 +261,24 @@ pub fn histogram_r(
             .collect();
         let xs: Vec<f64> = (0..nb).map(|k| edges[k] + w / 2.0).collect();
         let d = stats::describe(v, info.lo, info.hi);
+        let stat = format!(
+            "mean {} σ {} Cpk {}<extra></extra>",
+            fmt(d.mean),
+            fmt(d.std),
+            d.cpk.map(fmt).unwrap_or("–".into())
+        );
+        // raw counts ride along in customdata so the page can switch a
+        // normalized histogram back to counts without a round trip
         data.push(json!({
             "type":"bar","name": format!("{name} (n={})", v.len()),"x": xs,"y": ys,"width": w * 0.98,
+            "customdata": c, "meta": if density { "pct" } else { "count" },
             "marker":{"color": series_color(name, i), "line":{"width":0}},
             "opacity": if groups.len() > 1 { 0.55 } else { 0.9 },
-            "hovertemplate": format!("{name}<br>%{{x:.4g}}<br>{}: %{{y:.3g}}<br>mean {} σ {} Cpk {}<extra></extra>", if density {"% of group"} else {"count"}, fmt(d.mean), fmt(d.std), d.cpk.map(fmt).unwrap_or("–".into()))
+            "hovertemplate": if density {
+                format!("{name}<br>%{{x:.4g}}<br>%{{y:.3g}}% of group (%{{customdata}} parts)<br>{stat}")
+            } else {
+                format!("{name}<br>%{{x:.4g}}<br>count: %{{y}}<br>{stat}")
+            }
         }));
     }
     let (shapes, ann) = limit_shapes(info.lo, info.hi, true);

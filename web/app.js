@@ -2,7 +2,7 @@
 "use strict";
 const { h, plot, fmt, fmtP, pct, kpi, chartBox, badge, table } = SC;
 
-const S = { datasets: [], ds: 0, filter: "", view: "overview", testsCache: {}, scope: "all", co: { range: "both", dim: "2d", opacity: 0.6 } };
+const S = { datasets: [], ds: 0, filter: "", view: "overview", testsCache: {}, scope: "all", co: { range: "both", dim: "2d", opacity: 0.6, hist: "pct" } };
 try { Object.assign(S.co, JSON.parse(localStorage.getItem("sc-chart") || "{}")); S.scope = localStorage.getItem("sc-scope") || "all"; } catch (e) {}
 const main = document.getElementById("main");
 const GROUPS = [["", "none"], ["pass", "good / bad"], ["alarm", "alarm"], ["site", "test site"], ["head", "head"], ["hbin", "hard bin"], ["sbin", "soft bin"], ["wafer", "wafer"], ["file", "file / lot"]];
@@ -27,8 +27,11 @@ function chartOpts(onRange, opts) {
   const dim = h("div", { class: "seg" }, ["2d", "3d"].map((d) => h("button", { class: S.co.dim === d ? "active" : "", onclick: (e) => { S.co.dim = d; saveChartOpts(); [...e.target.parentNode.children].forEach((b) => b.classList.toggle("active", b === e.target)); SC.replotAll(); } }, d.toUpperCase())));
   const opv = h("span", { class: "muted small" }, Math.round(S.co.opacity * 100) + "%");
   const op = h("input", { type: "range", min: 0.1, max: 1, step: 0.05, value: S.co.opacity, oninput: (e) => { S.co.opacity = +e.target.value; opv.textContent = Math.round(S.co.opacity * 100) + "%"; saveChartOpts(); SC.replotAll(); } });
+  const hist = opts.hist ? h("div", { class: "seg", title: "% of group puts groups of different size on one scale; counts show how many parts are really in each bin" }, [["pct", "% of group"], ["count", "counts"]].map(([v, l]) => h("button", { class: S.co.hist === v ? "active" : "", onclick: (e) => { S.co.hist = v; saveChartOpts(); for (const seg of document.querySelectorAll(".seg-hist")) [...seg.children].forEach((b, i) => b.classList.toggle("active", ["pct", "count"][i] === v)); SC.replotAll(); } }, l))) : null;
+  if (hist) hist.classList.add("seg-hist");
   return h("div", { class: "chart-opts" },
     opts.noRange ? null : field("Axis range", range),
+    hist ? field("Histogram", hist) : null,
     field("View", dim),
     h("label", { class: "field" }, h("span", {}, "Opacity"), h("div", { class: "row tight" }, op, opv)),
     opts.extra || null);
@@ -37,6 +40,17 @@ function chartOpts(onRange, opts) {
 /** Applies the chart options to a resolved Plotly figure. */
 function chartTransform(f) {
   const op = S.co.opacity;
+  // figures marked _normable (compare views) follow the % / counts switch
+  if (f._normable && S.co.hist === "count") {
+    let hit = false;
+    for (const t of f.data || []) {
+      if (t.type !== "bar" || t.meta !== "pct" || !t.customdata) continue;
+      t.y = t.customdata;
+      t.hovertemplate = String(t.hovertemplate || "").replace(/%\{y:\.3g\}% of group \(%\{customdata\} parts\)/, "count: %{y}");
+      hit = true;
+    }
+    if (hit && f.layout) f.layout = Object.assign({}, f.layout, { yaxis: Object.assign({}, f.layout.yaxis, { title: { text: "parts" } }) });
+  }
   for (const t of f.data || []) {
     if (t.type === "bar" && !t.orientation) t.opacity = op;
     else if ((t.type === "scatter" || t.type === "scattergl") && t.mode && t.mode.includes("markers") && t.hoverinfo !== "skip") t.marker = Object.assign({}, t.marker, { opacity: op });
@@ -162,6 +176,7 @@ const VIEWS = {
   wafer: { label: "Wafer maps", fn: viewWafer },
   compare: { label: "Compare", fn: viewCompare },
   match: { label: "Match & trace", fn: viewMatch },
+  candidates: { label: "Bad candidates", fn: viewCandidates },
   correlation: { label: "Correlation", fn: viewCorrelation },
   anova: { label: "ANOVA", fn: viewAnova },
   anomaly: { label: "Abnormal parts", fn: viewAnomaly },
@@ -315,7 +330,7 @@ async function viewWafer(el) {
   const test = testInput("wt", S.wtest || S.explorerTest || "");
   test.addEventListener("change", () => { S.wtest = test.value; if ((S.wmode || "hbin") === "test") draw(); });
   const small = (inp) => { inp.style.minWidth = "120px"; inp.style.width = "130px"; return inp; };
-  const wc = S.wcal || (S.wcal = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false });
+  const wc = waferCal();
   const wt = small(testInput("wwt", wc.w, "none = one map"));
   const xt = small(testInput("wxt", wc.x, "X test"));
   const yt = small(testInput("wyt", wc.y, "Y test"));
@@ -367,6 +382,7 @@ async function viewCompare(el) {
     const sel = h("input", { type: "text", class: "filter-input", placeholder: "group, e.g. site = 3  or  $match  or  part_id in @ids.txt", value: S.cmpSel || "", style: { minWidth: "300px" } });
     const vs = h("input", { type: "text", class: "filter-input", placeholder: "versus (blank = all other parts)", value: S.cmpVs || "" });
     const matchBy = select([["key", "number + name"], ["num", "test number"], ["name", "test name"]], S.cmpMatch || "key", (v) => (S.cmpMatch = v));
+    const excl = h("input", { type: "text", value: S.cmpExcl ?? "", placeholder: "e.g. 500, 80100-80104", style: { width: "170px" }, title: "Tests left out of the marker ranking, e.g. identity tests (wafer, X/Y, die ID) that differ between lots by position only", onchange: (e) => (S.cmpExcl = e.target.value) });
     const later = select([["", "none"], ...dsOptions().filter(([v]) => +v !== S.ds)], S.cmpLater ?? "", (v) => { S.cmpLater = v; keys.hidden = !v; });
     const ka = keyPicker("a"), kb = keyPicker("b");
     const keys = h("div", { class: "row tight", hidden: !S.cmpLater }, ka.el, h("span", { class: "muted small" }, "↔"), kb.el);
@@ -374,12 +390,13 @@ async function viewCompare(el) {
       S.cmpFA = fa.value; S.cmpFB = fb.value; S.cmpSel = sel.value; S.cmpVs = vs.value;
       const params = m === "group" ? { mode: "group", a: S.ds, select: sel.value, vs: vs.value, filter: scoped(S.filter), match_by: matchBy.value } : { mode: "datasets", a: +a.value, b: +b.value, filter_a: scoped(fa.value), filter_b: scoped(fb.value), match_by: matchBy.value };
       if (m === "group" && later.value) Object.assign(params, { later: +later.value, key_a: ka.value(), key_b: kb.value() });
+      if (excl.value.trim()) params.exclude = excl.value;
       runCompare(out, params);
     } }, "Compare");
     ctl.replaceChildren(field("Mode", mode));
     if (m === "group") ctl.append(field("Group (B)", sel), field("Versus (A)", vs), field("Same units in file (drift)", later), field("identified by", keys));
     else ctl.append(field("A", a), field("Filter A", fa), field("B", b), field("Filter B", fb));
-    ctl.append(field("Match tests by", matchBy), run);
+    ctl.append(field("Match tests by", matchBy), field("Leave out tests", excl), run);
     return run;
   }
   const runBtn = render();
@@ -395,7 +412,7 @@ async function runCompare(out, params) {
     let pick = null;
     mkBox.replaceChildren(h("h2", {}, "Marker candidates"), h("div", { class: "loading" }, "Ranking every test (statistics + random forest)…"));
     mkP.then((mk) => (mk instanceof Error ? showErr(mkBox, mk) : renderMarkers(mkBox, mk, (row) => pick && pick(row))));
-    out.replaceChildren(mkBox, h("h2", {}, "Full comparison"), h("div", { class: "kpis" },
+    out.replaceChildren(chartOpts(() => runCompare(out, params), { hist: true }), mkBox, h("h2", {}, "Full comparison"), h("div", { class: "kpis" },
       kpi(r.label_a, pct(r.yield_a), `${r.n_a.toLocaleString()} parts`),
       kpi(r.label_b, pct(r.yield_b), `${r.n_b.toLocaleString()} parts`),
       kpi("Yield delta", (r.yield_b - r.yield_a >= 0 ? "+" : "") + (r.yield_b - r.yield_a).toFixed(2) + " pt"),
@@ -409,16 +426,16 @@ async function runCompare(out, params) {
     out.append(tb, detail);
     const flagKind = (f) => (f === "OK" ? "good" : f.startsWith("ONLY") ? "neutral" : f.includes("+") ? "bad" : "warn");
     const cols = [
-      { key: "flag", label: "Flag", render: (v) => badge(v, flagKind(v)) },
+      { key: "flag", label: "Flag", render: (v) => badge(v, flagKind(v)), title: "SHIFT: mean moved ≥ 0.5 σ (Cohen's d) or ≥ 5 % of the limit range; SPREAD: σ ratio ≥ 1.5 or ≤ 1/1.5; both need Welch q < 0.01. ONLY_A / ONLY_B: the test exists in one population only." },
       { key: "key", label: "Test" },
       { key: "units", label: "Units" },
       { key: "mean_a", label: "Mean A", num: true, sortVal: (r) => r.a.mean },
       { key: "mean_b", label: "Mean B", num: true, sortVal: (r) => r.b.mean },
-      { key: "shift_sigma", label: "Shift σ", num: true, fmt: (v) => fmt(v, 2) },
-      { key: "shift_pct_limit", label: "Shift % lim", num: true, fmt: (v) => (v === null ? "–" : v.toFixed(1)) },
-      { key: "sigma_ratio", label: "σ ratio", num: true, fmt: (v) => fmt(v, 2) },
-      { key: "ks_d", label: "KS D", num: true, fmt: (v) => fmt(v, 3) },
-      { key: "q", label: "q", num: true, fmt: fmtP },
+      { key: "shift_sigma", label: "Shift σ", num: true, fmt: (v) => fmt(v, 2), title: "Cohen's d: mean B − mean A in pooled standard deviations" },
+      { key: "shift_pct_limit", label: "Shift % lim", num: true, fmt: (v) => (v === null ? "–" : v.toFixed(1)), title: "mean shift as a % of the limit range (hi − lo): how much of the test window it eats" },
+      { key: "sigma_ratio", label: "σ ratio", num: true, fmt: (v) => fmt(v, 2), title: "standard deviation B ÷ A" },
+      { key: "ks_d", label: "KS D", num: true, fmt: (v) => fmt(v, 3), title: mkTip("ks_d") },
+      { key: "q", label: "q", num: true, fmt: fmtP, title: "Welch t-test p-value (unequal variances), Benjamini–Hochberg corrected across all tests" },
       { key: "fail_rate_a", label: "Fail% A", num: true, fmt: (v) => v.toFixed(2) },
       { key: "fail_rate_b", label: "Fail% B", num: true, fmt: (v) => v.toFixed(2) },
     ];
@@ -427,7 +444,8 @@ async function runCompare(out, params) {
       loading(detail);
       try {
         const c = await api("chart", Object.assign({}, params, { kind: "compare_test", ds: params.a, test: row.key, range: S.co.range }));
-        detail.replaceChildren(h("h2", {}, row.key), chartOpts(() => showTest(row, false)));
+        detail.replaceChildren(h("h2", {}, row.key), chartOpts(() => showTest(row, false), { hist: true }));
+        normable(c.hist);
         const g2 = h("div", { class: "grid3" });
         detail.append(g2);
         for (const k of ["hist", "cdf", "box"]) { const [card, cc] = chartBox(); g2.append(card); plot(cc, c[k]); }
@@ -447,43 +465,103 @@ async function runCompare(out, params) {
 }
 
 // ---- Marker candidates
+/** Method notes for the marker table: [name, what it tells you about a test]. */
+const MK_HELP = {
+  score: ["Candidate score", "The strongest of the sub-scores (separation, tails, drift, correlation break, residual, random forest), each scaled 0–1. A test ranks high if it is a strong marker in any one view."],
+  why: ["Strongest signal", "Which method produced the score."],
+  auc: ["Rank AUC (Mann–Whitney)", "Chance that a random affected part reads higher on this test than a random reference part. 0.5 = no difference, 0 or 1 = the groups do not overlap at all. It uses ranks, so outliers and non-normal results do not distort it, and it is fair to very unequal group sizes (e.g. 5,000 vs 250 parts)."],
+  separation: ["Separation", "|2·AUC − 1|: 0 = same distribution, 1 = every affected part sits on one side of every reference part."],
+  shift_sigma: ["Robust shift", "(median affected − median reference) ÷ robust σ of the reference (1.4826 × MAD). How far the result moved, in units of the reference's normal spread; the sign gives the direction."],
+  ks_d: ["Kolmogorov–Smirnov D", "Largest gap between the two cumulative distributions (0–1). Catches shape changes such as a second mode or a stretched tail that a median shift can miss."],
+  q: ["Mann–Whitney q", "p-value of the rank test, corrected for testing hundreds of tests at once (Benjamini–Hochberg false-discovery rate). q < 0.05 means the difference is unlikely to be chance."],
+  sigma_ratio: ["Spread ratio", "Robust σ affected ÷ robust σ reference. Above 1 = the affected parts scatter more on this test."],
+  levene_p: ["Levene test (ANOVA on spread)", "One-way ANOVA on each part's distance from its group median: a small p means the spread really differs, even when the centre does not."],
+  tail_ref: ["±3σ share, reference", "Share of reference parts beyond median ± 3 robust σ of the reference (sigma-deviation counting, as used in latent-defect screening)."],
+  tail_aff: ["±3σ share, affected", "Share of affected parts beyond the same ±3σ band of the reference. A marker can hide in a few outliers while the bulk looks unchanged."],
+  tail_excess: ["Tails (±3σ)", "±3σ share of affected minus that of reference."],
+  pat_ref: ["PAT share, reference", "Share of reference parts outside static Part Average Testing limits: median ± 6 robust σ of the reference, never wider than the test limits (AEC-Q001 style)."],
+  pat_aff: ["PAT share, affected", "Share of affected parts outside the same PAT limits: parts that pass the test limits but are statistical outliers."],
+  pat_excess: ["PAT", "PAT share of affected minus that of reference."],
+  anova_p: ["One-way ANOVA p", "F test of the group means (affected vs reference). Assumes roughly normal results; read it next to the rank-based q."],
+  eta2: ["ANOVA η²", "Share of the test's variance explained by the group (0–1): how much of the spread is the affected-vs-reference difference."],
+  fail_ref: ["Fail %, reference", "Share of reference results outside the test limits."],
+  fail_aff: ["Fail %, affected", "Share of affected results outside the test limits."],
+  drift_sep: ["Drift separation", "Same units in a second file: the per-unit change (file 2 − file 1) of affected vs reference units, scored like separation."],
+  drift_shift_sigma: ["Drift shift", "Median per-unit change of affected minus reference, in robust σ of the reference units' change."],
+  r_ref: ["r, reference", "Pearson correlation of file-1 vs file-2 readings for reference units: how repeatable the test is for good units."],
+  r_aff: ["r, affected", "The same correlation for affected units (needs ≥ 8 matched units)."],
+  corr_break: ["Correlation break", "r reference − r affected: the test stops tracking the same unit between files for the affected parts."],
+  resid_sigma: ["Residual", "Fit file 2 vs file 1 on the reference units, then measure how far affected units sit from that line, in robust σ of the reference residuals."],
+  resid_abs: ["Residual", "|residual σ|: affected units' distance from the reference file-1 → file-2 fit."],
+  importance: ["Random-forest importance", "A class-balanced random forest learns affected vs reference from all tests at once; importance is how much each test contributes to its splits, relative to the top test. Finds markers that only work in combination with other tests."],
+};
+const mkTip = (k) => (MK_HELP[k] ? `${MK_HELP[k][0]}: ${MK_HELP[k][1]}` : "");
+/** How each method becomes a 0–1 sub-score; the candidate score is the largest. */
+const MK_SCORE = [
+  ["separation", "Separation", "|2·AUC − 1|, halved when q ≥ 0.05 so chance-level differences rank lower"],
+  ["tails", "Tails (±3σ)", "2 × (affected ±3σ share − reference ±3σ share), clipped to 0–1: 50 extra points of outliers = 1"],
+  ["PAT", "PAT", "4 × (affected PAT share − reference PAT share), clipped to 0–1: 25 extra points outside PAT = 1"],
+  ["drift", "Drift", "drift separation, |2·AUC − 1| of the per-unit change between files"],
+  ["correlation break", "Correlation break", "r reference − r affected, clipped to 0–1"],
+  ["residual", "Residual", "|residual σ| ÷ 6, clipped to 1: a 6σ offset from the reference fit = 1"],
+  ["random forest", "Random forest", "importance × model skill, where skill = 2 × model AUC − 1, so a model that cannot tell the groups apart cannot promote its noise tests"],
+];
+const MK_UNIT = ["drift", "correlation break", "residual"];
+function markerHelp(hasDrift) {
+  const li = (name, text) => h("li", {}, h("b", {}, name), " — ", text);
+  return h("details", { class: "adv help" },
+    h("summary", {}, "ⓘ Methods and how the score is calculated"),
+    h("p", { class: "small" }, "Reference = A (or the rest of the file), affected = B (or the group). Every numeric test is scored on its own; hover a column header or tab for its note."),
+    h("p", { class: "small" }, h("b", {}, "Score = the largest of these sub-scores"), " (each 0–1). Taking the maximum instead of a sum means a test surfaces when it is a clear marker in any one view, and is not boosted for showing the same difference in several. The badge names the sub-score that won."),
+    h("ul", { class: "small" }, ...MK_SCORE.map(([k, n, t]) => li(n, t + (MK_UNIT.includes(k) && !hasDrift ? " (not used here: needs the same units measured in both files)" : "")))),
+    h("p", { class: "small" }, h("b", {}, "Methods")),
+    h("ul", { class: "small" }, ...["auc", "separation", "q", "shift_sigma", "ks_d", "sigma_ratio", "levene_p", "anova_p", "eta2", "tail_aff", "pat_aff", "drift_sep", "corr_break", "resid_sigma", "importance"].map((k) => li(MK_HELP[k][0], MK_HELP[k][1]))),
+    h("p", { class: "small muted" }, "Summary tiles: Model AUC is the random forest's hold-out AUC (can all tests together tell the groups apart?). Outlier-count AUC counts, per part, how many tests fall beyond ±3σ of the reference and compares those counts between the groups; it is high when affected parts are marginal across many tests rather than on one."));
+}
+/** Marks a figure as following the "% of group / counts" histogram switch. */
+const normable = (f) => { if (f) f._normable = true; return f; };
 function renderMarkers(box, mk, onPick) {
   const hasDrift = !!mk.later;
   const p1 = (v) => (v === null || v === undefined ? "–" : (v * 100).toFixed(1));
   const f2 = (v) => (v === null || v === undefined ? "–" : fmt(v, 2));
-  const whyKind = (w) => ({ separation: "bad", tails: "warn", drift: "warn", "correlation break": "warn", residual: "warn" })[w] || "neutral";
+  const whyKind = (w) => ({ separation: "bad", tails: "warn", PAT: "warn", drift: "warn", "correlation break": "warn", residual: "warn" })[w] || "neutral";
   const cols = [
     { key: "rank", label: "#", num: true },
     { key: "key", label: "Test" },
-    { key: "why", label: "Strongest signal", render: (v) => badge(v, whyKind(v)) },
-    { key: "score", label: "Score", num: true, fmt: f2, title: "strongest normalized signal, 0–1" },
-    { key: "auc", label: "AUC", num: true, fmt: f2, title: "P(affected > reference); 0.5 = no difference" },
-    { key: "shift_sigma", label: "Shift σ", num: true, fmt: f2, title: "median shift in robust σ of the reference" },
+    { key: "why", label: "Strongest signal", render: (v) => { const b = badge(v, whyKind(v)); const m = MK_SCORE.find((x) => x[0] === v); b.title = m ? `${m[1]} sub-score: ${m[2]}` : ""; return b; } },
+    { key: "score", label: "Score", num: true, fmt: f2 },
+    { key: "auc", label: "AUC", num: true, fmt: f2 },
+    { key: "shift_sigma", label: "Shift σ", num: true, fmt: f2 },
     { key: "ks_d", label: "KS D", num: true, fmt: f2 },
-    { key: "q", label: "q", num: true, fmt: fmtP, title: "Mann–Whitney, Benjamini–Hochberg corrected" },
+    { key: "q", label: "q", num: true, fmt: fmtP },
     { key: "sigma_ratio", label: "σ ratio", num: true, fmt: f2 },
-    { key: "levene_p", label: "Levene p", num: true, fmt: fmtP, title: "spread difference" },
+    { key: "levene_p", label: "Levene p", num: true, fmt: fmtP },
     { key: "tail_ref", label: "±3σ ref %", num: true, fmt: p1 },
     { key: "tail_aff", label: "±3σ aff %", num: true, fmt: p1 },
+    { key: "pat_ref", label: "PAT ref %", num: true, fmt: p1 },
+    { key: "pat_aff", label: "PAT aff %", num: true, fmt: p1 },
+    { key: "anova_p", label: "ANOVA p", num: true, fmt: fmtP },
+    { key: "eta2", label: "η²", num: true, fmt: f2 },
     { key: "fail_ref", label: "Fail ref %", num: true, fmt: p1 },
     { key: "fail_aff", label: "Fail aff %", num: true, fmt: p1 },
   ];
   if (hasDrift) cols.push(
-    { key: "drift_sep", label: "Drift sep", num: true, fmt: f2, title: "separation of the per-unit change between the two files" },
+    { key: "drift_sep", label: "Drift sep", num: true, fmt: f2 },
     { key: "drift_shift_sigma", label: "Drift σ", num: true, fmt: f2 },
-    { key: "r_ref", label: "r ref", num: true, fmt: f2, title: "file-1 vs file-2 correlation, reference units" },
-    { key: "r_aff", label: "r aff", num: true, fmt: f2, title: "file-1 vs file-2 correlation, affected units" },
-    { key: "resid_sigma", label: "Resid σ", num: true, fmt: f2, title: "affected units vs the reference file-1 → file-2 fit" });
-  cols.push({ key: "importance", label: "RF imp", num: true, fmt: f2, title: "random-forest importance (relative to the top test)" });
-  const views = [["score", "Overall"], ["separation", "Separation"], ["tail_excess", "Tails (±3σ)"]];
+    { key: "r_ref", label: "r ref", num: true, fmt: f2 },
+    { key: "r_aff", label: "r aff", num: true, fmt: f2 },
+    { key: "resid_sigma", label: "Resid σ", num: true, fmt: f2 });
+  cols.push({ key: "importance", label: "RF imp", num: true, fmt: f2 });
+  const views = [["score", "Overall"], ["separation", "Separation"], ["tail_excess", "Tails (±3σ)"], ["pat_excess", "PAT"], ["eta2", "ANOVA η²"]];
   if (hasDrift) views.push(["drift_sep", "Drift between files"], ["corr_break", "Correlation break"], ["resid_abs", "Residual"]);
   views.push(["importance", "Random forest"]);
+  for (const c of cols) c.title = mkTip(c.key);
   const rows = mk.rows.map((r) => Object.assign({ resid_abs: r.resid_sigma === null ? null : Math.abs(r.resid_sigma) }, r));
   const tabs = h("div", { class: "tabs" });
   const tb = h("div");
   const setView = (k) => {
     S.mkView = k;
-    tabs.replaceChildren(...views.map(([v, l]) => h("button", { class: v === k ? "active" : "", onclick: () => setView(v) }, l)));
+    tabs.replaceChildren(...views.map(([v, l]) => h("button", { class: v === k ? "active" : "", title: mkTip(v), onclick: () => setView(v) }, l)));
     const sorted = rows.filter((r) => r[k] !== null && r[k] !== undefined).sort((a, b) => b[k] - a[k]).map((r, i) => Object.assign({}, r, { rank: i + 1 }));
     table(tb, cols, sorted, { limit: 10, search: true, placeholder: "Search tests…", onClick: onPick, tools: h("button", { onclick: () => SC.download("marker_tests.csv", SC.toCSV(cols, sorted)) }, "Download CSV") });
   };
@@ -494,17 +572,19 @@ function renderMarkers(box, mk, onPick) {
     kpi("Model AUC", mk.forest_auc == null ? "–" : fmt(mk.forest_auc, 3), mk.forest_error || "random forest, hold-out: can all tests together tell the groups apart?"),
     kpi("Outlier-count AUC", fmt(mk.sdc_auc, 3), "tests beyond ±3σ per part"),
   ];
+  k[3].title = "Hold-out AUC of a class-balanced random forest trained on all tests: 0.5 = cannot tell the groups apart, 1 = perfect. Also sets how much random-forest importance counts in the score (skill = 2 × AUC − 1).";
+  k[4].title = "Per part, count the tests beyond ±3 robust σ of the reference; this AUC compares those counts between affected and reference parts.";
   if (hasDrift) k.push(kpi("Drift file", mk.later, "same units, matched by identity"));
   box.replaceChildren(h("h2", {}, "Marker candidates"),
     h("p", { class: "lead" }, "Every test ranked by how well it separates the affected parts from the reference: rank AUC and shift, tails beyond ±3σ of the reference" + (hasDrift ? ", how the same units changed in the other file (drift, residual, correlation break)" : "") + ", and random-forest importance. The score is the strongest of these signals. Click a test for its distributions."),
-    h("div", { class: "kpis" }, ...k));
+    h("div", { class: "kpis" }, ...k), markerHelp(hasDrift));
   const g = h("div", { class: "grid2" });
   box.append(g);
-  for (const f of [mk.figures.scores, mk.figures.sdc]) { const [card, c] = chartBox("tall"); g.append(card); plot(c, f); }
+  for (const f of [mk.figures.scores, normable(mk.figures.sdc)]) { const [card, c] = chartBox("tall"); g.append(card); plot(c, f); }
   box.append(h("h3", {}, "Top 10"), tabs, tb, h("h3", {}, "Top candidates: reference vs affected"));
   const g3 = h("div", { class: "grid3" });
   box.append(g3);
-  for (const f of mk.figures.top) { const [card, c] = chartBox(); g3.append(card); plot(c, f); }
+  for (const f of mk.figures.top) { normable(f); const [card, c] = chartBox(); g3.append(card); plot(c, f); }
   setView(views.some(([v]) => v === S.mkView) ? S.mkView : "score");
 }
 
@@ -1048,6 +1128,218 @@ function renderMatch(out, m, traceBox) {
     tools: h("button", { onclick: () => SC.download(`matched_${m.name}.csv`, SC.toCSV(cols.filter((c) => c.key !== "same"), rows)) }, "Download CSV"),
   });
 }
+// ---- Bad candidates
+/** Wafer-coordinate settings shared with the wafer view (tests 80100–80104 by default). */
+function waferCal() { return S.wcal || (S.wcal = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false }); }
+function viewCandidates(el) {
+  el.append(h("h1", {}, "Bad candidates"), h("p", { class: "lead" }, "Parts that were good in file 1 but are bad in file 2 (e.g. failing one test), found by matching the two files by part text. Instead of splitting anything, the matched good parts of file 1 are marked as bad candidates and compared with every other good part of file 1: which tests, outlier scores, sites, wafer zones or field positions set them apart, and which tests to focus on."));
+  if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open both files (without 'combine'): file 1 with most parts, file 2 with the parts that became bad.")); return; }
+  const st = S.bc || (S.bc = { a: S.ds, b: otherDs(S.ds), good: "hbin = 1", test: "", how: "fail", extra: "", name: "bad_candidate", exclude: "500, 80100-80104", coords: "auto" });
+  const ids = S.datasets.map((d) => d.id);
+  if (!ids.includes(st.a)) st.a = S.ds;
+  if (!ids.includes(st.b) || st.b === st.a) st.b = otherDs(st.a);
+  const a = select(dsOptions(), String(st.a), (v) => (st.a = +v));
+  const b = select(dsOptions(), String(st.b), (v) => (st.b = +v));
+  const good = h("input", { type: "text", class: "filter-input", value: st.good, placeholder: "e.g. hbin = 1  or  pass" });
+  const test = h("input", { type: "text", value: st.test, placeholder: "e.g. 1013 (blank = any fail)", style: { width: "170px" } });
+  const how = select([["fail", "fails it"], ["first", "fails it first"], ["only", "fails only it"]], st.how);
+  const extra = h("input", { type: "text", class: "filter-input", value: st.extra, placeholder: "optional extra filter on file 2" });
+  const ka = keyPicker("ca"), kb = keyPicker("cb");
+  const name = h("input", { type: "text", value: st.name, style: { width: "130px" }, title: "Part set name, usable as $name in every filter" });
+  const excl = h("input", { type: "text", value: st.exclude, style: { width: "190px" }, title: "Identity tests (wafer, X/Y, die ID…) differ by position only; leave them out of the ranking. Ranges allowed." });
+  const coords = select([["auto", "auto (PRR X/Y, else tests)"], ["tests", "from tests (Wafer maps settings)"]], st.coords);
+  const out = h("div"), traceBox = h("div");
+  const badFilter = () => {
+    const t = test.value.trim().replace(/:.*/, "");
+    const tc = !t ? "" : how.value === "first" ? `first_fail = ${t}` : how.value === "only" ? `fail(${t}) and n_fails = 1` : `fail(${t})`;
+    return ["not pass", tc, extra.value.trim() ? `(${extra.value.trim()})` : ""].filter(Boolean).join(" and ");
+  };
+  const run = async () => {
+    Object.assign(st, { a: +a.value, b: +b.value, good: good.value.trim(), test: test.value.trim(), how: how.value, extra: extra.value, name: name.value.trim() || "bad_candidate", exclude: excl.value, coords: coords.value });
+    if (st.a === st.b) return toast("Pick two different files", "bad");
+    const popF = scoped(st.good), set = "$" + st.name;
+    loading(out, "Matching file 2's bad parts to file 1's good parts…");
+    try {
+      const m = await api("match", { a: st.a, b: st.b, key_a: ka.value(), key_b: kb.value(), filter_a: popF, filter_b: badFilter(), name: st.name });
+      if (!m.pairs) { out.replaceChildren(h("div", { class: "err" }, `None of the ${m.n_b.toLocaleString()} bad parts of file 2 (${badFilter()}) matched a good part of file 1 (${popF || "all parts"}). Check the identity (${m.key_a} ↔ ${m.key_b}) and the filters.`)); return; }
+      const w = waferCal();
+      const common = { a: st.a, filter: popF, exclude: st.exclude, range: S.co.range };
+      const cal = { coords: st.coords, wafer_test: w.w, x_test: w.x, y_test: w.y, ox_test: w.ox, oy_test: w.oy, offset_mode: w.mode, flip_x: w.fx, flip_y: w.fy };
+      loading(out, `${m.pairs.toLocaleString()} bad candidates found; ranking every test and outlier score…`);
+      const [mk, cd] = await Promise.all([
+        api("markers", Object.assign({ mode: "group", select: set, vs: "", later: st.b, key_a: ka.value(), key_b: kb.value() }, common)).catch((e) => e),
+        api("candidates", Object.assign({ name: st.name }, common, cal)),
+      ]);
+      renderCandidates(out, traceBox, { m, mk, cd, st, popF, set, keys: { key_a: ka.value(), key_b: kb.value() }, badF: badFilter() });
+    } catch (e) { showErr(out, e); }
+  };
+  el.append(
+    h("div", { class: "controls" }, field("File 1 (good parts)", a), field("Good parts are", good), field("Identify parts by", ka.el)),
+    h("div", { class: "controls" }, field("File 2 (became bad)", b), field("Bad parts failing test", h("div", { class: "row tight" }, test, how)), field("Extra filter", extra), field("Identify parts by", kb.el)),
+    h("div", { class: "controls" }, field("Mark them as", name), field("Leave out tests", excl), field("Die X/Y", coords), h("button", { class: "primary", onclick: run }, "Find bad candidates")),
+    out, traceBox);
+  if (S.bcLast && ids.includes(S.bcLast.st.a) && ids.includes(S.bcLast.st.b)) renderCandidates(out, traceBox, S.bcLast);
+}
+/** One line on how the candidates differ on a test, in the terms of its strongest signal. */
+function focusNote(r, pctS) {
+  const parts = [];
+  if (r.why === "tails") parts.push(`${pctS(r.tail_aff, 0)} of candidates beyond ±3σ vs ${pctS(r.tail_ref)} of the others`);
+  else if (r.why === "PAT") parts.push(`${pctS(r.pat_aff, 0)} of candidates outside PAT limits vs ${pctS(r.pat_ref)} of the others`);
+  else if (r.why === "random forest") parts.push(`random-forest importance ${fmt(r.importance, 2)}: it separates them together with other tests`);
+  else if (r.drift_sep != null && ["drift", "residual", "correlation break"].includes(r.why)) parts.push(`the same units changed differently between the files (drift ${fmt(r.drift_shift_sigma, 2)}σ, residual ${fmt(r.resid_sigma, 2)}σ)`);
+  parts.push(`median ${r.shift_sigma >= 0 ? "higher" : "lower"} by ${fmt(Math.abs(r.shift_sigma), 2)}σ, AUC ${fmt(r.auc, 2)}`);
+  // how close the typical candidate sits to a limit, as a share of the limit window
+  if (r.lo != null && r.hi != null && r.hi > r.lo) {
+    const near = (m) => { const dl = (m - r.lo) / (r.hi - r.lo), dh = (r.hi - m) / (r.hi - r.lo); return dl < dh ? ["LO", dl] : ["HI", dh]; };
+    const [lim, da] = near(r.median_aff);
+    const dr = lim === "LO" ? (r.median_ref - r.lo) / (r.hi - r.lo) : (r.hi - r.median_ref) / (r.hi - r.lo);
+    if (dr - da >= 0.05) parts.push(`median ${(da * 100).toFixed(0)}% of the limit window from ${lim} (others ${(dr * 100).toFixed(0)}%)`);
+  }
+  return parts.join("; ") + ".";
+}
+function renderCandidates(out, traceBox, R) {
+  S.bcLast = R;
+  const { m, mk, cd, st, popF, set } = R;
+  const A = dsName(st.a), B = dsName(st.b);
+  const pctS = (v, d) => (v == null ? "–" : (v * 100).toFixed(d ?? 1) + "%");
+  out.replaceChildren(h("div", { class: "kpis" },
+    kpi("Bad in file 2", m.n_b.toLocaleString(), R.badF),
+    kpi("Bad candidates", m.pairs.toLocaleString(), `good in ${A}, ${set}`),
+    kpi("Not found as good", m.only_b.toLocaleString(), "bad in file 2 without a good match in file 1"),
+    kpi("Reference", cd.n_ref.toLocaleString(), `other good parts (${popF || "all"})`),
+    kpi("Tests ranked", cd.n_tests.toLocaleString(), cd.excluded ? `${cd.excluded} left out` : "")));
+  out.append(h("div", { class: "row" },
+    h("button", { onclick: () => useFilter(st.a, set) }, "Analyse the candidates (filter " + set + ")"),
+    h("button", { onclick: () => { S.cmpMode = "group"; S.cmpSel = set; S.cmpVs = ""; S.ds = st.a; S.filter = popF; go("compare"); } }, "Open in Compare"),
+    h("button", { onclick: () => { S.wmode = "pass"; S.ds = st.a; go("wafer"); } }, "Wafer maps")));
+
+  // plain-language summary of what they share
+  const sum = h("ul", { class: "findings" });
+  const rows = mk instanceof Error ? [] : mk.rows;
+  const top = rows.filter((r, i) => i === 0 || r.score >= 0.3).slice(0, 3);
+  for (const r of top) sum.append(h("li", {}, h("b", {}, r.key), ` (${r.why}, score ${fmt(r.score, 2)}): `, focusNote(r, pctS)));
+  const failed = cd.b_fails[0];
+  if (failed && rows.length) {
+    const i = rows.findIndex((r) => r.key === failed.key);
+    const r = rows[i];
+    sum.append(h("li", {}, `The test they fail in ${B}, `, h("b", {}, failed.key), i < 0 ? ` is not ranked in ${A} (no results there, or left out).`
+      : r.score >= 0.3 ? ` already sets them apart in ${A}: rank #${i + 1}, score ${fmt(r.score, 2)}. They were marginal on it before failing.`
+      : ` does not set them apart in ${A} (rank #${i + 1}, score ${fmt(r.score, 2)}): no early sign on the same test, so look at the other focus tests.`));
+  }
+  const ind = cd.indicators[0];
+  if (ind) sum.append(h("li", {}, h("b", {}, ind.name), `: AUC ${fmt(ind.auc, 2)}, ${pctS(ind.capture, 0)} of candidates fall in the top 5 % of good parts (${fmt(ind.lift, 1)}× chance).`));
+  const fac = cd.factors.find((f) => f.p < 0.01);
+  if (fac) { const l = fac.levels[0]; sum.append(h("li", {}, h("b", {}, fac.name), `: ${l.level} has ${pctS(l.rate, 2)} candidates vs ${pctS(m.pairs / (cd.n_ref + cd.n_aff), 2)} overall (${fmt(l.lift, 1)}×, p ${fmtP(fac.p)}).`)); }
+  else sum.append(h("li", {}, "No site, wafer, zone or bin stands out (no factor with p < 0.01)."));
+  if (cd.b_fails.length) sum.append(h("li", {}, `In ${B} they fail: `, cd.b_fails.slice(0, 4).map((f) => `${f.key} (${pctS(f.share, 0)})`).join(", "), "."));
+  out.append(h("h2", {}, "What the candidates have in common"), sum);
+
+  // focus tests (marker ranking)
+  const focus = h("div");
+  const mkBox = h("div");
+  out.append(chartOpts(() => showFocus(S.bcFocus), { hist: true }), mkBox, focus);
+  const showFocus = async (key) => {
+    if (!key) return;
+    S.bcFocus = key;
+    loading(focus);
+    try {
+      const second = (mk.rows || []).map((r) => r.key).find((k) => k !== key);
+      const [d, dual, sc] = await Promise.all([
+        api("chart", { kind: "hist", ds: st.a, filter: popF, test: key, group_by: set, density: true, range: S.co.range }),
+        api("match_dual", { link: m.link, test_a: key, test_b: key, color_by: "pass", color_side: "b", range: S.co.range, filter_a: "", filter_b: "" }).catch((e) => e),
+        second ? api("chart", { kind: "scatter", ds: st.a, filter: popF, test: key, test2: second, group_by: set, range: S.co.range }).catch((e) => e) : null,
+      ]);
+      focus.replaceChildren(h("h2", {}, `Focus: ${key}`), h("p", { class: "lead" }, `${A}: bad candidates against the other good parts. Below, the same candidates' results in ${A} against ${B}.`));
+      const g = h("div", { class: "grid2" });
+      focus.append(g);
+      for (const k of ["hist", "box", "cdf", "trend"]) { const [card, c] = chartBox(); g.append(card); plot(c, k === "hist" ? normable(d[k]) : d[k]); }
+      const g2 = h("div", { class: "grid2" });
+      focus.append(g2);
+      if (sc && !(sc instanceof Error)) { const [card, c] = chartBox("tall"); g2.append(card); plot(c, sc.scatter); }
+      if (dual && !(dual instanceof Error)) { const [card, c] = chartBox("tall"); g2.append(card); plot(c, dual.figures.scatter); }
+      focus.scrollIntoView({ behavior: "smooth", block: "start" });
+    } catch (e) { showErr(focus, e); }
+  };
+  if (mk instanceof Error) showErr(mkBox, mk);
+  else {
+    renderMarkers(mkBox, mk, (row) => showFocus(row.key));
+    mkBox.querySelector("h2").textContent = "Focus tests";
+  }
+
+  // indicators
+  const indBox = h("div");
+  out.append(h("h2", {}, "Outlier indicators"), h("p", { class: "lead" }, "Would a per-part outlier score have caught the candidates in file 1? AUC 0.5 = no better than chance. Capture = share of candidates above the 95th percentile of the other good parts; lift = capture ÷ 5 %. Flagged = share over the method's usual threshold."), indBox);
+  const ig = h("div", { class: "grid2" });
+  const it = h("div");
+  indBox.append(ig);
+  {
+    const [card, c] = chartBox();
+    ig.append(card, it);
+    const rows = [...cd.indicators].reverse();
+    plot(c, { data: [{ type: "bar", orientation: "h", y: rows.map((r) => r.name), x: rows.map((r) => r.auc), marker: { color: rows.map((r) => (r.auc >= 0.7 ? "@fail" : "@s1")) }, text: rows.map((r) => `capture ${pctS(r.capture, 0)}`), textposition: "auto", hovertemplate: "%{y}<br>AUC %{x:.2f}<br>%{text}<extra></extra>" }],
+      layout: { title: { text: "How well each score separates the candidates (AUC)", x: 0.01, xanchor: "left", font: { size: 15 } }, xaxis: { range: [0, 1], title: { text: "AUC" } }, yaxis: { automargin: true }, margin: { l: 250, r: 20, t: 56, b: 44 }, shapes: [{ type: "line", x0: 0.5, x1: 0.5, yref: "paper", y0: 0, y1: 1, line: { color: "@muted", dash: "dot" } }] } });
+    table(it, [
+      { key: "name", label: "Indicator" },
+      { key: "auc", label: "AUC", num: true, fmt: (v) => fmt(v, 2), title: "chance that a candidate scores higher than another good part" },
+      { key: "capture", label: "Capture", num: true, fmt: (v) => pctS(v, 0), title: "candidates above the 95th percentile of the other good parts" },
+      { key: "lift", label: "Lift", num: true, fmt: (v) => fmt(v, 1) + "×", title: "capture ÷ 5 %" },
+      { key: "flagged_aff", label: "Flagged cand.", num: true, fmt: (v) => pctS(v), title: "candidates over the method's usual threshold" },
+      { key: "flagged_ref", label: "Flagged good", num: true, fmt: (v) => pctS(v), title: "other good parts over the same threshold" },
+    ], cd.indicators, { search: false });
+  }
+
+  // common factors
+  const fBox = h("div"), fChart = h("div");
+  out.append(h("h2", {}, "Common factors"), h("p", { class: "lead" }, "Are the candidates concentrated somewhere? χ² test of the candidate rate across the levels of each factor (Cramér's V = strength, 0–1). Wafer zone splits each wafer by radius: centre < 50 %, middle < 80 %, edge. Click a factor for its levels."), h("div", { class: "grid2" }, fBox, fChart));
+  const showFactor = (f) => {
+    const lv = f.levels.slice(0, 30);
+    const [card, c] = chartBox();
+    fChart.replaceChildren(card);
+    plot(c, { data: [{ type: "bar", x: lv.map((l) => l.level), y: lv.map((l) => l.rate * 100), customdata: lv.map((l) => [l.n_aff, l.n]), marker: { color: lv.map((l) => (l.lift >= 2 ? "@fail" : "@s1")) }, hovertemplate: "%{x}<br>%{y:.2f}% candidates (%{customdata[0]} of %{customdata[1]})<extra></extra>" }],
+      layout: { title: { text: `${f.name}: candidate rate per level`, x: 0.01, xanchor: "left", font: { size: 15 } }, xaxis: { type: "category", title: { text: "" } }, yaxis: { title: { text: "% candidates" } }, margin: { l: 60, r: 20, t: 56, b: 80 },
+        shapes: [{ type: "line", xref: "paper", x0: 0, x1: 1, y0: (100 * cd.n_aff) / (cd.n_ref + cd.n_aff), y1: (100 * cd.n_aff) / (cd.n_ref + cd.n_aff), line: { color: "@muted", dash: "dot" } }] } });
+  };
+  const frows = cd.factors.map((f) => Object.assign({ top: f.levels[0].level, top_rate: f.levels[0].rate, top_lift: f.levels[0].lift, n_levels: f.levels.length }, f));
+  table(fBox, [
+    { key: "name", label: "Factor" },
+    { key: "n_levels", label: "Levels", num: true },
+    { key: "p", label: "p", num: true, fmt: fmtP, title: "χ² test: is the candidate rate the same on every level?" },
+    { key: "cramers_v", label: "V", num: true, fmt: (v) => fmt(v, 2), title: "Cramér's V: strength of the association, 0–1" },
+    { key: "top", label: "Highest level" },
+    { key: "top_rate", label: "Rate", num: true, fmt: (v) => pctS(v, 2) },
+    { key: "top_lift", label: "Lift", num: true, fmt: (v) => fmt(v, 1) + "×", title: "rate ÷ overall candidate rate" },
+  ], frows, { search: false, onClick: showFactor });
+  if (frows.length) showFactor(frows[0]);
+  else fChart.replaceChildren(h("p", { class: "muted" }, "No factor with more than one level."));
+
+  // stacked wafer map
+  if (cd.stack.length) {
+    const xs = [...new Set(cd.stack.map((p) => p.x))].sort((p, q) => p - q), ys = [...new Set(cd.stack.map((p) => p.y))].sort((p, q) => p - q);
+    const z = ys.map(() => xs.map(() => null)), tx = ys.map(() => xs.map(() => ""));
+    for (const p of cd.stack) { const i = ys.indexOf(p.y), j = xs.indexOf(p.x); z[i][j] = p.k ? (100 * p.k) / p.n : 0; tx[i][j] = `${p.k} of ${p.n}`; }
+    const [card, c] = chartBox("tall");
+    out.append(h("h2", {}, "Where on the wafer"), h("p", { class: "lead" }, `All wafers stacked: share of good parts at each die position that became bad candidates (die X/Y from ${cd.coords === "prr" ? "PRR" : "the wafer-map test settings"}).`), card);
+    plot(c, { data: [{ type: "heatmap", x: xs, y: ys, z, text: tx, colorscale: "@seq", zmin: 0, xgap: 1, ygap: 1, colorbar: { title: { text: "% cand." }, thickness: 12 }, hovertemplate: "(%{x},%{y})<br>%{text} candidates<br>%{z:.1f}%<extra></extra>" }],
+      layout: { title: { text: "Bad-candidate rate per die position", x: 0.01, xanchor: "left", font: { size: 15 } }, xaxis: { title: { text: "X" } }, yaxis: { title: { text: "Y" }, scaleanchor: "x", autorange: "reversed" }, margin: { l: 50, r: 20, t: 56, b: 44 } } });
+  }
+
+  // candidates
+  const tb = h("div");
+  out.append(h("h2", {}, "Candidates"), h("p", { class: "muted" }, "Anomaly %ile = rank of the combined anomaly score among the other good parts (99 = more abnormal than 99 % of them). Worst tests = largest deviations from the other good parts, in robust σ. Click a row to trace the part in both files."), tb);
+  const cols = [
+    { key: "key", label: "Identity" }, { key: "wafer", label: "Wafer" }, { key: "x", label: "X", num: true }, { key: "y", label: "Y", num: true }, { key: "site", label: "Site", num: true }, { key: "sbin", label: "Sbin", num: true },
+    { key: "b_hbin", label: "Hbin in 2", num: true }, { key: "b_fails", label: "Fails in 2" },
+    { key: "anomaly_pct", label: "Anomaly %ile", num: true, fmt: (v) => (v == null ? "–" : v.toFixed(0)) },
+    { key: "sdc", label: "Tests >3σ", num: true }, { key: "worst", label: "Worst tests" },
+  ];
+  table(tb, cols, cd.parts, {
+    sort: "anomaly_pct",
+    onClick: (r) => trace(traceBox, Object.assign({ a: st.a, b: st.b, row_a: r.row }, R.keys, { value: r.key })),
+    tools: h("button", { onclick: () => SC.download(`${st.name}.csv`, SC.toCSV(cols, cd.parts)) }, "Download CSV"),
+  });
+  if (!(mk instanceof Error) && mk.rows.length) showFocus(S.bcFocus && mk.rows.some((r) => r.key === S.bcFocus) ? S.bcFocus : mk.rows[0].key).then(() => window.scrollTo(0, 0));
+}
+
 async function trace(el, params) {
   loading(el, "Tracing…");
   try {

@@ -89,6 +89,16 @@ pub struct PartAnomaly {
     pub score: f64,
 }
 
+/// Every method's raw score for one analysed part (NaN = not computed).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RowScores {
+    pub max_robust_z: f64,
+    pub n_pat: usize,
+    pub max_nnr_z: f64,
+    pub mahal_d2: f64,
+    pub iforest: f64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct AnomalyReport {
     pub n_parts: usize,
@@ -105,6 +115,9 @@ pub struct AnomalyReport {
     pub rows: Vec<usize>,
     #[serde(skip)]
     pub iforest_scores: Vec<f64>,
+    /// per-method scores for every analysed row (same order as `rows`)
+    #[serde(skip)]
+    pub per_row: Vec<RowScores>,
 }
 
 pub fn detect(ds: &Dataset, rows: &[usize], opt: &AnomalyOptions) -> AnomalyReport {
@@ -199,7 +212,8 @@ pub fn detect(ds: &Dataset, rows: &[usize], opt: &AnomalyOptions) -> AnomalyRepo
         .collect();
     // NNR
     let mut nnr = vec![(0usize, 0.0f64); n];
-    if opt.nnr && rows.iter().any(|&r| ds.parts[r].x != -32768) {
+    let nnr_on = opt.nnr && rows.iter().any(|&r| ds.parts[r].x != -32768);
+    if nnr_on {
         let mut by_wafer: HashMap<(u16, u32), Vec<usize>> = HashMap::new();
         for (k, &r) in rows.iter().enumerate() {
             let p = &ds.parts[r];
@@ -316,6 +330,19 @@ pub fn detect(ds: &Dataset, rows: &[usize], opt: &AnomalyOptions) -> AnomalyRepo
     }
     let mut parts: Vec<PartAnomaly> = vec![];
     let mut scores = vec![0.0; n];
+    let per_row: Vec<RowScores> = (0..n)
+        .map(|k| RowScores {
+            max_robust_z: uni[k].1,
+            n_pat: if ds.parts[rows[k]].is_pass() {
+                uni[k].2
+            } else {
+                0
+            },
+            max_nnr_z: if nnr_on { nnr[k].1 } else { f64::NAN },
+            mahal_d2: mahal[k].0,
+            iforest: ifs[k],
+        })
+        .collect();
     let mut by_method: HashMap<String, usize> = HashMap::new();
     for (k, &r) in rows.iter().enumerate() {
         let p = &ds.parts[r];
@@ -389,5 +416,6 @@ pub fn detect(ds: &Dataset, rows: &[usize], opt: &AnomalyOptions) -> AnomalyRepo
         scores,
         rows: rows.to_vec(),
         iforest_scores: ifs,
+        per_row,
     }
 }

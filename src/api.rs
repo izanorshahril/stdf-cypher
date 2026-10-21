@@ -164,6 +164,120 @@ fn test_ref(ds: &Dataset, q: &str) -> Result<usize> {
         .ok_or_else(|| anyhow!("test '{q}' not found"))
 }
 
+/// Die coordinates rebuilt from datalogged results: wafer, X and Y tests plus
+/// optional per-part X/Y offsets (e.g. reticle origin logged next to X/Y).
+struct TestXy {
+    tx: usize,
+    ty: usize,
+    tw: Option<usize>,
+    tox: Option<usize>,
+    toy: Option<usize>,
+    /// +1 adds the offset, −1 subtracts it
+    sign: f64,
+    flip_x: bool,
+    flip_y: bool,
+}
+
+impl TestXy {
+    fn parse(ds: &Dataset, pp: &P) -> Result<Self> {
+        let opt_test = |k: &str, what: &str| -> Result<Option<usize>> {
+            let q = pp.str(k);
+            if q.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(test_ref(ds, &q).context(what.to_string())?))
+            }
+        };
+        Ok(Self {
+            tx: test_ref(ds, &pp.str("x_test")).context("X test")?,
+            ty: test_ref(ds, &pp.str("y_test")).context("Y test")?,
+            tw: opt_test("wafer_test", "wafer test")?,
+            tox: opt_test("ox_test", "X offset test")?,
+            toy: opt_test("oy_test", "Y offset test")?,
+            sign: if pp.str("offset_mode") == "sub" {
+                -1.0
+            } else {
+                1.0
+            },
+            flip_x: pp.bool("flip_x", false),
+            flip_y: pp.bool("flip_y", false),
+        })
+    }
+    fn xy(&self, ds: &Dataset, row: usize) -> Option<(i16, i16)> {
+        let off = |t: Option<usize>| t.map(|t| ds.value(t, row)).unwrap_or(0.0);
+        let x = ds.value(self.tx, row) + self.sign * off(self.tox);
+        let y = ds.value(self.ty, row) + self.sign * off(self.toy);
+        let ok = |v: f64| v.is_finite() && v.abs() < 32767.0;
+        let (x, y) = (
+            if self.flip_x { -x } else { x },
+            if self.flip_y { -y } else { y },
+        );
+        (ok(x) && ok(y)).then(|| (x.round() as i16, y.round() as i16))
+    }
+    /// Wafer label ("all" without a wafer test); None when the result is missing.
+    fn wafer(&self, ds: &Dataset, row: usize) -> Option<String> {
+        match self.tw {
+            Some(tw) => {
+                let v = ds.value(tw, row);
+                v.is_finite().then(|| data::matching::num_key(v))
+            }
+            None => Some("all".to_string()),
+        }
+    }
+    /// Position within the stepping field: X/Y before the offsets are added.
+    fn field_xy(&self, ds: &Dataset, row: usize) -> Option<(i64, i64)> {
+        self.tox.or(self.toy)?;
+        let (x, y) = (ds.value(self.tx, row), ds.value(self.ty, row));
+        (x.is_finite() && y.is_finite()).then(|| (x.round() as i64, y.round() as i64))
+    }
+}
+
+/// Test numbers from a list like "500, 80100-80104".
+fn parse_nums(s: &str) -> Result<Vec<u32>> {
+    let mut v = vec![];
+    for part in s
+        .split([',', ' ', ';'])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let part = part.split(':').next().unwrap_or(part);
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (u32, u32) = (a.trim().parse()?, b.trim().parse()?);
+                if b < a || b - a > 100_000 {
+                    bail!("bad test range {part}");
+                }
+                v.extend(a..=b);
+            }
+            None => v.push(
+                part.parse()
+                    .with_context(|| format!("'{part}' is not a test number"))?,
+            ),
+        }
+    }
+    Ok(v)
+}
+
+/// Groups for a `$set` color choice: parts outside the set, then inside it.
+fn set_groups(
+    reg: &Registry,
+    id: usize,
+    rows: &[usize],
+    by: &str,
+) -> Option<Vec<(String, Vec<usize>)>> {
+    let name = by.strip_prefix('$')?;
+    let flags = reg.set(id, name)?;
+    let (inn, out): (Vec<usize>, Vec<usize>) = rows
+        .iter()
+        .partition(|&&r| flags.get(r).copied().unwrap_or(false));
+    Some(
+        vec![(format!("not {by}"), out), (by.to_string(), inn)]
+            .into_iter()
+            .filter(|g| !g.1.is_empty())
+            .collect(),
+    )
+}
+
 fn groups_for(ds: &Dataset, rows: &[usize], by: &str) -> Vec<(String, Vec<usize>)> {
     groups_for_test(ds, rows, by, None)
 }
@@ -692,6 +806,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "match_dual" => match_dual_op(reg, &pp),
         "trace" => trace_op(reg, &pp),
         "markers" => markers_op(reg, &pp),
+        "candidates" => candidates_op(reg, &pp),
         "subset_ds" => subset_op(reg, &pp),
         "part_detail" => {
             let id = pp.usize("ds", 0);
@@ -1002,7 +1117,8 @@ fn chart(reg: &Registry, pp: &P) -> Result<Value> {
     Ok(match kind.as_str() {
         "hist" | "box" | "cdf" | "trend" | "stats" => {
             let t = test_ref(&ds, &pp.str("test"))?;
-            let g = groups_for_test(&ds, &r, &group_by, Some(t));
+            let g = set_groups(reg, id, &r, &group_by)
+                .unwrap_or_else(|| groups_for_test(&ds, &r, &group_by, Some(t)));
             let info = &ds.tests[t];
             let st: Vec<Value> = g.iter().map(|(name, rows)| {
                 let d = stats::describe(&ds.values_of(t, Some(rows)), info.lo, info.hi);
@@ -1027,7 +1143,9 @@ fn chart(reg: &Registry, pp: &P) -> Result<Value> {
         "scatter" => {
             let t = test_ref(&ds, &pp.str("test"))?;
             let t2 = test_ref(&ds, &pp.str("test2"))?;
-            let mut f = viz::scatter(&ds, t, t2, &groups_for(&ds, &r, &group_by));
+            let g = set_groups(reg, id, &r, &group_by)
+                .unwrap_or_else(|| groups_for(&ds, &r, &group_by));
+            let mut f = viz::scatter(&ds, t, t2, &g);
             viz::set_range(
                 &mut f,
                 "xaxis",
@@ -1052,56 +1170,16 @@ fn chart(reg: &Registry, pp: &P) -> Result<Value> {
             } else {
                 None
             };
-            let tx = test_ref(&ds, &pp.str("x_test")).context("X test")?;
-            let ty = test_ref(&ds, &pp.str("y_test")).context("Y test")?;
-            let wq = pp.str("wafer_test");
-            let tw = if wq.trim().is_empty() {
-                None
-            } else {
-                Some(test_ref(&ds, &wq).context("wafer test")?)
-            };
-            // optional per-part offsets (e.g. reticle / stepping origin logged next to X/Y)
-            let opt_test = |k: &str, what: &str| -> Result<Option<usize>> {
-                let q = pp.str(k);
-                if q.trim().is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(test_ref(&ds, &q).context(what.to_string())?))
-                }
-            };
-            let tox = opt_test("ox_test", "X offset test")?;
-            let toy = opt_test("oy_test", "Y offset test")?;
-            let sign = if pp.str("offset_mode") == "sub" {
-                -1.0
-            } else {
-                1.0
-            };
-            let (fx, fy) = (pp.bool("flip_x", false), pp.bool("flip_y", false));
-            let coord = |row: usize| -> Option<(i16, i16)> {
-                let off = |t: Option<usize>| match t {
-                    Some(t) => ds.value(t, row),
-                    None => 0.0,
-                };
-                let x = ds.value(tx, row) + sign * off(tox);
-                let y = ds.value(ty, row) + sign * off(toy);
-                let ok = |v: f64| v.is_finite() && v.abs() < 32767.0;
-                let (x, y) = (if fx { -x } else { x }, if fy { -y } else { y });
-                (ok(x) && ok(y)).then(|| (x.round() as i16, y.round() as i16))
-            };
+            let txy = TestXy::parse(&ds, pp)?;
+            let (tx, ty, tw) = (txy.tx, txy.ty, txy.tw);
+            let coord = |row: usize| txy.xy(&ds, row);
             let mut by_wafer: IndexMap<String, Vec<usize>> = IndexMap::new();
             for &row in &r {
                 if coord(row).is_none() {
                     continue;
                 }
-                let w = match tw {
-                    Some(tw) => {
-                        let v = ds.value(tw, row);
-                        if !v.is_finite() {
-                            continue;
-                        }
-                        data::matching::num_key(v)
-                    }
-                    None => "all".to_string(),
+                let Some(w) = txy.wafer(&ds, row) else {
+                    continue;
                 };
                 by_wafer.entry(w).or_default().push(row);
             }
@@ -1751,6 +1829,7 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
         trees: pp.usize("trees", 150),
         match_by: pp.str_or("match_by", "key"),
         min_n: pp.usize("min_n", 5),
+        exclude: parse_nums(&pp.str("exclude"))?,
     };
     let rep = markers::find(
         &Group {
@@ -1930,4 +2009,341 @@ pub fn export_csv_op(reg: &Registry, p: &Value) -> Result<String> {
         }
     };
     Ok(export_csv(&ds, &r, &tests))
+}
+
+/// Bad-candidate profile: what the parts of set `name` (e.g. good here but bad
+/// in a later file) have in common against the rest of the population
+/// (`filter`): per-part outlier indicators, factor enrichment (site, wafer,
+/// wafer zone, stepping-field position…), where they sit on the wafer, what
+/// they failed in the later file, and a per-candidate list.
+fn candidates_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::analysis::{self, candidates as cand};
+    use rayon::prelude::*;
+    use std::collections::HashMap;
+    let id = pp.usize("a", 0);
+    let (ds, _) = reg.get(id)?;
+    let name = set_name(&pp.str("name"));
+    let flags = reg
+        .set(id, &name)
+        .ok_or_else(|| anyhow!("part set ${name} does not exist yet: match the files first"))?;
+    let pop = reg.rows(id, &ds, &pp.str("filter"))?;
+    let aff: Vec<bool> = pop
+        .iter()
+        .map(|&r| flags.get(r).copied().unwrap_or(false))
+        .collect();
+    let n_aff = aff.iter().filter(|&&a| a).count();
+    if n_aff == 0 {
+        bail!("none of the parts in the population is in ${name}");
+    }
+    if n_aff == pop.len() {
+        bail!("every part of the population is in ${name}: nothing left to compare against");
+    }
+    let exclude = parse_nums(&pp.str("exclude"))?;
+    let tests: Vec<usize> = ds
+        .numeric_tests()
+        .into_iter()
+        .filter(|&t| !exclude.contains(&ds.tests[t].num))
+        .collect();
+    let split = |v: &[f64]| -> (Vec<f64>, Vec<f64>) {
+        let (mut r, mut a) = (vec![], vec![]);
+        for (x, &is) in v.iter().zip(&aff) {
+            if is {
+                a.push(*x)
+            } else {
+                r.push(*x)
+            }
+        }
+        (r, a)
+    };
+
+    // sigma-deviation count and worst tests against the reference
+    let ref_rows: Vec<usize> = pop
+        .iter()
+        .zip(&aff)
+        .filter(|p| !*p.1)
+        .map(|p| *p.0)
+        .collect();
+    let centers: Vec<(usize, f64, f64)> = tests
+        .par_iter()
+        .filter_map(|&t| {
+            let v = ds.values_of(t, Some(&ref_rows));
+            if v.len() < 10 {
+                return None;
+            }
+            let s = analysis::stats::robust_sigma(&v);
+            (s > 0.0).then(|| (t, analysis::stats::median(&v), s))
+        })
+        .collect();
+    let zs = |row: usize| -> Vec<(usize, f64)> {
+        centers
+            .iter()
+            .filter_map(|&(t, c, s)| {
+                let v = ds.value(t, row);
+                v.is_finite().then(|| (t, (v - c) / s))
+            })
+            .collect()
+    };
+    let sdc: Vec<f64> = pop
+        .par_iter()
+        .map(|&r| zs(r).iter().filter(|z| z.1.abs() > 3.0).count() as f64)
+        .collect();
+
+    // unsupervised outlier scores over the whole population
+    let an = anomaly::detect(
+        &ds,
+        &pop,
+        &anomaly::AnomalyOptions {
+            tests: Some(tests.clone()),
+            ..Default::default()
+        },
+    );
+    let col =
+        |f: &dyn Fn(&anomaly::RowScores) -> f64| -> Vec<f64> { an.per_row.iter().map(f).collect() };
+    let mut indicators = vec![];
+    for (key, label, v, flag) in [
+        (
+            "sdc",
+            "Sigma-deviation count (tests beyond ±3σ)",
+            sdc.clone(),
+            None,
+        ),
+        (
+            "robust_z",
+            "Largest robust z of any test",
+            col(&|r| r.max_robust_z),
+            Some(6.0),
+        ),
+        (
+            "pat",
+            "Tests outside PAT limits",
+            col(&|r| r.n_pat as f64),
+            Some(1.0),
+        ),
+        (
+            "nnr",
+            "Wafer neighbourhood residual (NNR)",
+            col(&|r| r.max_nnr_z),
+            Some(5.0),
+        ),
+        (
+            "mahalanobis",
+            "Mahalanobis distance (all tests)",
+            col(&|r| r.mahal_d2),
+            None,
+        ),
+        (
+            "iforest",
+            "Isolation Forest score",
+            col(&|r| r.iforest),
+            Some(0.62),
+        ),
+        (
+            "combined",
+            "Combined anomaly score",
+            an.scores.clone(),
+            None,
+        ),
+    ] {
+        let (r, a) = split(&v);
+        if let Some(i) = cand::indicator(key, label, &r, &a, flag) {
+            indicators.push(i);
+        }
+    }
+    indicators.sort_by(|a, b| {
+        b.auc
+            .partial_cmp(&a.auc)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // die positions: PRR X/Y, else rebuilt from logged tests
+    let txy = TestXy::parse(&ds, pp).ok();
+    let use_prr = pp.str("coords") != "tests" && pop.iter().any(|&r| ds.parts[r].x != -32768);
+    let pos: Vec<Option<(String, f64, f64)>> = pop
+        .iter()
+        .map(|&r| {
+            let p = &ds.parts[r];
+            if use_prr {
+                (p.x != -32768).then(|| {
+                    (
+                        format!("{}|{}", p.file, ds.wafer_name(p)),
+                        p.x as f64,
+                        p.y as f64,
+                    )
+                })
+            } else {
+                let t = txy.as_ref()?;
+                let (x, y) = t.xy(&ds, r)?;
+                Some((t.wafer(&ds, r)?, x as f64, y as f64))
+            }
+        })
+        .collect();
+
+    // factors
+    let lab = |f: &dyn Fn(usize) -> Option<String>| -> Vec<Option<String>> {
+        pop.iter().map(|&r| f(r)).collect()
+    };
+    let mut fl: Vec<(&str, &str, Vec<Option<String>>)> = vec![
+        (
+            "site",
+            "Test site",
+            lab(&|r| Some(format!("site {}", ds.parts[r].site))),
+        ),
+        (
+            "head",
+            "Test head",
+            lab(&|r| Some(format!("head {}", ds.parts[r].head))),
+        ),
+        (
+            "sbin",
+            "Soft bin",
+            lab(&|r| Some(format!("sbin {}", ds.parts[r].sbin))),
+        ),
+        (
+            "hbin",
+            "Hard bin",
+            lab(&|r| Some(format!("hbin {}", ds.parts[r].hbin))),
+        ),
+        (
+            "lot",
+            "Lot / file",
+            lab(&|r| {
+                ds.sources
+                    .get(ds.parts[r].file as usize)
+                    .map(|s| format!("{} ({})", s.lot_id, s.sublot_id))
+            }),
+        ),
+        (
+            "alarm",
+            "Tester alarm on any test",
+            lab(&|r| {
+                Some(
+                    if ds.parts[r].alarms.is_empty() {
+                        "no alarm"
+                    } else {
+                        "alarm"
+                    }
+                    .to_string(),
+                )
+            }),
+        ),
+        (
+            "wafer",
+            "Wafer",
+            pos.iter()
+                .map(|p| {
+                    p.as_ref()
+                        .map(|p| p.0.rsplit('|').next().unwrap_or(&p.0).to_string())
+                })
+                .collect(),
+        ),
+        ("zone", "Wafer zone (radius)", cand::zones(&pos)),
+    ];
+    if let Some(t) = txy.as_ref().filter(|_| !use_prr) {
+        fl.push((
+            "field",
+            "Position in the stepping field (X/Y before offset)",
+            lab(&|r| t.field_xy(&ds, r).map(|(x, y)| format!("({x},{y})"))),
+        ));
+    }
+    let mut factors: Vec<cand::Factor> = fl
+        .into_iter()
+        .filter_map(|(k, n, l)| cand::factor(k, n, &l, &aff))
+        .collect();
+    factors.sort_by(|a, b| a.p.partial_cmp(&b.p).unwrap_or(std::cmp::Ordering::Equal));
+
+    // stacked map: parts and candidates per die position over all wafers
+    let mut stack: IndexMap<(i64, i64), (usize, usize)> = IndexMap::new();
+    for (p, &a) in pos.iter().zip(&aff) {
+        if let Some((_, x, y)) = p {
+            let e = stack.entry((*x as i64, *y as i64)).or_default();
+            e.0 += 1;
+            e.1 += a as usize;
+        }
+    }
+    let stack: Vec<Value> = stack
+        .iter()
+        .map(|(&(x, y), &(n, k))| json!({"x": x, "y": y, "n": n, "k": k}))
+        .collect();
+
+    // the later file: what the candidates failed there
+    let link = {
+        let m = reg.matches.read().unwrap();
+        m.iter().find(|l| l.a == id && l.name == name).map(|l| {
+            (
+                l.b,
+                l.pairs
+                    .iter()
+                    .map(|(x, y, k)| (*x, (*y, k.clone())))
+                    .collect::<HashMap<usize, (usize, String)>>(),
+            )
+        })
+    };
+    let later = match &link {
+        Some((b, pairs)) => Some((reg.get(*b)?.0, pairs)),
+        None => None,
+    };
+    let mut b_fails: IndexMap<String, usize> = IndexMap::new();
+    let mut b_bins: IndexMap<u16, usize> = IndexMap::new();
+    if let Some((db, pairs)) = &later {
+        for (&r, _) in pop.iter().zip(&aff).filter(|p| *p.1) {
+            if let Some((rb, _)) = pairs.get(&r) {
+                let p = &db.parts[*rb];
+                *b_bins.entry(p.hbin).or_default() += 1;
+                for &t in &p.fails {
+                    *b_fails.entry(db.tests[t as usize].key.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+    b_fails.sort_by(|_, a, _, b| b.cmp(a));
+    b_bins.sort_by(|_, a, _, b| b.cmp(a));
+
+    // one row per candidate
+    let ref_combined: Vec<f64> = analysis::stats::sorted(&split(&an.scores).0);
+    let pct_of = |v: f64| {
+        if ref_combined.is_empty() || !v.is_finite() {
+            return Value::Null;
+        }
+        json!(ref_combined.partition_point(|&x| x < v) as f64 * 100.0 / ref_combined.len() as f64)
+    };
+    let parts: Vec<Value> = pop
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| aff[*k])
+        .take(5000)
+        .map(|(k, &r)| {
+            let p = &ds.parts[r];
+            let mut z = zs(r);
+            z.sort_by(|a, b| b.1.abs().partial_cmp(&a.1.abs()).unwrap_or(std::cmp::Ordering::Equal));
+            let worst: Vec<String> = z.iter().take(3).map(|(t, z)| format!("{} ({:+.1}σ)", ds.tests[*t].key, z)).collect();
+            let (b_hbin, fails, key) = match &later {
+                Some((db, pairs)) => match pairs.get(&r) {
+                    Some((rb, key)) => {
+                        let q = &db.parts[*rb];
+                        let f: Vec<String> = q.fails.iter().take(4).map(|&t| db.tests[t as usize].key.clone()).collect();
+                        (json!(q.hbin), f.join(", "), key.clone())
+                    }
+                    None => (Value::Null, String::new(), String::new()),
+                },
+                None => (Value::Null, String::new(), String::new()),
+            };
+            let (wafer, x, y) = match &pos[k] {
+                Some((w, x, y)) => (w.rsplit('|').next().unwrap_or(w).to_string(), json!(x), json!(y)),
+                None => (String::new(), Value::Null, Value::Null),
+            };
+            json!({"row": r, "key": key, "part_id": p.part_id, "part_txt": p.part_txt, "wafer": wafer, "x": x, "y": y,
+                "site": p.site, "sbin": p.sbin, "b_hbin": b_hbin, "b_fails": fails,
+                "anomaly_pct": pct_of(an.scores[k]), "iforest": n(an.per_row[k].iforest), "sdc": sdc[k] as usize,
+                "worst": worst.join(", ")})
+        })
+        .collect();
+
+    Ok(json!({
+        "name": name, "n_ref": pop.len() - n_aff, "n_aff": n_aff, "n_tests": centers.len(), "excluded": exclude.len(),
+        "later": link.as_ref().map(|l| reg.name(l.0)),
+        "indicators": indicators, "factors": factors, "stack": stack, "coords": if use_prr { "prr" } else if txy.is_some() { "tests" } else { "" },
+        "b_fails": b_fails.iter().map(|(k, c)| json!({"key": k, "n": c, "share": *c as f64 / n_aff as f64})).collect::<Vec<_>>(),
+        "b_bins": b_bins.iter().map(|(k, c)| json!({"bin": k, "n": c})).collect::<Vec<_>>(),
+        "parts": parts,
+    }))
 }
