@@ -1,0 +1,60 @@
+[package]
+name = "stdf-cypher"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Open STDF v4 analytics: parse, compare, split, correlate, ANOVA, anomaly detection, ML and interactive visualization"
+repository = "https://github.com/izanorshahril/stdf-cypher"
+readme = "README.md"
+build = "build.rs"
+keywords = ["stdf", "semiconductor", "test", "analytics", "ate"]
+categories = ["command-line-utilities", "science", "parser-implementations"]
+
+[lib]
+name = "stdf_cypher"
+path = "src/lib.rs"
+
+[[bin]]
+name = "stdf-cypher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+flate2 = "1"
+statrs = "0.18"
+nalgebra = "0.33"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1"
+regex = "1"
+indexmap = { version = "2", features = ["serde"] }
+csv = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "fs", "io-util", "time", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console", "Win32_UI_WindowsAndMessaging"] }
+rfd = "0.15"
+raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rfd = "0.15"
+
+[build-dependencies]
+embed-resource = "3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.dev.package."*"]
+opt-level = 2

@@ -1,0 +1,28 @@
+# Build output
+/target
+/dist/
+*.exe
+*.pdb
+
+# STDF data and generated outputs (never commit test-floor data)
+*.stdf
+*.stdf.gz
+*.std
+*.std.gz
+!tests/data/*.stdf
+stdf_report.html
+*_report.html
+split_out/
+*_split/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local environment
+.env
+.env.*

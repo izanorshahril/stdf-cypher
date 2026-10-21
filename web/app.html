@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>STDF Cypher</title>
+<link rel="icon" href="/favicon.ico">
+<style>/*__STYLE__*/</style>
+<script src="/static/plotly.min.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <button class="brand ghost" id="homebtn" title="Home"><img src="/static/icon.png" alt="" width="22" height="22">STDF Cypher <small id="ver"></small></button>
+  <button id="open" class="primary" title="Open STDF files (Ctrl+O)">＋ Open files</button>
+  <label class="field"><span>Dataset</span><span class="row tight"><select id="ds"></select><button id="rename" class="ghost icon" title="Rename this dataset">✎</button></span></label>
+  <label class="field"><span>Population</span><select id="scope" title="Limit every chart and analysis to good parts"><option value="all">all parts</option><option value="good">good parts only</option></select></label>
+  <div class="grow">
+    <label class="field" style="flex:1"><span>Part filter</span>
+      <input id="filter" class="filter-input" type="text" spellcheck="false" placeholder='optional, e.g.  site in (1,2) and hbin != 5   ·   wafer ~ "W0[1-3]"   ·   t[1000] > 0.3'>
+    </label>
+  </div>
+  <button id="apply" style="align-self:flex-end">Apply</button>
+  <button id="clear" class="ghost" style="align-self:flex-end" title="Clear filter">Clear</button>
+  <button id="theme" class="ghost" style="align-self:flex-end" title="Light / dark theme">◐</button>
+</header>
+<div class="layout">
+  <nav class="side" id="nav"></nav>
+  <main id="main"></main>
+</div>
+<div id="drop-overlay"><div><img src="/static/icon.png" alt="" width="72" height="72"><b>Drop STDF files to open them</b><span>.stdf · .std · .gz</span></div></div>
+<div id="busy" hidden><div class="busy-card"><div class="spinner"></div><div class="busy-msg"></div><div class="busy-bar" hidden><div></div></div></div></div>
+<div id="toasts"></div>
+<div id="offline-banner">The STDF Cypher app has stopped. Start it again to continue.</div>
+<script>/*__COMMON__*/</script>
+<script>/*__APP__*/</script>
+</body>
+</html>

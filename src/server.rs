@@ -1,0 +1,241 @@
+//! Interactive dashboard server (axum). All analysis runs in Rust; the page
+//! asks for results and Plotly figures through `POST /api/{op}`.
+
+use crate::api::{self, Registry};
+use anyhow::Result;
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{header, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
+
+pub const PLOTLY_JS: &str = include_str!("../web/vendor/plotly.min.js");
+pub const COMMON_JS: &str = include_str!("../web/common.js");
+pub const STYLE_CSS: &str = include_str!("../web/style.css");
+const APP_HTML: &str = include_str!("../web/app.html");
+const APP_JS: &str = include_str!("../web/app.js");
+pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
+const ICON_ICO: &[u8] = include_bytes!("../assets/icon.ico");
+
+pub fn app_page() -> String {
+    APP_HTML
+        .replace("/*__STYLE__*/", STYLE_CSS)
+        .replace("/*__COMMON__*/", COMMON_JS)
+        .replace("/*__APP__*/", APP_JS)
+}
+
+async fn index() -> Html<String> {
+    Html(app_page())
+}
+
+async fn plotly() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/javascript"),
+            (header::CACHE_CONTROL, "max-age=86400"),
+        ],
+        PLOTLY_JS,
+    )
+        .into_response()
+}
+
+async fn favicon() -> Response {
+    ([(header::CONTENT_TYPE, "image/x-icon")], ICON_ICO).into_response()
+}
+
+async fn icon_png() -> Response {
+    ([(header::CONTENT_TYPE, "image/png")], ICON_PNG).into_response()
+}
+
+async fn op(
+    State(reg): State<Arc<Registry>>,
+    Path(op): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let params = body.map(|b| b.0).unwrap_or(json!({}));
+    let res = tokio::task::spawn_blocking(move || api::run(&reg, &op, &params)).await;
+    match res {
+        Ok(Ok(v)) => Json(json!({"ok": true, "data": v})).into_response(),
+        Ok(Err(e)) => (
+            StatusCode::OK,
+            Json(json!({"ok": false, "error": format!("{e:#}")})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn export_csv(
+    State(reg): State<Arc<Registry>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let params: Value = json!(q);
+    match tokio::task::spawn_blocking(move || api::export_csv_op(&reg, &params)).await {
+        Ok(Ok(csv)) => (
+            [
+                (header::CONTENT_TYPE, "text/csv"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"stdf-cypher-export.csv\"",
+                ),
+            ],
+            csv,
+        )
+            .into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, format!("{e:#}")).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// Receive a dropped file (raw body) and store it in the cache folder.
+async fn upload(Query(q): Query<HashMap<String, String>>, body: Body) -> Response {
+    let name = q
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| "upload.stdf".into());
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let dir = crate::desktop::cache_dir().join("uploads");
+    let res: Result<String> = async {
+        tokio::fs::create_dir_all(&dir).await?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let sub = dir.join(stamp.to_string());
+        tokio::fs::create_dir_all(&sub).await?;
+        let path = sub.join(&safe);
+        let mut f = tokio::fs::File::create(&path).await?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            f.write_all(&chunk?).await?;
+        }
+        f.flush().await?;
+        Ok(path.to_string_lossy().to_string())
+    }
+    .await;
+    match res {
+        Ok(p) => Json(json!({"ok": true, "data": {"path": p, "name": name}})).into_response(),
+        Err(e) => {
+            Json(json!({"ok": false, "error": format!("upload failed: {e:#}")})).into_response()
+        }
+    }
+}
+
+/// Dropped when the window's event stream disconnects (window closed / reloaded).
+struct WindowGuard(Arc<Registry>);
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        self.0.session.disconnect();
+    }
+}
+
+/// Long-lived event stream: tells the app the window is alive (unaffected by
+/// background-tab timer throttling) and pushes files opened from a 2nd launch.
+async fn events(
+    State(reg): State<Arc<Registry>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    reg.session.connect();
+    let rx = reg.session.events.subscribe();
+    let guard = WindowGuard(reg);
+    let stream = futures_util::stream::unfold((guard, rx), |(g, mut rx)| async move {
+        let ev = tokio::select! {
+            m = rx.recv() => match m {
+                Ok(paths) => Event::default().event("open").data(paths),
+                Err(_) => Event::default().comment("lag"),
+            },
+            _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => Event::default().comment("alive"),
+        };
+        Some((Ok(ev), (g, rx)))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+pub fn router(reg: Arc<Registry>) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/favicon.ico", get(favicon))
+        .route("/static/icon.png", get(icon_png))
+        .route("/static/plotly.min.js", get(plotly))
+        .route("/api/export.csv", get(export_csv))
+        .route(
+            "/api/upload",
+            post(upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/events", get(events))
+        .route("/api/{op}", post(op))
+        .with_state(reg)
+}
+
+/// Run the server on an already-bound listener until Ctrl+C or, in app mode,
+/// until the app window has been closed.
+pub async fn run(reg: Arc<Registry>, listener: tokio::net::TcpListener) -> Result<()> {
+    let watch = reg.clone();
+    axum::serve(listener, router(reg))
+        .with_graceful_shutdown(async move {
+            let ctrl_c = tokio::signal::ctrl_c();
+            let window_closed = async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    if watch.session.should_exit() {
+                        break;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = window_closed => {},
+            }
+        })
+        .await?;
+    Ok(())
+}
+
+pub async fn serve(reg: Arc<Registry>, host: &str, port: u16, open: bool) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let addr = listener.local_addr()?;
+    let url = format!(
+        "http://{}:{}/",
+        if host == "0.0.0.0" { "localhost" } else { host },
+        addr.port()
+    );
+    eprintln!("stdf-cypher dashboard: {url}  (Ctrl+C to stop)");
+    if open {
+        let _ = crate::desktop::open_default_browser(&url);
+    }
+    run(reg, listener).await
+}
+
+/// Desktop app: free port, app window, exit when the window closes.
+pub async fn app(reg: Arc<Registry>, open_window: bool) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    let url = format!("http://127.0.0.1:{port}/");
+    crate::desktop::write_instance(port);
+    eprintln!("{} running at {url}", crate::desktop::APP_NAME);
+    if open_window {
+        crate::desktop::open_window(&url)?;
+    }
+    let r = run(reg, listener).await;
+    crate::desktop::clear_instance();
+    r
+}
