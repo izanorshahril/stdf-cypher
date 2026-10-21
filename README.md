@@ -44,7 +44,7 @@ When double-clicked, Windows briefly shows a console window before the app hides
 
 ## Install
 
-**Windows:** download `stdf-cypher.exe` from the [latest release](https://github.com/izanorshahril/stdf-cypher/releases/latest). Copy it anywhere and double-click it. No installer and no admin rights are needed.
+**Windows:** download `stdf-cypher-<version>-windows-x64.zip` from the [latest release](https://github.com/izanorshahril/stdf-cypher/releases/latest), extract it anywhere and double-click `stdf-cypher.exe`. No installer and no admin rights are needed.
 
 **Build from source** (Rust 1.80+ stable; on Windows use the default MSVC toolchain from rustup.rs):
 
