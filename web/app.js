@@ -4,8 +4,17 @@ const { h, plot, fmt, fmtP, pct, kpi, chartBox, badge, table } = SC;
 
 const S = { datasets: [], ds: 0, filter: "", view: "overview", testsCache: {}, scope: "all", co: { range: "both", dim: "2d", opacity: 0.6, hist: "pct" } };
 try { Object.assign(S.co, JSON.parse(localStorage.getItem("sc-chart") || "{}")); S.scope = localStorage.getItem("sc-scope") || "all"; } catch (e) {}
+// order of opened files (dataset order, e.g. retest runs): time | name | none
+S.optSort = "time";
+try { S.optSort = localStorage.getItem("sc-sort") || "time"; } catch (e) {}
 const main = document.getElementById("main");
-const GROUPS = [["", "none"], ["pass", "good / bad"], ["alarm", "alarm"], ["site", "test site"], ["head", "head"], ["hbin", "hard bin"], ["sbin", "soft bin"], ["wafer", "wafer"], ["file", "file / lot"]];
+const GROUPS = [["", "none"], ["pass", "good / bad"], ["alarm", "alarm"], ["site", "test site"], ["head", "head"], ["hbin", "hard bin"], ["sbin", "soft bin"], ["wafer", "wafer"], ["file", "file / lot"], ["loadboard", "loadboard"], ["site_loadboard", "site × loadboard"]];
+/** Loadboard test number input (a session setting: the `loadboard` field reads this test's most common value per file). */
+function loadboardField() {
+  const i = h("input", { type: "text", value: S.lbTest || "5100", style: { width: "80px" }, title: "Test number holding the loadboard (DIB) ID. Read per file (its most common value), so parts missing it still get the file's board. Usable as the field `loadboard` in filters, color-by, ANOVA and commonality, and `site_loadboard` for site × board.",
+    onchange: async (e) => { const v = e.target.value.trim(); try { const r = await api("loadboard", { test: v }); S.lbTest = String(r.test); S.testsCache = {}; toast(`Loadboard = test ${r.test}`, "good"); } catch (err) { toast(err.message, "bad"); } } });
+  return field("Loadboard test", i);
+}
 
 async function api(op, params) {
   const r = await fetch("/api/" + op, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params || {}) });
@@ -176,7 +185,10 @@ const VIEWS = {
   wafer: { label: "Wafer maps", fn: viewWafer },
   compare: { label: "Compare", fn: viewCompare },
   match: { label: "Match & trace", fn: viewMatch },
+  investigation: { label: "Failure investigation", fn: viewInvestigation },
   candidates: { label: "Bad candidates", fn: viewCandidates },
+  signature: { label: "Signature check", fn: viewSignature },
+  retest: { label: "Retest trace", fn: viewRetest },
   correlation: { label: "Correlation", fn: viewCorrelation },
   anova: { label: "ANOVA", fn: viewAnova },
   anomaly: { label: "Abnormal parts", fn: viewAnomaly },
@@ -305,11 +317,33 @@ async function viewExplorer(el) {
         kpi("Test", `${t.num}`, t.name), kpi("Limits", `${fmt(t.lo)} … ${fmt(t.hi)}`, t.units || ""), kpi("Results", d.stats.reduce((a, g) => a + g.n, 0).toLocaleString(), S.scope === "good" || S.filter ? "in the selection" : ""), kpi("Outside limits", d.stats.reduce((a, g) => a + g.fails, 0).toLocaleString())));
       const g = h("div", { class: "grid2" });
       charts.append(g);
-      for (const k of ["hist", "box", "cdf", "trend"]) { const [card, c] = chartBox(); g.append(card); plot(c, d[k]); }
-      charts.append(h("h2", {}, "Statistics by group"));
+      // groups unticked in the statistics table are left off the charts (kept per grouping)
+      const multi = d.stats.length > 1;
+      const hidKey = S.explorerGroup || "";
+      const hidden = (S.explorerHidden ||= {})[hidKey] ||= new Set();
+      const isOf = (tr, name) => tr.name === name || (tr.name || "").startsWith(`${name} (n=`) || tr.name === `${name} outliers`;
+      const plotAll = () => {
+        g.replaceChildren();
+        for (const k of ["hist", "box", "cdf", "trend"]) {
+          const [card, c] = chartBox();
+          g.append(card);
+          const fig = multi && hidden.size ? Object.assign({}, d[k], { data: d[k].data.filter((tr) => !d.stats.some((x) => hidden.has(x.group) && isOf(tr, x.group))) }) : d[k];
+          plot(c, fig);
+        }
+      };
+      plotAll();
+      const toggle = (name, on) => { if (on) hidden.delete(name); else hidden.add(name); plotAll(); };
+      const allBox = multi ? h("span", { class: "row tight small" },
+        h("button", { onclick: () => { hidden.clear(); st.querySelectorAll("input[data-group]").forEach((x) => (x.checked = true)); plotAll(); } }, "All"),
+        h("button", { onclick: () => { d.stats.forEach((x) => hidden.add(x.group)); st.querySelectorAll("input[data-group]").forEach((x) => (x.checked = false)); plotAll(); } }, "None"),
+        h("span", { class: "muted" }, "tick the groups to show on the charts")) : null;
+      charts.append(h("div", { class: "row" }, h("h2", {}, "Statistics by group"), allBox));
       const st = h("div");
       charts.append(st);
-      table(st, [{ key: "group", label: "Group" }, { key: "n", label: "N", num: true }, { key: "mean", label: "Mean", num: true }, { key: "std", label: "Std", num: true }, { key: "min", label: "Min", num: true }, { key: "q1", label: "Q1", num: true }, { key: "median", label: "Median", num: true }, { key: "q3", label: "Q3", num: true }, { key: "max", label: "Max", num: true }, { key: "cpk", label: "Cpk", num: true, fmt: (v) => fmt(v, 2) }, { key: "fails", label: "Fails", num: true }], d.stats, { search: false });
+      const groupCol = multi
+        ? { key: "group", label: "Group", render: (v) => h("label", { class: "chk" }, h("input", { type: "checkbox", "data-group": v, checked: !hidden.has(v), onclick: (e) => e.stopPropagation(), onchange: (e) => toggle(v, e.target.checked) }), String(v)) }
+        : { key: "group", label: "Group" };
+      table(st, [groupCol, { key: "n", label: "N", num: true }, { key: "mean", label: "Mean", num: true }, { key: "std", label: "Std", num: true }, { key: "min", label: "Min", num: true }, { key: "q1", label: "Q1", num: true }, { key: "median", label: "Median", num: true }, { key: "q3", label: "Q3", num: true }, { key: "max", label: "Max", num: true }, { key: "cpk", label: "Cpk", num: true, fmt: (v) => fmt(v, 2) }, { key: "fails", label: "Fails", num: true }], d.stats, { search: false });
       if (t2.value) {
         const s = await api("chart", P({ kind: "scatter", test: S.explorerTest, test2: t2.value, group_by: S.explorerGroup || "" }));
         const [card, c] = chartBox("tall");
@@ -405,13 +439,14 @@ async function viewCompare(el) {
 async function runCompare(out, params) {
   loading(out);
   const mkBox = h("div");
-  const mkP = api("markers", Object.assign({}, params, { range: S.co.range })).catch((e) => e);
+  const mkP = api("markers", Object.assign({}, params, { range: S.co.range, methods: mkMethods() })).catch((e) => e);
   try {
     const d = await api("compare", params);
     const r = d.report;
     let pick = null;
     mkBox.replaceChildren(h("h2", {}, "Marker candidates"), h("div", { class: "loading" }, "Ranking every test (statistics + random forest)…"));
-    mkP.then((mk) => (mk instanceof Error ? showErr(mkBox, mk) : renderMarkers(mkBox, mk, (row) => pick && pick(row))));
+    const fetchTop = (key) => api("chart", Object.assign({}, params, { kind: "compare_test", ds: params.a, test: key, range: S.co.range })).then((c) => c.hist);
+    mkP.then((mk) => (mk instanceof Error ? showErr(mkBox, mk) : renderMarkers(mkBox, mk, (row) => pick && pick(row), { fetchTop })));
     out.replaceChildren(chartOpts(() => runCompare(out, params), { hist: true }), mkBox, h("h2", {}, "Full comparison"), h("div", { class: "kpis" },
       kpi(r.label_a, pct(r.yield_a), `${r.n_a.toLocaleString()} parts`),
       kpi(r.label_b, pct(r.yield_b), `${r.n_b.toLocaleString()} parts`),
@@ -467,7 +502,7 @@ async function runCompare(out, params) {
 // ---- Marker candidates
 /** Method notes for the marker table: [name, what it tells you about a test]. */
 const MK_HELP = {
-  score: ["Candidate score", "The strongest of the sub-scores (separation, tails, drift, correlation break, residual, random forest), each scaled 0–1. A test ranks high if it is a strong marker in any one view."],
+  score: ["Candidate score", "The strongest of the ticked sub-scores (separation, tails, PAT, ANOVA, drift, correlation break, residual, random forest), each scaled 0–1. A test ranks high if it is a strong marker in any one view."],
   why: ["Strongest signal", "Which method produced the score."],
   auc: ["Rank AUC (Mann–Whitney)", "Chance that a random affected part reads higher on this test than a random reference part. 0.5 = no difference, 0 or 1 = the groups do not overlap at all. It uses ranks, so outliers and non-normal results do not distort it, and it is fair to very unequal group sizes (e.g. 5,000 vs 250 parts)."],
   separation: ["Separation", "|2·AUC − 1|: 0 = same distribution, 1 = every affected part sits on one side of every reference part."],
@@ -496,35 +531,67 @@ const MK_HELP = {
   importance: ["Random-forest importance", "A class-balanced random forest learns affected vs reference from all tests at once; importance is how much each test contributes to its splits, relative to the top test. Finds markers that only work in combination with other tests."],
 };
 const mkTip = (k) => (MK_HELP[k] ? `${MK_HELP[k][0]}: ${MK_HELP[k][1]}` : "");
-/** How each method becomes a 0–1 sub-score; the candidate score is the largest. */
+/** How each method becomes a 0–1 sub-score; the candidate score is the largest of the ticked ones. */
 const MK_SCORE = [
   ["separation", "Separation", "|2·AUC − 1|, halved when q ≥ 0.05 so chance-level differences rank lower"],
   ["tails", "Tails (±3σ)", "2 × (affected ±3σ share − reference ±3σ share), clipped to 0–1: 50 extra points of outliers = 1"],
   ["PAT", "PAT", "4 × (affected PAT share − reference PAT share), clipped to 0–1: 25 extra points outside PAT = 1"],
+  ["ANOVA", "ANOVA", "η = √η², the correlation ratio (share of the test's spread explained by the group, on the same 0–1 footing as separation), halved when the ANOVA p ≥ 0.05. Off by default: it repeats the separation view under a normality assumption"],
   ["drift", "Drift", "drift separation, |2·AUC − 1| of the per-unit change between files"],
   ["correlation break", "Correlation break", "r reference − r affected, clipped to 0–1"],
   ["residual", "Residual", "|residual σ| ÷ 6, clipped to 1: a 6σ offset from the reference fit = 1"],
   ["random forest", "Random forest", "importance × model skill, where skill = 2 × model AUC − 1, so a model that cannot tell the groups apart cannot promote its noise tests"],
 ];
 const MK_UNIT = ["drift", "correlation break", "residual"];
-function markerHelp(hasDrift) {
+const MK_DEFAULT = MK_SCORE.map((m) => m[0]).filter((m) => m !== "ANOVA");
+/** The ticked score methods (shared by Compare and Bad candidates). */
+const mkMethods = () => (S.mkMethods && S.mkMethods.length ? S.mkMethods : MK_DEFAULT);
+/** Score and strongest signal of one marker row from its sub-scores, over the ticked methods. */
+function mkRescore(r, methods) {
+  let best = [0, ""];
+  for (const [k] of MK_SCORE) {
+    const v = r.subs && r.subs[k];
+    if (!methods.includes(k) || v === undefined || v === null) continue;
+    if (!best[1] || v > best[0]) best = [v, k];
+  }
+  return Object.assign({}, r, { score: best[0], why: best[1] || "–" });
+}
+function markerHelp(hasDrift, methods, avail) {
   const li = (name, text) => h("li", {}, h("b", {}, name), " — ", text);
+  const note = (k) => (!avail.includes(k) ? (MK_UNIT.includes(k) && !hasDrift ? " (not available here: needs the same units measured in both files)" : " (not available in this run)") : !methods.includes(k) ? " (not ticked: not counted)" : "");
   return h("details", { class: "adv help" },
     h("summary", {}, "ⓘ Methods and how the score is calculated"),
     h("p", { class: "small" }, "Reference = A (or the rest of the file), affected = B (or the group). Every numeric test is scored on its own; hover a column header or tab for its note."),
-    h("p", { class: "small" }, h("b", {}, "Score = the largest of these sub-scores"), " (each 0–1). Taking the maximum instead of a sum means a test surfaces when it is a clear marker in any one view, and is not boosted for showing the same difference in several. The badge names the sub-score that won."),
-    h("ul", { class: "small" }, ...MK_SCORE.map(([k, n, t]) => li(n, t + (MK_UNIT.includes(k) && !hasDrift ? " (not used here: needs the same units measured in both files)" : "")))),
+    h("p", { class: "small" }, h("b", {}, "Score = the largest of the ticked sub-scores"), ` (each 0–1; now: ${methods.map((k) => MK_SCORE.find((m) => m[0] === k)[1]).join(", ")}). Taking the maximum instead of a sum means a test surfaces when it is a clear marker in any one view, and is not boosted for showing the same difference in several. The badge names the sub-score that won. Untick a method to rank without it; the table, chart and badges follow without re-running.`),
+    h("ul", { class: "small" }, ...MK_SCORE.filter(([k]) => methods.includes(k)).map(([k, n, t]) => li(n, t + note(k)))),
+    MK_SCORE.some(([k]) => !methods.includes(k)) ? h("p", { class: "small muted" }, "Not counted: ", MK_SCORE.filter(([k]) => !methods.includes(k)).map(([k, n]) => n + note(k)).join("; "), ".") : null,
     h("p", { class: "small" }, h("b", {}, "Methods")),
     h("ul", { class: "small" }, ...["auc", "separation", "q", "shift_sigma", "ks_d", "sigma_ratio", "levene_p", "anova_p", "eta2", "tail_aff", "pat_aff", "drift_sep", "corr_break", "resid_sigma", "importance"].map((k) => li(MK_HELP[k][0], MK_HELP[k][1]))),
     h("p", { class: "small muted" }, "Summary tiles: Model AUC is the random forest's hold-out AUC (can all tests together tell the groups apart?). Outlier-count AUC counts, per part, how many tests fall beyond ±3σ of the reference and compares those counts between the groups; it is high when affected parts are marginal across many tests rather than on one."));
 }
 /** Marks a figure as following the "% of group / counts" histogram switch. */
 const normable = (f) => { if (f) f._normable = true; return f; };
-function renderMarkers(box, mk, onPick) {
+const MK_COLOR = { separation: "@s1", tails: "@s2", drift: "@s3", "correlation break": "@s7", residual: "@s4", ANOVA: "@s6" };
+/** Bar chart of the top 20 scores, one trace per strongest signal. */
+function markerScoreFig(mk, rows) {
+  const bars = rows.slice(0, 20);
+  const whys = [...new Set(bars.map((r) => r.why))].sort();
+  return { data: whys.map((w) => { const sel = bars.filter((r) => r.why === w); return { type: "bar", orientation: "h", name: w, y: sel.map((r) => r.key), x: sel.map((r) => r.score), marker: { color: MK_COLOR[w] || "@s5" }, hovertemplate: "%{y}<br>score %{x:.2f}<extra>%{fullData.name}</extra>" }; }),
+    layout: { title: { text: `Top marker candidates (${mk.n_aff} affected vs ${mk.n_ref} reference)`, x: 0.01, xanchor: "left", font: { size: 15 } }, xaxis: { title: { text: "candidate score (strongest ticked signal)" }, range: [0, 1.02] },
+      yaxis: { autorange: "reversed", type: "category", categoryorder: "array", categoryarray: bars.map((r) => r.key) }, barmode: "overlay", margin: { l: 190, r: 20, t: 64, b: 50 },
+      legend: { orientation: "h", x: 1, xanchor: "right", y: 1.0, yanchor: "bottom" } } };
+}
+/**
+ * Marker ranking with score-method checkboxes. `opts.fetchTop(key)` returns
+ * (a promise of) the reference-vs-affected histogram of a test the server did
+ * not draw; `opts.onRescore(rows)` hears every re-ranking.
+ */
+function renderMarkers(box, mk, onPick, opts) {
+  opts = opts || {};
   const hasDrift = !!mk.later;
   const p1 = (v) => (v === null || v === undefined ? "–" : (v * 100).toFixed(1));
   const f2 = (v) => (v === null || v === undefined ? "–" : fmt(v, 2));
-  const whyKind = (w) => ({ separation: "bad", tails: "warn", PAT: "warn", drift: "warn", "correlation break": "warn", residual: "warn" })[w] || "neutral";
+  const whyKind = (w) => ({ separation: "bad", tails: "warn", PAT: "warn", ANOVA: "warn", drift: "warn", "correlation break": "warn", residual: "warn" })[w] || "neutral";
   const cols = [
     { key: "rank", label: "#", num: true },
     { key: "key", label: "Test" },
@@ -556,7 +623,10 @@ function renderMarkers(box, mk, onPick) {
   if (hasDrift) views.push(["drift_sep", "Drift between files"], ["corr_break", "Correlation break"], ["resid_abs", "Residual"]);
   views.push(["importance", "Random forest"]);
   for (const c of cols) c.title = mkTip(c.key);
-  const rows = mk.rows.map((r) => Object.assign({ resid_abs: r.resid_sigma === null ? null : Math.abs(r.resid_sigma) }, r));
+  const base = mk.rows.map((r) => Object.assign({ resid_abs: r.resid_sigma === null ? null : Math.abs(r.resid_sigma) }, r));
+  // methods some test has a sub-score for (drift needs a second file, the forest a model)
+  const avail = MK_SCORE.map((m) => m[0]).filter((k) => base.some((r) => r.subs && r.subs[k] !== undefined));
+  let rows = base;
   const tabs = h("div", { class: "tabs" });
   const tb = h("div");
   const setView = (k) => {
@@ -575,17 +645,48 @@ function renderMarkers(box, mk, onPick) {
   k[3].title = "Hold-out AUC of a class-balanced random forest trained on all tests: 0.5 = cannot tell the groups apart, 1 = perfect. Also sets how much random-forest importance counts in the score (skill = 2 × AUC − 1).";
   k[4].title = "Per part, count the tests beyond ±3 robust σ of the reference; this AUC compares those counts between affected and reference parts.";
   if (hasDrift) k.push(kpi("Drift file", mk.later, "same units, matched by identity"));
+  const methodBox = h("div", { class: "controls" });
+  const helpBox = h("div");
   box.replaceChildren(h("h2", {}, "Marker candidates"),
-    h("p", { class: "lead" }, "Every test ranked by how well it separates the affected parts from the reference: rank AUC and shift, tails beyond ±3σ of the reference" + (hasDrift ? ", how the same units changed in the other file (drift, residual, correlation break)" : "") + ", and random-forest importance. The score is the strongest of these signals. Click a test for its distributions."),
-    h("div", { class: "kpis" }, ...k), markerHelp(hasDrift));
+    h("p", { class: "lead" }, "Every test ranked by how well it separates the affected parts from the reference: rank AUC and shift, tails beyond ±3σ of the reference, PAT, ANOVA" + (hasDrift ? ", how the same units changed in the other file (drift, residual, correlation break)" : "") + ", and random-forest importance. The score is the strongest of the ticked signals. Click a test for its distributions."),
+    h("div", { class: "kpis" }, ...k), methodBox, helpBox);
   const g = h("div", { class: "grid2" });
   box.append(g);
-  for (const f of [mk.figures.scores, normable(mk.figures.sdc)]) { const [card, c] = chartBox("tall"); g.append(card); plot(c, f); }
-  box.append(h("h3", {}, "Top 10"), tabs, tb, h("h3", {}, "Top candidates: reference vs affected"));
+  const [scoreCard, scoreChart] = chartBox("tall"), [sdcCard, sdcChart] = chartBox("tall");
+  g.append(scoreCard, sdcCard);
+  plot(sdcChart, normable(mk.figures.sdc));
   const g3 = h("div", { class: "grid3" });
-  box.append(g3);
-  for (const f of mk.figures.top) { normable(f); const [card, c] = chartBox(); g3.append(card); plot(c, f); }
-  setView(views.some(([v]) => v === S.mkView) ? S.mkView : "score");
+  box.append(h("h3", {}, "Top 10"), tabs, tb, h("h3", {}, "Top candidates: reference vs affected"), g3);
+  const serverTop = Object.fromEntries((mk.figures.top_keys || []).map((key, i) => [key, mk.figures.top[i]]));
+  const drawTop = () => {
+    g3.replaceChildren();
+    for (const r of rows.slice(0, mk.figures.top.length || 6)) {
+      const [card, c] = chartBox();
+      g3.append(card);
+      const title = (f) => { f = JSON.parse(JSON.stringify(f)); f.layout = f.layout || {}; f.layout.title = Object.assign({ x: 0.01, xanchor: "left", font: { size: 15 } }, f.layout.title, { text: `${r.key} · ${r.why} (score ${fmt(r.score, 2)})` }); return normable(f); };
+      if (serverTop[r.key]) plot(c, title(serverTop[r.key]));
+      else if (opts.fetchTop) { c.append(h("div", { class: "loading" }, "Loading…")); Promise.resolve(opts.fetchTop(r.key)).then((f) => { c.replaceChildren(); plot(c, title(f)); }).catch((e) => showErr(c, e)); }
+    }
+  };
+  const rescore = () => {
+    const methods = mkMethods().filter((m) => MK_SCORE.some((x) => x[0] === m));
+    rows = base.map((r) => mkRescore(r, methods)).sort((a, b) => b.score - a.score);
+    methodBox.replaceChildren(h("span", { class: "muted small", style: { paddingBottom: "6px" } }, "Score methods:"), ...MK_SCORE.map(([key, name, text]) => {
+      const cb = h("input", { type: "checkbox", checked: methods.includes(key), disabled: !avail.includes(key), onchange: (e) => {
+        const next = MK_SCORE.map((m) => m[0]).filter((m) => (m === key ? e.target.checked : methods.includes(m)));
+        if (!next.length) { e.target.checked = true; return toast("Keep at least one score method", "bad"); }
+        S.mkMethods = next;
+        rescore();
+      } });
+      return h("label", { class: "chk", title: avail.includes(key) ? text : (MK_UNIT.includes(key) ? "Needs the same units measured in a second file" : "Not available in this run") }, cb, name);
+    }));
+    helpBox.replaceChildren(markerHelp(hasDrift, methods, avail));
+    plot(scoreChart, markerScoreFig(mk, rows));
+    setView(views.some(([v]) => v === S.mkView) ? S.mkView : "score");
+    drawTop();
+    if (opts.onRescore) opts.onRescore(rows);
+  };
+  rescore();
 }
 
 // ---- Correlation
@@ -687,10 +788,12 @@ function corrTarget(el) {
 // ---- ANOVA
 async function viewAnova(el) {
   el.append(h("h1", {}, "ANOVA"), h("p", { class: "lead" }, "One-way ANOVA of every test against a factor, with Kruskal–Wallis (non-parametric) and Brown–Forsythe (equal-variance) checks and Benjamini–Hochberg q-values. η² is the share of variance the factor explains. Use 'file / lot' on merged files for lot-to-lot, or site for site-to-site."));
-  const factor = select(GROUPS.filter(([k]) => k && k !== "pass").concat([["x", "die X"], ["y", "die Y"]]), S.anovaFactor || "site", (v) => { S.anovaFactor = v; });
+  const factorSel = select(GROUPS.filter(([k]) => k && k !== "pass").concat([["x", "die X"], ["y", "die Y"], ["test:", "a test's value…"]]), S.anovaFactor || "site", (v) => { S.anovaFactor = v; ftest.hidden = v !== "test:"; });
+  const ftest = h("input", { type: "text", value: S.anovaFactorTest || "5100", placeholder: "test #", style: { width: "80px" }, hidden: (S.anovaFactor || "site") !== "test:", title: "Group parts by this test's value (e.g. a datalogged board, socket or trim code)", oninput: (e) => (S.anovaFactorTest = e.target.value.trim()) });
+  const factor = { get value() { return factorSel.value === "test:" ? "test:" + ftest.value.trim() : factorSel.value; } };
   const ming = h("input", { type: "number", value: 5, min: 2 });
   const out = h("div");
-  el.append(h("div", { class: "controls" }, field("Factor", factor), field("Min parts / group", ming), h("button", { class: "primary", onclick: run }, "Run ANOVA")), out);
+  el.append(h("div", { class: "controls" }, field("Factor", h("div", { class: "row tight" }, factorSel, ftest)), field("Min parts / group", ming), loadboardField(), h("button", { class: "primary", onclick: run }, "Run ANOVA")), out);
   async function run() {
     loading(out);
     try {
@@ -1128,13 +1231,206 @@ function renderMatch(out, m, traceBox) {
     tools: h("button", { onclick: () => SC.download(`matched_${m.name}.csv`, SC.toCSV(cols.filter((c) => c.key !== "same"), rows)) }, "Download CSV"),
   });
 }
+// ---- Signature check
+/** Editable list of {ds, filter} populations. */
+function popList(list, label, emptyNote) {
+  const box = h("div");
+  const draw = () => {
+    box.replaceChildren(...list.map((it, i) => h("div", { class: "row tight", style: { marginBottom: "6px" } },
+      select(dsOptions(), String(it.ds), (v) => (it.ds = +v)),
+      h("input", { type: "text", class: "filter-input", value: it.filter, placeholder: "good parts, e.g. hbin = 1", oninput: (e) => (it.filter = e.target.value) }),
+      h("button", { title: "Remove", onclick: () => { list.splice(i, 1); draw(); } }, "×"))),
+      list.length ? "" : h("p", { class: "muted small" }, emptyNote),
+      h("button", { onclick: () => { list.push({ ds: S.datasets[S.datasets.length - 1].id, filter: "hbin = 1" }); draw(); } }, "+ " + label));
+  };
+  draw();
+  return box;
+}
+const SIG_VERDICT = { keep: "good", caution: "warn", drop: "bad", untested: "neutral", weak: "neutral", "no data": "neutral" };
+const SCREEN_VERDICT = { "resembles lot A": "bad", elevated: "warn", "like the reference": "good", "no signature": "neutral" };
+/** Signature check settings, seeded from Bad candidates. */
+function sigState() {
+  const bc = S.bc || {};
+  return S.sg || (S.sg = { a: bc.a ?? S.ds, name: bc.name || "bad_candidate", filter: bc.good || "hbin = 1", exclude: bc.exclude ?? "500, 80100-80104", max: 5, clean: [], screen: [], stayed: [], useClean: true, useConf: true, useStayed: true, confirmed: "confirmed_good", noMarginal: false });
+}
+function viewSignature(el) {
+  el.append(h("h1", {}, "Signature check"), h("p", { class: "lead" }, "Learn a failure signature from the bad candidates of the lot with the issue (lot A), throw out what known-good parts also show, and screen other files with what is left. Run Bad candidates first: it creates the part sets the signature is learned from ($bad_candidate) and checked against ($confirmed_good)."));
+  if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open lot A's files (and a clean lot, if you have one) without 'combine'.")); return; }
+  const bc = S.bc || {};
+  const ids = S.datasets.map((d) => d.id);
+  const st = sigState();
+  if (!ids.includes(st.a)) st.a = S.ds;
+  for (const k of ["clean", "screen"]) st[k] = st[k].filter((x) => ids.includes(x.ds));
+  if (!st.clean.length && !st.cleanSeeded) { st.cleanSeeded = true; const o = S.datasets.find((d) => d.id !== st.a && d.id !== bc.b); if (o) st.clean.push({ ds: o.id, filter: "hbin = 1" }); }
+  const a = select(dsOptions(), String(st.a), (v) => (st.a = +v));
+  const name = h("input", { type: "text", value: st.name, style: { width: "130px" }, oninput: (e) => (st.name = e.target.value) });
+  const filter = h("input", { type: "text", class: "filter-input", value: st.filter, oninput: (e) => (st.filter = e.target.value) });
+  const excl = h("input", { type: "text", value: st.exclude, style: { width: "170px" }, oninput: (e) => (st.exclude = e.target.value) });
+  const noMarg = h("input", { type: "checkbox", checked: !!st.noMarginal, onchange: (e) => (st.noMarginal = e.target.checked) });
+  const max = h("input", { type: "number", min: 1, max: 20, value: st.max, style: { width: "70px" }, oninput: (e) => (st.max = +e.target.value || 5) });
+  const useClean = h("input", { type: "checkbox", checked: st.useClean !== false, onchange: (e) => (st.useClean = e.target.checked) });
+  const useConf = h("input", { type: "checkbox", checked: st.useConf !== false, onchange: (e) => (st.useConf = e.target.checked) });
+  st.stayed = (st.stayed || []).filter((x) => ids.includes(x.a) && ids.includes(x.b));
+  const useStayed = h("input", { type: "checkbox", checked: st.useStayed !== false, onchange: (e) => (st.useStayed = e.target.checked) });
+  const stayedBox = h("div");
+  const drawStayed = () => stayedBox.replaceChildren(...st.stayed.map((it, i) => h("div", { class: "row tight", style: { marginBottom: "6px" } },
+    select(dsOptions(), String(it.a), (v) => (it.a = +v)), h("span", { class: "muted small" }, "good, and pass again in"), select(dsOptions(), String(it.b), (v) => (it.b = +v)),
+    h("button", { title: "Remove", onclick: () => { st.stayed.splice(i, 1); drawStayed(); } }, "×"))),
+    h("button", { onclick: () => { st.stayed.push({ a: S.datasets[0].id, b: S.datasets[S.datasets.length - 1].id }); drawStayed(); } }, "+ Add run 1 → 100% retest"));
+  drawStayed();
+  const conf = h("input", { type: "text", value: st.confirmed || "confirmed_good", style: { width: "130px" }, oninput: (e) => (st.confirmed = e.target.value) });
+  const srcRow = { display: "flex", gap: "6px", alignItems: "center", margin: "8px 0" };
+  const out = h("div");
+  const run = async () => {
+    const clean = st.useClean !== false ? st.clean : [];
+    const stayed = st.useStayed !== false ? st.stayed : [];
+    if (stayed.some((x) => x.a === x.b)) return toast("A stayed-good source needs two different files: run 1 and its retest", "bad");
+    if (!clean.length && !stayed.length && st.useConf === false) return toast("Tick at least one reference source: a clean lot, a stayed-good lot or the confirmed good parts", "bad");
+    loading(out, "Learning rules in lot A, checking them against the reference pool…");
+    try {
+      const d = await api("signature", { a: st.a, name: st.name, filter: scoped(st.filter), exclude: st.exclude, max_rules: st.max, range: S.co.range, exclude_set: st.noMarginal ? "marginal" : "",
+        use_clean: st.useClean !== false, use_confirmed: st.useConf !== false, confirmed: st.confirmed || "confirmed_good",
+        use_stayed: st.useStayed !== false, stayed: stayed.map((x) => ({ a: x.a, b: x.b, filter: scoped("pass") })),
+        clean: clean.map((c) => ({ ds: c.ds, filter: scoped(c.filter) })), screen: st.screen.map((c) => ({ ds: c.ds, filter: scoped(c.filter) })) });
+      S.sgLast = d;
+      renderSignature(out, d, st);
+    } catch (e) { showErr(out, e); }
+  };
+  el.append(
+    h("div", { class: "card pad" }, h("b", {}, "1 · Learn from lot A"), h("div", { class: "controls" }, field("File 1 of lot A", a), field("Bad candidates (part set)", h("div", { class: "row tight" }, h("span", {}, "$"), name)), field("Population", filter), field("Leave out tests", excl),
+      h("label", { class: "chk", title: "Leave the $marginal parts (file-2 fails outside the Bad candidates value range) out of every group" }, noMarg, "Leave out $marginal"), h("button", { onclick: () => go("candidates") }, "Bad candidates…")),
+      h("p", { class: "muted small" }, "Normal parts: without a clean lot, the confirmed good parts (if there are at least 30), else every other good part of lot A.")),
+    h("div", { class: "grid2" },
+      h("div", { class: "card pad" }, h("b", {}, "2 · Reference pool (good parts only)"), h("p", { class: "muted small" }, "Every reference part that matches a rule is a false alarm. Each source's rate is shown; the verdicts use the pooled rate."),
+        h("label", { class: "chk", style: srcRow }, useConf, "Confirmed good from file 2:", h("span", {}, "$"), conf, h("span", { class: "muted small" }, "(their lot-A values)")),
+        h("label", { class: "chk", style: srcRow }, useClean, "Clean lots (no such failures):"),
+        popList(st.clean, "Add clean lot", "Optional: add a validated lot (e.g. lot B)."),
+        h("label", { class: "chk", style: srcRow, title: "Parts good in a run 1 that pass again on its 100% retest (matched by part text), e.g. lot C; their run-1 values are used" }, useStayed, "Stayed good on retest:"),
+        stayedBox),
+      h("div", { class: "card pad" }, h("b", {}, "3 · Files to screen"), h("p", { class: "muted small" }, "Does their hit rate look like lot A or like the reference?"), popList(st.screen, "Add file to screen", "Optional: add the files you want to check."))),
+    h("div", { class: "controls" }, field("Rules in the signature (max)", max), h("button", { class: "primary", onclick: run }, "Check signature")),
+    out);
+  if (S.sgLast) renderSignature(out, S.sgLast, st);
+}
+function renderSignature(out, d, st) {
+  const pctS = (v, n) => (v == null ? "–" : (v * 100).toFixed(n ?? 1) + "%");
+  const sg = d.signature;
+  const nk = d.rows.filter((r) => r.verdict === "keep").length, nc = d.rows.filter((r) => r.verdict === "caution").length;
+  const srcs = d.sources || [];
+  out.replaceChildren(h("div", { class: "kpis" },
+    kpi("Bad candidates", d.n_cand.toLocaleString(), `$${d.name}`),
+    kpi("Normal parts", d.n_normal.toLocaleString(), d.normal === "confirmed good" ? `$${d.confirmed}: the rules are learned against them` : "other good parts of lot A"),
+    kpi("Reference pool", d.n_pool.toLocaleString(), srcs.map((c) => `${c.name} ${c.n.toLocaleString()}`).join(" + ")),
+    kpi("Rules kept", `${nk} + ${nc}`, `keep + caution, of ${d.rows.length} tests`)));
+  if (d.notes && d.notes.length) out.append(h("ul", { class: "small muted" }, ...d.notes.map((t) => h("li", {}, t))));
+  // the signature
+  const card = h("div", { class: "card pad" });
+  out.append(h("h2", {}, "Signature"), card);
+  if (!sg.rules.length) card.append(h("p", {}, "No rule survives the reference pool: whatever separates lot A's candidates also shows in good parts without the failure. There is no specific signature to screen with yet."));
+  else {
+    card.append(h("p", {}, `A part matches when it hits at least ${sg.m} of these ${sg.rules.length} rule${sg.rules.length > 1 ? "s" : ""}:`),
+      h("p", { class: "muted small" }, `Built one rule at a time from ${sg.considered} usable (keep / caution) rule${sg.considered === 1 ? "" : "s"}: ` + sg.steps.map((x, i) => `${i ? "+ " : ""}${x.key} → score ${fmt(x.score, 3)} (m = ${x.m})`).join(", ") + (sg.rules.length < sg.considered ? "; no other rule improves the score." : ".")),
+      h("ul", { class: "findings" }, ...sg.rules.map((r) => h("li", {}, h("b", {}, r.key), ` ${r.text} ${r.units || ""} `, badge(r.verdict, SIG_VERDICT[r.verdict]), h("span", { class: "muted small" }, ` capture ${pctS(r.capture, 0)}, normal ${pctS(r.fa_a)}, ` + r.sources.map((c) => `${c.lot} ${pctS(c.rate)}`).join(", ") + `, pooled ${pctS(r.fa_ref)}`)))),
+      h("div", { class: "kpis" },
+        kpi("Catches", pctS(sg.capture, 0), "of lot A's bad candidates"),
+        kpi("Normal parts", pctS(sg.fa_a), "that match"),
+        ...sg.sources.map((c) => kpi(c.name, pctS(c.rate), `false alarms (${c.n.toLocaleString()} good parts)`)),
+        kpi("Reference pool", pctS(sg.fa_ref), "pooled false-alarm rate")));
+    if (sg.filter) card.append(h("p", { class: "small" }, "As a part filter: ", h("code", {}, sg.filter), " ",
+      h("button", { onclick: () => { navigator.clipboard && navigator.clipboard.writeText(sg.filter); toast("Copied", "good"); } }, "Copy")));
+  }
+  // screening
+  if (d.screen.length) {
+    const det = h("div");
+    out.append(h("h2", {}, "Screening"), h("p", { class: "lead" }, `Signature hit rate in each file against the reference pool (${pctS(d.rate_ref, 2)}) and lot A (${pctS(d.rate_a, 2)}). p: one-sided Fisher exact test, file vs reference pool. Click a file for its at-risk parts.`));
+    const tb = h("div");
+    out.append(tb, det);
+    const showFile = (f) => {
+      det.replaceChildren(h("h3", {}, `${f.name}: ${f.hits.toLocaleString()} parts match`),
+        h("p", { class: "muted small" }, "Per rule: " + f.per_rule.map((r) => `${r.key} ${pctS(r.rate)}`).join(" · ")));
+      const sel = S.datasets.find((x) => x.name === f.name);
+      if (sg.filter && sel) det.append(h("div", { class: "row" }, h("button", { onclick: () => useFilter(sel.id, sg.filter) }, "Analyse them"), h("button", { onclick: () => { setDs(sel.id); document.getElementById("filter").value = ""; S.filter = ""; S.wmode = "pass"; go("wafer"); } }, "Wafer maps")));
+      const t = h("div");
+      det.append(t);
+      const cols = [{ key: "part_txt", label: "Part text" }, { key: "part_id", label: "Part" }, { key: "wafer", label: "Wafer" }, { key: "x", label: "X", num: true }, { key: "y", label: "Y", num: true }, { key: "site", label: "Site", num: true }, { key: "n_rules", label: "Rules hit", num: true }, { key: "rules", label: "Which" }];
+      table(t, cols, f.parts, { tools: h("button", { onclick: () => SC.download(`signature_${baseName({ name: f.name })}.csv`, SC.toCSV(cols, f.parts)) }, "Download CSV") });
+    };
+    table(tb, [
+      { key: "name", label: "File" },
+      { key: "verdict", label: "Verdict", render: (v) => badge(v, SCREEN_VERDICT[v] || "neutral") },
+      { key: "n", label: "Parts", num: true },
+      { key: "hits", label: "Match", num: true },
+      { key: "rate", label: "Rate", num: true, fmt: (v) => pctS(v, 2) },
+      { key: "p_ref", label: "p vs reference", num: true, fmt: fmtP, title: "one-sided Fisher exact test: is this file's rate higher than the reference pool's?" },
+    ], d.screen, { search: false, onClick: showFile });
+    showFile(d.screen[0]);
+  }
+  // all rules
+  const figs = Object.fromEntries(d.figures.map((f) => [f.key, f.figure]));
+  const chart = h("div");
+  const showRule = (r) => {
+    if (!figs[r.key]) { chart.replaceChildren(h("p", { class: "muted" }, `No chart for ${r.key} (only the leading and kept rules are drawn).`)); return; }
+    const [c1, c] = chartBox("tall");
+    chart.replaceChildren(h("p", { class: "small" }, h("b", {}, r.key), " — ", r.why, "."), c1);
+    plot(c, normable(figs[r.key]));
+  };
+  const tabs = h("div", { class: "tabs" }), tb2 = h("div");
+  const cols = [
+    { key: "rank", label: "#", num: true },
+    { key: "key", label: "Test" },
+    { key: "verdict", label: "Verdict", render: (v, r) => { const b = badge(v, SIG_VERDICT[v]); b.title = r.why; return b; } },
+    { key: "drop_by", label: "Dropped by", title: "the reference source whose own false-alarm rate dropped the rule (each source can drop a rule on its own, so a large pool cannot outvote it)", fmt: (v) => v || "" },
+    { key: "text", label: "Rule" },
+    { key: "capture", label: "Capture", num: true, fmt: (v) => pctS(v, 0), title: "share of lot A's bad candidates the rule catches" },
+    { key: "fa_a", label: "Normal", num: true, fmt: (v) => pctS(v), title: d.normal === "confirmed good" ? "share of the confirmed good parts (the learning group) that match" : "share of lot A's other good parts that match (unknown status: some were never retested)" },
+    ...srcs.map((c, i) => ({ key: `src${i}`, label: c.name, num: true, fmt: (v) => pctS(v), title: `false-alarm rate in ${c.kind === "confirmed" ? "the parts file 2 confirmed good (their lot-A values)" : "this clean lot's good parts"}` })),
+    { key: "fa_ref", label: "Pooled ref.", num: true, fmt: (v) => pctS(v), title: "false-alarm rate of the whole reference pool: the verdict and the score use this" },
+    { key: "shift", label: "Ref. shift σ", num: true, fmt: (v) => fmt(v, 2), title: "reference pool median − normal median, in normal σ, positive toward the rule's side. Well below 0 = the pool never reaches the rule's region" },
+    { key: "limits", label: "Limits", title: "a clean lot's limits differ from lot A's" },
+    { key: "score", label: "Score", num: true, fmt: (v) => fmt(v, 2), title: "capture − the larger false-alarm rate (normal parts or pooled reference)" },
+  ];
+  const rows = d.rows.map((r, i) => {
+    const o = Object.assign({ rank: i + 1, shift: r.pool ? r.pool.shift_sigma : null, limits: r.pool && r.pool.limits_changed ? "changed" : "" }, r);
+    srcs.forEach((c, j) => { const x = r.sources.find((y) => y.lot === c.name); o[`src${j}`] = x ? x.rate : null; });
+    return o;
+  });
+  const views = [["all", "All"], ["keep", "Keep"], ["caution", "Caution"], ["drop", "Drop"], ["untested", "Not tested"], ["weak", "Weak"]];
+  const setView = (v) => {
+    S.sgView = v;
+    tabs.replaceChildren(...views.map(([k, l]) => h("button", { class: k === v ? "active" : "", onclick: () => setView(k) }, `${l} (${k === "all" ? rows.length : rows.filter((r) => r.verdict === k).length})`)));
+    const sel = v === "all" ? rows : rows.filter((r) => r.verdict === v);
+    table(tb2, cols, sel, { onClick: showRule, placeholder: "Search tests…", tools: h("button", { onclick: () => SC.download("signature_rules.csv", SC.toCSV(cols.filter((c) => c.key !== "verdict").concat([{ key: "verdict", label: "Verdict" }, { key: "why", label: "Why" }, { key: "filter", label: "Filter" }]), sel)) }, "Download CSV") });
+  };
+  out.append(h("h2", {}, "Rules per test"), h("p", { class: "lead" }, "Each test's best threshold rule in lot A and how the reference pool judges it. Click a test to see the normal parts, the bad candidates and every other file against the rule's cut (dotted line)."), signatureHelp(), chartOpts(() => { }, { noRange: true, hist: true }), tabs, tb2, chart);
+  setView(views.some(([k]) => k === S.sgView) ? S.sgView : "all");
+  const first = rows.find((r) => figs[r.key]);
+  if (first) showRule(first);
+}
+function signatureHelp() {
+  const li = (n, t) => h("li", {}, h("b", {}, n), " — ", t);
+  return h("details", { class: "adv help" }, h("summary", {}, "ⓘ How rules, verdicts and the screening work"),
+    h("ul", { class: "small" },
+      li("Normal parts", "the group the rules are learned against. Without a clean lot: the parts file 2 confirmed good ($confirmed_good: good in lot A, pass in file 2), if there are at least 30; otherwise every other good part of lot A (some of those were never retested, so a few may be real failures too)."),
+      li("Rule (learn)", "for each test, the cut that best separates lot A's bad candidates from the normal parts: above a value, below a value, or outside a band around the normal parts (median ± k robust σ). The cut maximises Youden's J = capture − false-alarm rate. Learned on the same parts it is scored on, so the capture is optimistic; the reference pool is the check."),
+      li("Reference pool", "good parts only, from the ticked sources: clean lots (no such failures), parts that stayed good on a 100% retest (good in run 1 and passing again, their run-1 values) and the confirmed good parts (their lot-A values). Each source's false-alarm rate is listed; any one source can drop a rule, and otherwise the pooled rate (all their parts together) drives the verdict and the score. Confirmed good parts are also among the normal parts, so their rate is in-sample; a clean lot is the independent check."),
+      li("Capture / Normal / sources / Pooled", "share of the bad candidates, of the normal parts, of each reference source and of the whole pool that match the rule."),
+      li("Score", "capture − the larger of the normal and pooled false-alarm rates. High = catches the candidates and stays quiet in every good population."),
+      li("Drop", "a reference source (each clean lot and the confirmed good parts, each on its own) or the whole pool matches the rule in at least half as many parts as the candidates, or at least twice as often as the normal parts and significantly so (Fisher p < 0.01). The pattern exists without the failure, so it is not the signature. Because every source can drop a rule by itself, a large pool cannot outvote a small lot that shows the pattern; Dropped by names it."),
+      li("Caution", "the pool matches it significantly more often than the normal parts, but less than twice as often. Still used."),
+      li("Not tested", "the pool sits more than 0.5σ away from the rule's side, so it never reaches the region: few hits there prove nothing either way."),
+      li("Weak", "the rule barely separates the candidates from the normal parts (capture − normal false alarms < 0.2)."),
+      li("Signature", "built one rule at a time: start with the kept rule that scores best on its own, then keep adding the rule that most improves capture − the larger of the normal and pooled false-alarm rates (with m, the number of rules a part must hit, re-chosen at each step), and stop when no rule improves it or the maximum is reached. It is therefore never worse than its best single rule."),
+      li("Screening", "a file's signature hit rate against the reference pool (one-sided Fisher exact test). Resembles lot A = significantly above the pool and at least half of lot A's rate; elevated = significantly above the pool only; like the reference = not significantly different."),
+      li("Limits", "lots on the same test program can carry slightly different limits; rules use absolute values, and the Limits column flags tests whose limits changed.")));
+}
+
 // ---- Bad candidates
 /** Wafer-coordinate settings shared with the wafer view (tests 80100–80104 by default). */
 function waferCal() { return S.wcal || (S.wcal = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false }); }
 function viewCandidates(el) {
-  el.append(h("h1", {}, "Bad candidates"), h("p", { class: "lead" }, "Parts that were good in file 1 but are bad in file 2 (e.g. failing one test), found by matching the two files by part text. Instead of splitting anything, the matched good parts of file 1 are marked as bad candidates and compared with every other good part of file 1: which tests, outlier scores, sites, wafer zones or field positions set them apart, and which tests to focus on."));
+  el.append(h("h1", {}, "Bad candidates"), h("p", { class: "lead" }, "Parts that were good in file 1 but are bad in file 2 (e.g. failing one test, optionally only with its file-2 value in a range), found by matching the two files by part text. Instead of splitting anything, the matched good parts of file 1 are marked as bad candidates and compared with every other good part of file 1: which tests, outlier scores, sites, wafer zones or field positions set them apart, and which tests to focus on. Good parts that pass file 2 are marked as confirmed good."));
   if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open both files (without 'combine'): file 1 with most parts, file 2 with the parts that became bad.")); return; }
-  const st = S.bc || (S.bc = { a: S.ds, b: otherDs(S.ds), good: "hbin = 1", test: "", how: "fail", extra: "", name: "bad_candidate", exclude: "500, 80100-80104", coords: "auto" });
+  const st = S.bc || (S.bc = { a: S.ds, b: otherDs(S.ds), good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: "500, 80100-80104", coords: "auto" });
   const ids = S.datasets.map((d) => d.id);
   if (!ids.includes(st.a)) st.a = S.ds;
   if (!ids.includes(st.b) || st.b === st.a) st.b = otherDs(st.a);
@@ -1143,6 +1439,27 @@ function viewCandidates(el) {
   const good = h("input", { type: "text", class: "filter-input", value: st.good, placeholder: "e.g. hbin = 1  or  pass" });
   const test = h("input", { type: "text", value: st.test, placeholder: "e.g. 1013 (blank = any fail)", style: { width: "170px" } });
   const how = select([["fail", "fails it"], ["first", "fails it first"], ["only", "fails only it"]], st.how);
+  const range = h("input", { type: "text", value: st.range || "", placeholder: "pick the test first (optional)", style: { width: "150px" }, title: "Hard bad only: the failing test's value in file 2 must be inside this range (ends included; either end may be left open, e.g. 10..). Type plain numbers: they are read in the unit shown next to the box, the test's display unit (its logged UNITS scaled by RES_SCAL, as the tester shows it). An explicit SI suffix (10uA..20uA) overrides that. File-2 fails outside the range become $marginal." });
+  // the selected test's display unit in file 2: plain numbers in the range are read in it
+  const unitHint = h("b", { class: "small" });
+  const updHint = async () => {
+    const q = test.value.trim().replace(/:.*/, "");
+    unitHint.title = "";
+    if (!q) { unitHint.textContent = ""; range.placeholder = "pick the test first (optional)"; return; }
+    let t;
+    try { t = (await testsFor(+b.value, "")).find((x) => x.key === q || String(x.num) === q || x.name === q); } catch (e) { t = null; }
+    if (!t) { unitHint.textContent = ""; unitHint.title = ""; range.placeholder = `test ${q} not in file 2`; return; }
+    const du = t.disp_units || t.units || "";
+    range.placeholder = du ? `e.g. 10..20 (${du})` : "e.g. 10..20";
+    unitHint.textContent = du || "(no unit)";
+    unitHint.title = `Plain numbers are in ${du || "the test's units"}` + (t.res_scal ? `: logged in ${t.units || "?"} with RES_SCAL ${t.res_scal}, shown in ${du}` : (t.units ? `, the unit the test is logged in` : "")) + ". An SI suffix (e.g. 10u) overrides it.";
+  };
+  test.addEventListener("input", updHint);
+  b.addEventListener("change", updHint);
+  updHint();
+  const incMarg = h("input", { type: "checkbox", checked: !!st.incMarg });
+  const rangeNote = h("div", { class: "muted small", style: { maxWidth: "320px" } }, st.rangeNote || "");
+  range.addEventListener("input", () => { st.rangeNote = ""; rangeNote.textContent = ""; });
   const extra = h("input", { type: "text", class: "filter-input", value: st.extra, placeholder: "optional extra filter on file 2" });
   const ka = keyPicker("ca"), kb = keyPicker("cb");
   const name = h("input", { type: "text", value: st.name, style: { width: "130px" }, title: "Part set name, usable as $name in every filter" });
@@ -1155,19 +1472,22 @@ function viewCandidates(el) {
     return ["not pass", tc, extra.value.trim() ? `(${extra.value.trim()})` : ""].filter(Boolean).join(" and ");
   };
   const run = async () => {
-    Object.assign(st, { a: +a.value, b: +b.value, good: good.value.trim(), test: test.value.trim(), how: how.value, extra: extra.value, name: name.value.trim() || "bad_candidate", exclude: excl.value, coords: coords.value });
+    Object.assign(st, { a: +a.value, b: +b.value, good: good.value.trim(), test: test.value.trim(), how: how.value, range: range.value.trim(), incMarg: incMarg.checked, extra: extra.value, name: name.value.trim() || "bad_candidate", exclude: excl.value, coords: coords.value });
     if (st.a === st.b) return toast("Pick two different files", "bad");
-    const popF = scoped(st.good), set = "$" + st.name;
+    if (st.range && !st.test) return toast("A value range needs the failing test", "bad");
+    const goodF = scoped(st.good), set = "$" + st.name;
     loading(out, "Matching file 2's bad parts to file 1's good parts…");
     try {
-      const m = await api("match", { a: st.a, b: st.b, key_a: ka.value(), key_b: kb.value(), filter_a: popF, filter_b: badFilter(), name: st.name });
-      if (!m.pairs) { out.replaceChildren(h("div", { class: "err" }, `None of the ${m.n_b.toLocaleString()} bad parts of file 2 (${badFilter()}) matched a good part of file 1 (${popF || "all parts"}). Check the identity (${m.key_a} ↔ ${m.key_b}) and the filters.`)); return; }
+      const m = await api("candidate_sets", { a: st.a, b: st.b, key_a: ka.value(), key_b: kb.value(), filter_a: goodF, filter_b: badFilter(), test: st.test.replace(/:.*/, ""), range: st.range, include_marginal: st.incMarg, name: st.name });
+      if (!m.n_cand) { out.replaceChildren(h("div", { class: "err" }, `None of the ${m.n_b.toLocaleString()} bad parts of file 2 (${badFilter()}) matched a good part of file 1 (${goodF || "all parts"})` + (m.n_marginal ? `, except ${m.n_marginal.toLocaleString()} marginal fails outside the range ${st.range} (tick "Include marginal fails" to use them).` : `. Check the identity (${m.key_a} ↔ ${m.key_b}) and the filters.`))); return; }
+      // marginal fails are left out of both groups unless they count as candidates
+      const popF = m.n_marginal && !m.include_marginal ? (goodF ? `(${goodF}) and not $${m.marginal}` : `not $${m.marginal}`) : goodF;
       const w = waferCal();
       const common = { a: st.a, filter: popF, exclude: st.exclude, range: S.co.range };
       const cal = { coords: st.coords, wafer_test: w.w, x_test: w.x, y_test: w.y, ox_test: w.ox, oy_test: w.oy, offset_mode: w.mode, flip_x: w.fx, flip_y: w.fy };
-      loading(out, `${m.pairs.toLocaleString()} bad candidates found; ranking every test and outlier score…`);
+      loading(out, `${m.n_cand.toLocaleString()} bad candidates found; ranking every test and outlier score…`);
       const [mk, cd] = await Promise.all([
-        api("markers", Object.assign({ mode: "group", select: set, vs: "", later: st.b, key_a: ka.value(), key_b: kb.value() }, common)).catch((e) => e),
+        api("markers", Object.assign({ mode: "group", select: set, vs: "", later: st.b, key_a: ka.value(), key_b: kb.value(), methods: mkMethods() }, common)).catch((e) => e),
         api("candidates", Object.assign({ name: st.name }, common, cal)),
       ]);
       renderCandidates(out, traceBox, { m, mk, cd, st, popF, set, keys: { key_a: ka.value(), key_b: kb.value() }, badF: badFilter() });
@@ -1175,8 +1495,8 @@ function viewCandidates(el) {
   };
   el.append(
     h("div", { class: "controls" }, field("File 1 (good parts)", a), field("Good parts are", good), field("Identify parts by", ka.el)),
-    h("div", { class: "controls" }, field("File 2 (became bad)", b), field("Bad parts failing test", h("div", { class: "row tight" }, test, how)), field("Extra filter", extra), field("Identify parts by", kb.el)),
-    h("div", { class: "controls" }, field("Mark them as", name), field("Leave out tests", excl), field("Die X/Y", coords), h("button", { class: "primary", onclick: run }, "Find bad candidates")),
+    h("div", { class: "controls" }, field("File 2 (became bad)", b), field("Bad parts failing test", h("div", { class: "row tight" }, test, how)), field("with its file-2 value in", h("div", {}, h("div", { class: "row tight" }, range, unitHint), rangeNote)), h("label", { class: "chk", title: "Off: file-2 fails outside the range ($marginal) are left out of both the candidates and the reference. On: they count as candidates." }, incMarg, "Include marginal fails as candidates"), field("Extra filter", extra), field("Identify parts by", kb.el)),
+    h("div", { class: "controls" }, field("Mark them as", name), field("Leave out tests", excl), field("Die X/Y", coords), loadboardField(), h("button", { class: "primary", onclick: run }, "Find bad candidates")),
     out, traceBox);
   if (S.bcLast && ids.includes(S.bcLast.st.a) && ids.includes(S.bcLast.st.b)) renderCandidates(out, traceBox, S.bcLast);
 }
@@ -1202,36 +1522,49 @@ function renderCandidates(out, traceBox, R) {
   const { m, mk, cd, st, popF, set } = R;
   const A = dsName(st.a), B = dsName(st.b);
   const pctS = (v, d) => (v == null ? "–" : (v * 100).toFixed(d ?? 1) + "%");
+  const rng = m.range ? `${m.range.test} in ${m.range.lo ?? "−∞"} … ${m.range.hi ?? "+∞"} ${m.range.units || ""}`.trim() : "";
   out.replaceChildren(h("div", { class: "kpis" },
     kpi("Bad in file 2", m.n_b.toLocaleString(), R.badF),
-    kpi("Bad candidates", m.pairs.toLocaleString(), `good in ${A}, ${set}`),
+    kpi("Bad candidates", m.n_cand.toLocaleString(), `good in ${A}, ${set}` + (rng ? `; ${rng} in ${B}` : "")),
+    m.range ? kpi("Marginal", (m.n_marginal || 0).toLocaleString(), `$${m.marginal}: fails outside the range, ${m.include_marginal ? "counted as candidates" : "left out of both groups"}`) : "",
+    kpi("Confirmed good", (m.n_confirmed || 0).toLocaleString(), `$${m.confirmed}: good in ${A}, pass in ${B}`),
     kpi("Not found as good", m.only_b.toLocaleString(), "bad in file 2 without a good match in file 1"),
     kpi("Reference", cd.n_ref.toLocaleString(), `other good parts (${popF || "all"})`),
     kpi("Tests ranked", cd.n_tests.toLocaleString(), cd.excluded ? `${cd.excluded} left out` : "")));
   out.append(h("div", { class: "row" },
     h("button", { onclick: () => useFilter(st.a, set) }, "Analyse the candidates (filter " + set + ")"),
     h("button", { onclick: () => { S.cmpMode = "group"; S.cmpSel = set; S.cmpVs = ""; S.ds = st.a; S.filter = popF; go("compare"); } }, "Open in Compare"),
-    h("button", { onclick: () => { S.wmode = "pass"; S.ds = st.a; go("wafer"); } }, "Wafer maps")));
-
-  // plain-language summary of what they share
-  const sum = h("ul", { class: "findings" });
-  const rows = mk instanceof Error ? [] : mk.rows;
-  const top = rows.filter((r, i) => i === 0 || r.score >= 0.3).slice(0, 3);
-  for (const r of top) sum.append(h("li", {}, h("b", {}, r.key), ` (${r.why}, score ${fmt(r.score, 2)}): `, focusNote(r, pctS)));
-  const failed = cd.b_fails[0];
-  if (failed && rows.length) {
-    const i = rows.findIndex((r) => r.key === failed.key);
-    const r = rows[i];
-    sum.append(h("li", {}, `The test they fail in ${B}, `, h("b", {}, failed.key), i < 0 ? ` is not ranked in ${A} (no results there, or left out).`
-      : r.score >= 0.3 ? ` already sets them apart in ${A}: rank #${i + 1}, score ${fmt(r.score, 2)}. They were marginal on it before failing.`
-      : ` does not set them apart in ${A} (rank #${i + 1}, score ${fmt(r.score, 2)}): no early sign on the same test, so look at the other focus tests.`));
+    h("button", { onclick: () => { S.wmode = "pass"; S.ds = st.a; go("wafer"); } }, "Wafer maps"),
+    h("button", { onclick: () => { Object.assign(sigState(), { a: st.a, name: st.name, filter: st.good, exclude: st.exclude, confirmed: m.confirmed || "confirmed_good", noMarginal: !!(m.n_marginal && !m.include_marginal) }); go("signature"); }, title: "Learn a signature from these candidates, check it against a reference pool of good parts (a clean lot and/or the confirmed good parts) and screen other files" }, "Signature check →")));
+  if (m.marginal_rows && m.marginal_rows.length) {
+    const mt = h("div");
+    const mcols = [{ key: "key", label: "Identity" }, { key: "a_wafer", label: "Wafer" }, { key: "a_x", label: "X", num: true }, { key: "a_y", label: "Y", num: true }, { key: "a_site", label: "Site", num: true }, { key: "b_hbin", label: "Hbin in 2", num: true }, { key: "b_value", label: `${m.range.test} in 2 (${m.range.units || "–"})`, num: true, fmt: (v) => fmt(v, 4) }];
+    out.append(h("details", { class: "adv" }, h("summary", {}, `Marginal: ${m.n_marginal.toLocaleString()} parts failed ${m.range.test} in ${B} outside the range (${m.include_marginal ? "counted as candidates" : "left out of the candidates and the reference"})`), mt));
+    table(mt, mcols, m.marginal_rows, { tools: h("button", { onclick: () => SC.download(`${m.marginal}.csv`, SC.toCSV(mcols, m.marginal_rows)) }, "Download CSV"), onClick: (r) => trace(traceBox, Object.assign({ a: st.a, b: st.b, row_a: r.a_row }, R.keys, { value: r.key })) });
   }
-  const ind = cd.indicators[0];
-  if (ind) sum.append(h("li", {}, h("b", {}, ind.name), `: AUC ${fmt(ind.auc, 2)}, ${pctS(ind.capture, 0)} of candidates fall in the top 5 % of good parts (${fmt(ind.lift, 1)}× chance).`));
-  const fac = cd.factors.find((f) => f.p < 0.01);
-  if (fac) { const l = fac.levels[0]; sum.append(h("li", {}, h("b", {}, fac.name), `: ${l.level} has ${pctS(l.rate, 2)} candidates vs ${pctS(m.pairs / (cd.n_ref + cd.n_aff), 2)} overall (${fmt(l.lift, 1)}×, p ${fmtP(fac.p)}).`)); }
-  else sum.append(h("li", {}, "No site, wafer, zone or bin stands out (no factor with p < 0.01)."));
-  if (cd.b_fails.length) sum.append(h("li", {}, `In ${B} they fail: `, cd.b_fails.slice(0, 4).map((f) => `${f.key} (${pctS(f.share, 0)})`).join(", "), "."));
+
+  // plain-language summary of what they share (follows the ticked score methods)
+  const sum = h("ul", { class: "findings" });
+  const summarize = (rows) => {
+    sum.replaceChildren();
+    const top = rows.filter((r, i) => i === 0 || r.score >= 0.3).slice(0, 3);
+    for (const r of top) sum.append(h("li", {}, h("b", {}, r.key), ` (${r.why}, score ${fmt(r.score, 2)}): `, focusNote(r, pctS)));
+    const failed = cd.b_fails[0];
+    if (failed && rows.length) {
+      const i = rows.findIndex((r) => r.key === failed.key);
+      const r = rows[i];
+      sum.append(h("li", {}, `The test they fail in ${B}, `, h("b", {}, failed.key), i < 0 ? ` is not ranked in ${A} (no results there, or left out).`
+        : r.score >= 0.3 ? ` already sets them apart in ${A}: rank #${i + 1}, score ${fmt(r.score, 2)}. They were marginal on it before failing.`
+        : ` does not set them apart in ${A} (rank #${i + 1}, score ${fmt(r.score, 2)}): no early sign on the same test, so look at the other focus tests.`));
+    }
+    const ind = cd.indicators[0];
+    if (ind) sum.append(h("li", {}, h("b", {}, ind.name), `: AUC ${fmt(ind.auc, 2)}, ${pctS(ind.capture, 0)} of candidates fall in the top 5 % of good parts (${fmt(ind.lift, 1)}× chance).`));
+    const fac = cd.factors.find((f) => f.p < 0.01);
+    if (fac) { const l = fac.levels[0]; sum.append(h("li", {}, h("b", {}, fac.name), `: ${l.level} has ${pctS(l.rate, 2)} candidates vs ${pctS(cd.n_aff / (cd.n_ref + cd.n_aff), 2)} overall (${fmt(l.lift, 1)}×, p ${fmtP(fac.p)}).`)); }
+    else sum.append(h("li", {}, "No site, wafer, zone or bin stands out (no factor with p < 0.01)."));
+    if (cd.b_fails.length) sum.append(h("li", {}, `In ${B} they fail: `, cd.b_fails.slice(0, 4).map((f) => `${f.key} (${pctS(f.share, 0)})`).join(", "), "."));
+  };
+  summarize([]);
   out.append(h("h2", {}, "What the candidates have in common"), sum);
 
   // focus tests (marker ranking)
@@ -1243,7 +1576,7 @@ function renderCandidates(out, traceBox, R) {
     S.bcFocus = key;
     loading(focus);
     try {
-      const second = (mk.rows || []).map((r) => r.key).find((k) => k !== key);
+      const second = (R.ranked || mk.rows || []).map((r) => r.key).find((k) => k !== key);
       const [d, dual, sc] = await Promise.all([
         api("chart", { kind: "hist", ds: st.a, filter: popF, test: key, group_by: set, density: true, range: S.co.range }),
         api("match_dual", { link: m.link, test_a: key, test_b: key, color_by: "pass", color_side: "b", range: S.co.range, filter_a: "", filter_b: "" }).catch((e) => e),
@@ -1262,7 +1595,8 @@ function renderCandidates(out, traceBox, R) {
   };
   if (mk instanceof Error) showErr(mkBox, mk);
   else {
-    renderMarkers(mkBox, mk, (row) => showFocus(row.key));
+    const fetchTop = (key) => api("chart", { kind: "compare_test", mode: "group", ds: st.a, select: set, vs: "", filter: popF, test: key, range: S.co.range }).then((c) => c.hist);
+    renderMarkers(mkBox, mk, (row) => showFocus(row.key), { fetchTop, onRescore: (rows) => { R.ranked = rows; summarize(rows); } });
     mkBox.querySelector("h2").textContent = "Focus tests";
   }
 
@@ -1337,7 +1671,7 @@ function renderCandidates(out, traceBox, R) {
     onClick: (r) => trace(traceBox, Object.assign({ a: st.a, b: st.b, row_a: r.row }, R.keys, { value: r.key })),
     tools: h("button", { onclick: () => SC.download(`${st.name}.csv`, SC.toCSV(cols, cd.parts)) }, "Download CSV"),
   });
-  if (!(mk instanceof Error) && mk.rows.length) showFocus(S.bcFocus && mk.rows.some((r) => r.key === S.bcFocus) ? S.bcFocus : mk.rows[0].key).then(() => window.scrollTo(0, 0));
+  if (!(mk instanceof Error) && mk.rows.length) showFocus(S.bcFocus && mk.rows.some((r) => r.key === S.bcFocus) ? S.bcFocus : (R.ranked || mk.rows)[0].key).then(() => window.scrollTo(0, 0));
 }
 
 async function trace(el, params) {
@@ -1363,6 +1697,691 @@ async function trace(el, params) {
   } catch (e) { showErr(el, e); }
 }
 
+// ---- Failure investigation (a case: files with roles, settings, steps)
+function invCase() {
+  const ids = S.datasets.map((d) => d.id);
+  return S.inv || (S.inv = { name: "case 1", test: "", loadboard: S.lbTest || "5100", exclude: "500, 80100-80104", key: "part_txt", good: "pass",
+    lots: [{ name: "Lot A", kind: "issue", run1: ids[0], retest: ids[1] ?? ids[0], chain: [] }, { name: "Lot B", kind: "clean", run1: ids[2] ?? ids[0] }],
+    screen: [], window: { from: "auto", mode: "strict", tol: 5, unit: "pct" }, maxRate: 10, minZone: 10 });
+}
+const INV_STEPS = [
+  ["recovery", "1 · Retest and recovery window", "Follow each issue lot's rejects through its reject retests and find the value band that never recovers."],
+  ["bad", "2 · Bad candidates", "Per issue lot: good in run 1, failing the test in the retest with the value inside the hard-bad window ($case_bad); outside it $case_marginal; passing the retest $case_good."],
+  ["common", "3 · Commonality", "One table across the lots: site, loadboard, site × loadboard, wafer, zone, reticle position and test time for every group, flags for what all issue lots share and the clean lots do not, and the top marker tests side by side."],
+  ["signature", "4 · Signature check", "Rules learned from the first issue lot's bad candidates, checked against the clean lots, the parts that stayed good on retest in the other issue lots and the confirmed good parts."],
+  ["screen", "5 · Screen", "The signature applied to the other issue lots' unrecoverable and recovered parts and to the files to screen."],
+];
+function viewInvestigation(el) {
+  el.append(h("h1", {}, "Failure investigation"), h("p", { class: "lead" }, "Set the case up once: which files are the issue lots (run 1, the retest where good parts failed, and the retests of those rejects), which are clean lots and which to screen, plus the failing test. Each step then reuses it, shows its result here and links to its full page. Use files from one tester type throughout (e.g. V93K only)."));
+  if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open the case's files first (without 'combine'), or load a saved case below.")); }
+  const c = invCase();
+  const ids = S.datasets.map((d) => d.id);
+  const fix = (x) => (ids.includes(x) ? x : ids[0]);
+  for (const l of c.lots) { l.run1 = fix(l.run1); if (l.kind === "issue") { l.retest = fix(l.retest); l.chain = (l.chain || []).filter((x) => ids.includes(x)); } }
+  c.screen = c.screen.filter((x) => ids.includes(x));
+  const R = S.invRes || (S.invRes = {});
+  const top = h("div"), files = h("div"), settings = h("div"), steps = h("div");
+  el.append(top, files, settings, steps);
+
+  // save / load
+  const nameIn = h("input", { type: "text", value: c.name, style: { width: "160px" }, oninput: (e) => (c.name = e.target.value) });
+  const savedSel = select([["", "saved cases…"]], "", () => {});
+  api("case_list").then((l) => savedSel.replaceChildren(h("option", { value: "" }, l.length ? "saved cases…" : "no saved case"), ...l.map((x) => h("option", { value: x.path }, x.name)))).catch(() => {});
+  const pathIn = h("input", { type: "text", placeholder: "or a case file path", style: { width: "220px" } });
+  top.append(h("div", { class: "controls card pad" }, field("Case", nameIn),
+    h("button", { onclick: () => saveCase(false) }, "Save"), h("button", { onclick: () => saveCase(true), title: "Save as <name>.stdf-case.json in the folder of the first lot's run 1" }, "Save next to the files"),
+    field("Load", h("div", { class: "row tight" }, savedSel, pathIn)), h("button", { onclick: () => loadCase(pathIn.value.trim() || savedSel.value) }, "Load")));
+  const pathOf = (id) => { const d = S.datasets.find((x) => x.id === id); return d && d.paths.length === 1 ? d.paths[0] : null; };
+  async function saveCase(next) {
+    const f = (id) => ({ path: pathOf(id), name: dsName(id) });
+    const out = JSON.parse(JSON.stringify(c));
+    out.lots = c.lots.map((l) => Object.assign({}, l, { run1: f(l.run1) }, l.kind === "issue" ? { retest: f(l.retest), chain: l.chain.map(f) } : {}));
+    out.screen = c.screen.map(f);
+    const missing = [out.lots.flatMap((l) => [l.run1, l.retest, ...(l.chain || [])]), out.screen].flat().filter((x) => x && !x.path);
+    if (missing.length) return toast(`Only files loaded from disk can be saved in a case: ${missing.map((x) => x.name).join(", ")}`, "bad");
+    let path = "";
+    if (next) { const p = out.lots[0].run1.path; path = p.replace(/[\\/][^\\/]*$/, "") + "/" + c.name.replace(/[^\w-]+/g, "_") + ".stdf-case.json"; }
+    try { const r = await api("case_save", { case: out, path }); toast(`Saved ${r.path}`, "good"); } catch (e) { toast(e.message, "bad"); }
+  }
+  async function loadCase(path) {
+    if (!path) return toast("Pick a saved case or enter a path", "bad");
+    try {
+      const { case: k } = await api("case_load", { path });
+      const all = [k.lots.flatMap((l) => [l.run1, l.retest, ...(l.chain || [])]), k.screen || []].flat().filter((x) => x && x.path);
+      const open = (p) => S.datasets.find((d) => d.paths.length === 1 && d.paths[0] === p);
+      const need = [...new Set(all.map((x) => x.path).filter((p) => !open(p)))];
+      if (need.length) { toast(`Opening ${need.length} file(s)…`); await api("load", { paths: need }); await refreshDatasets(); }
+      const id = (x) => (x && x.path && open(x.path) ? open(x.path).id : undefined);
+      k.lots = k.lots.map((l) => Object.assign({}, l, { run1: id(l.run1) }, l.kind === "issue" ? { retest: id(l.retest), chain: (l.chain || []).map(id).filter((x) => x !== undefined) } : {}));
+      k.screen = (k.screen || []).map(id).filter((x) => x !== undefined);
+      S.inv = k; S.invRes = {};
+      if (k.loadboard) { await api("loadboard", { test: k.loadboard }); S.lbTest = String(k.loadboard); }
+      toast(`Loaded ${k.name}`, "good");
+      go("investigation");
+    } catch (e) { toast(e.message, "bad"); }
+  }
+
+  // files and roles
+  const drawFiles = () => {
+    const dsSel = (v, set) => select(dsOptions(), String(v), (x) => set(+x));
+    const lotRows = c.lots.map((l, i) => {
+      const chainBox = h("div", { class: "row tight" }, ...(l.chain || []).map((x, j) => h("span", { class: "row tight" }, dsSel(x, (v) => (l.chain[j] = v)), h("button", { title: "Remove", onclick: () => { l.chain.splice(j, 1); drawFiles(); } }, "×"))),
+        h("button", { onclick: () => { l.chain.push(ids[ids.length - 1]); drawFiles(); } }, "+ reject retest"));
+      return h("div", { class: "card pad", style: { marginBottom: "8px" } },
+        h("div", { class: "controls" },
+          field("Lot", h("input", { type: "text", value: l.name, style: { width: "110px" }, oninput: (e) => (l.name = e.target.value) })),
+          field("Role", select([["issue", "issue lot"], ["clean", "clean lot"]], l.kind, (v) => { l.kind = v; if (v === "issue") { l.retest = l.retest ?? l.run1; l.chain = l.chain || []; } drawFiles(); })),
+          field(l.kind === "issue" ? "Run 1 (parts good here)" : "Run 1", dsSel(l.run1, (v) => (l.run1 = v))),
+          ...(l.kind === "issue" ? [field("Retest (good parts failed here)", dsSel(l.retest, (v) => (l.retest = v))), field("Retests of those rejects, in order", chainBox)] : []),
+          h("button", { title: "Remove this lot", onclick: () => { c.lots.splice(i, 1); drawFiles(); } }, "Remove lot")));
+    });
+    const scr = h("div", { class: "row tight" }, ...c.screen.map((x, j) => h("span", { class: "row tight" }, dsSel(x, (v) => (c.screen[j] = v)), h("button", { onclick: () => { c.screen.splice(j, 1); drawFiles(); } }, "×"))),
+      h("button", { onclick: () => { c.screen.push(ids[ids.length - 1]); drawFiles(); } }, "+ file to screen"));
+    files.replaceChildren(h("h2", {}, "Files and roles"), ...lotRows,
+      h("div", { class: "row" }, h("button", { onclick: () => { c.lots.push({ name: `Lot ${String.fromCharCode(65 + c.lots.length)}`, kind: "issue", run1: ids[0], retest: ids[0], chain: [] }); drawFiles(); } }, "+ Issue lot"),
+        h("button", { onclick: () => { c.lots.push({ name: `Lot ${String.fromCharCode(65 + c.lots.length)}`, kind: "clean", run1: ids[0] }); drawFiles(); } }, "+ Clean lot")),
+      h("div", { class: "controls" }, field("Files to screen (good parts)", scr)));
+  };
+  drawFiles();
+
+  // settings
+  const testIn = h("input", { type: "text", value: c.test, placeholder: "e.g. 1013", style: { width: "110px" }, oninput: (e) => (c.test = e.target.value.trim()) });
+  const keySel = select(KEYS.filter(([k]) => k !== "tests"), c.key || "part_txt", (v) => (c.key = v));
+  settings.append(h("h2", {}, "Settings"), h("div", { class: "controls" }, field("Failing test", testIn), field("Identify parts by", keySel), field("Good parts are", h("input", { type: "text", class: "filter-input", value: c.good, oninput: (e) => (c.good = e.target.value) })),
+    field("Leave out tests", h("input", { type: "text", value: c.exclude, style: { width: "170px" }, oninput: (e) => (c.exclude = e.target.value) })), loadboardField(),
+    h("button", { class: "primary", onclick: () => runAll() }, "Run all steps")));
+
+  // steps
+  const boxes = {};
+  for (const [k, title, what] of INV_STEPS) {
+    const status = h("span"), body = h("div");
+    boxes[k] = { status, body };
+    steps.append(h("div", { class: "card pad", style: { marginTop: "12px" } }, h("div", { class: "row" }, h("b", {}, title), status,
+      h("button", { onclick: () => run(k) }, k === "screen" ? "Run (with step 4)" : "Run"), h("button", { onclick: () => openFull(k), title: "Open the full page with this case's settings" }, "Open page →")),
+      h("p", { class: "muted small" }, what), body));
+  }
+  const issue = () => c.lots.filter((l) => l.kind === "issue"), clean = () => c.lots.filter((l) => l.kind === "clean");
+  const g4 = (v) => (v == null || !isFinite(v) ? "–" : String(Number(v.toPrecision(5))));
+  const pctS = (v, n) => (v == null || !isFinite(v) ? "–" : (v * 100).toFixed(n ?? 1) + "%");
+  const setStatus = (k, s, msg) => { R[k + "_status"] = [s, msg]; boxes[k].status.replaceChildren(s ? badge(msg || s, s === "done" ? "good" : s === "error" ? "bad" : "neutral") : ""); };
+  const need = () => { if (!c.test) throw new Error("Enter the failing test in Settings"); };
+
+  async function stepRecovery() {
+    need();
+    R.recovery = [];
+    for (const l of issue()) {
+      if (!l.chain.length) { R.recovery.push({ lot: l.name, note: "no reject retest: add the retests of the rejects to find the recovery window" }); continue; }
+      const d = await api("retest_trace", { runs: [l.retest, ...l.chain], key: c.key, filter: `fail(${c.test})`, tests: c.test, also: [l.run1], max_rate: c.maxRate / 100, min_zone: c.minZone });
+      R.recovery.push({ lot: l.name, d });
+    }
+    pickWindow();
+  }
+  function pickWindow() {
+    const cands = (R.recovery || []).filter((x) => x.d).map((x) => ({ lot: x.lot, z: x.d.recovery[0].zones.find((z) => z.kind === "hard_bad"), units: x.d.tests[0].units })).filter((x) => x.z);
+    const w = c.window;
+    const pick = w.from === "auto" ? cands.sort((a, b) => b.z.n - a.z.n)[0] : cands.find((x) => x.lot === w.from);
+    R.window = pick ? Object.assign({ lot: pick.lot, units: pick.units, how: w.mode === "strict" ? "strict (observed)" : w.mode === "widened" ? "widened to the nearest recovered part" : `strict + ${w.tol}${w.unit === "pct" ? "% of band width" : " " + (pick.units || "")}` }, hardBadRange(pick.z, w.mode, w.tol, w.unit)) : null;
+  }
+  function drawRecovery() {
+    const b = boxes.recovery.body;
+    if (!R.recovery) return b.replaceChildren();
+    const rows = R.recovery.map((x) => {
+      if (!x.d) return { lot: x.lot, note: x.note };
+      const z = (k) => x.d.recovery[0].zones.find((q) => q.kind === k);
+      const f = (q) => (q ? `${g4(q.lo)} … ${g4(q.hi)}: ${q.recovered}/${q.n}` : "–");
+      return { lot: x.lot, traced: x.d.n_parts, recovered: x.d.outcomes.recovered, still: x.d.outcomes.still_bad, units: x.d.tests[0].units, hard: f(z("hard_bad")), marginal: f(z("marginal")), extreme: f(z("extreme")) };
+    });
+    const t = h("div");
+    const w = c.window;
+    const fromSel = select([["auto", "auto (most hard-bad parts)"], ...issue().map((l) => [l.name, l.name])], w.from, (v) => { w.from = v; pickWindow(); drawRecovery(); });
+    const modeSel = select([["strict", "strict (observed)"], ["widened", "widened to the nearest recovered part"], ["tolerance", "strict + tolerance"]], w.mode, (v) => { w.mode = v; pickWindow(); drawRecovery(); });
+    const tolIn = h("input", { type: "number", min: 0, step: "any", value: w.tol, style: { width: "70px" }, hidden: w.mode !== "tolerance", onchange: (e) => { w.tol = +e.target.value || 0; pickWindow(); drawRecovery(); } });
+    const unitSel = select([["pct", "% of band width"], ["abs", "absolute"]], w.unit, (v) => { w.unit = v; pickWindow(); drawRecovery(); });
+    unitSel.hidden = w.mode !== "tolerance";
+    b.replaceChildren(t, h("div", { class: "controls" }, field("Window from", fromSel), field("Range", h("div", { class: "row tight" }, modeSel, tolIn, unitSel)),
+      h("span", { style: { paddingBottom: "8px" } }, R.window ? h("b", {}, `Hard-bad window: ${c.test} in ${g4(R.window.lo)} … ${g4(R.window.hi)} ${R.window.units || ""} (${R.window.how}, from ${R.window.lot})`) : h("span", { class: "muted" }, "No hard-bad window found: step 2 then takes every fail of the test."))));
+    table(t, [{ key: "lot", label: "Lot" }, { key: "traced", label: "Rejects traced", num: true }, { key: "recovered", label: "Recovered", num: true }, { key: "still", label: "Still bad", num: true },
+      { key: "marginal", label: "Marginal" }, { key: "hard", label: "Hard bad" }, { key: "extreme", label: "Extreme" }, { key: "note", label: "" }], rows, { search: false });
+  }
+
+  async function stepBad() {
+    need();
+    R.bad = [];
+    const range = R.window ? `${g4(R.window.lo)}..${g4(R.window.hi)}` : "";
+    for (const l of issue()) {
+      const m = await api("candidate_sets", { a: l.run1, b: l.retest, key_a: c.key, key_b: c.key, filter_a: scoped(c.good), filter_b: `not pass and fail(${c.test})`, test: c.test, range, include_marginal: false, name: "case_bad", marginal: "case_marginal", confirmed: "case_good" });
+      R.bad.push({ lot: l.name, m });
+    }
+  }
+  function drawBad() {
+    const b = boxes.bad.body;
+    if (!R.bad) return b.replaceChildren();
+    const t = h("div");
+    b.replaceChildren(t);
+    table(t, [{ key: "lot", label: "Lot" }, { key: "n_b", label: `Fail ${c.test} in retest`, num: true }, { key: "n_cand", label: "Hard bad ($case_bad)", num: true }, { key: "n_marginal", label: "Marginal", num: true }, { key: "n_confirmed", label: "Confirmed good", num: true }, { key: "rng", label: "Range" }],
+      R.bad.map((x) => Object.assign({}, x.m, { lot: x.lot, rng: x.m.range ? `${g4(x.m.range.lo)} … ${g4(x.m.range.hi)} ${x.m.range.units || ""}` : "any fail" })), { search: false });
+  }
+
+  async function stepCommon() {
+    need();
+    const w = waferCal();
+    const lots = c.lots.map((l) => l.kind === "issue"
+      ? { name: l.name, ds: l.run1, kind: "issue", bad: "$case_bad", good: "$case_good", groups: [{ label: "marginal", filter: "$case_marginal" }, { label: "unrecoverable", filter: "$retest_still_bad" }, { label: "recovered", filter: "$retest_recovered" }] }
+      : { name: l.name, ds: l.run1, kind: "clean", bad: `fail(${c.test})`, good: scoped(c.good) });
+    R.common = await api("commonality", { lots, exclude: c.exclude, wafer_test: w.w, x_test: w.x, y_test: w.y, ox_test: w.ox, oy_test: w.oy, offset_mode: w.mode, flip_x: w.fx, flip_y: w.fy });
+  }
+  function drawCommon() {
+    const b = boxes.common.body;
+    const d = R.common;
+    if (!d) return b.replaceChildren();
+    const lots = d.lots;
+    const ft = h("div"), detail = h("div"), mt = h("div");
+    const flagged = d.factors.filter((f) => f.flag_within || f.flag_across);
+    b.replaceChildren(h("div", { class: "kpis" }, ...lots.map((l) => kpi(l.name, `${l.n_bad} / ${l.n_good}`, `${l.kind === "clean" ? `fail ${c.test}` : "hard bad"} / good`))),
+      h("ul", { class: "findings" }, ...(flagged.length ? flagged.map((f) => h("li", {}, h("b", {}, f.name), f.flag_across ? `: ${f.flag_across.level} holds ${f.flag_across.issue_share >= 1 ? "all" : "at least " + pctS(f.flag_across.issue_share, 0)} of every issue lot's bad parts, but only ${pctS(f.flag_across.clean_share, 0)} of the clean lots' parts.` : "", f.flag_within ? " Sets the bad parts apart within every issue lot (q < 0.05) and in no clean lot." : ""))
+        : [h("li", {}, "No factor is shared by all issue lots and absent from the clean lots.")])),
+      h("h3", {}, "Factors"), h("p", { class: "muted small" }, "Per lot: χ² test of bad vs good across the factor's levels (BH-corrected within the lot), the level with the highest bad rate and its lift. Click a factor for every group's share per level."), ft, detail,
+      h("h3", {}, "Top marker tests, side by side"), h("p", { class: "muted small" }, "Each lot's bad vs good parts ranked as on Bad candidates (no random forest here); sorted by the lowest score across the issue lots, so tests that mark every issue lot come first."), mt);
+    const frows = d.factors.map((f) => {
+      const o = { key: f.key, name: f.name, flag: [f.flag_across ? `across: ${f.flag_across.level}` : "", f.flag_within ? "within" : ""].filter(Boolean).join(", ") };
+      f.lots.forEach((l, i) => { o[`q${i}`] = l.test ? l.test.q : null; o[`t${i}`] = l.test ? `${l.test.top} (${fmt(l.test.top_lift, 1)}×)` : ""; });
+      return o;
+    });
+    const showFactor = (fr) => {
+      const f = d.factors.find((x) => x.key === fr.key);
+      const cols = [{ key: "level", label: f.name }];
+      const series = [];
+      f.lots.forEach((l, i) => l.groups.forEach((g, j) => { cols.push({ key: `g${i}_${j}`, label: `${l.lot}: ${g.label} (${g.n})`, num: true, fmt: (v) => pctS(v) }); series.push([`${l.lot}: ${g.label}`, l.kind, g]); }));
+      const rows = f.levels.map((lv) => { const o = { level: lv }; f.lots.forEach((l, i) => l.groups.forEach((g, j) => (o[`g${i}_${j}`] = g.n ? (g.counts[lv] || 0) / g.n : null))); return o; });
+      const tt = h("div"), [card, ch] = chartBox();
+      detail.replaceChildren(h("div", { class: "grid2" }, card, tt));
+      const shown = series.filter(([n]) => / bad$| good$|unrecoverable|recovered/.test(n));
+      plot(ch, { data: shown.map(([n, kind, g]) => ({ type: "bar", name: n, x: f.levels, y: f.levels.map((lv) => (g.n ? (100 * (g.counts[lv] || 0)) / g.n : 0)), hovertemplate: `${n}<br>%{x}: %{y:.1f}%<extra></extra>` })),
+        layout: { title: { text: `${f.name}: share of each group per level`, x: 0.01, xanchor: "left", font: { size: 15 } }, barmode: "group", xaxis: { type: "category" }, yaxis: { title: { text: "% of group" } }, margin: { l: 55, r: 20, t: 56, b: 80 }, legend: { orientation: "h", y: -0.25 } } });
+      table(tt, cols, rows, { search: false });
+    };
+    const fcols = [{ key: "name", label: "Factor" }, { key: "flag", label: "Flag", render: (v) => (v ? badge(v, "bad") : "") }];
+    lots.forEach((l, i) => fcols.push({ key: `q${i}`, label: `${l.name} q`, num: true, fmt: fmtP, title: `χ² bad vs good in ${l.name}, BH-corrected` }, { key: `t${i}`, label: `${l.name} top level` }));
+    table(ft, fcols, frows, { search: false, onClick: showFactor });
+    if (frows.length) showFactor(flagged.length ? frows.find((r) => r.key === flagged[0].key) : frows[0]);
+    const mcols = [{ key: "key", label: "Test" }, { key: "common", label: "Lowest issue-lot score", num: true, fmt: (v) => fmt(v, 2) }];
+    lots.forEach((l, i) => d.marker_lots[i] && mcols.push({ key: `s${i}`, label: `${l.name} score`, num: true, fmt: (v, r) => (v == null ? "–" : `${fmt(v, 2)} ${r[`w${i}`]}`) }));
+    table(mt, mcols, d.markers.map((m) => { const o = { key: m.key, common: m.common }; m.lots.forEach((s, i) => { o[`s${i}`] = s ? s.score : null; o[`w${i}`] = s ? s.why : ""; }); return o; }), { limit: 15, placeholder: "Search tests…" });
+  }
+
+  async function stepSignature() {
+    need();
+    const iss = issue();
+    if (!iss.length) throw new Error("Add an issue lot");
+    const first = iss[0], others = iss.slice(1);
+    const screen = [...others.flatMap((l) => [{ ds: l.run1, filter: "$retest_still_bad", label: `${l.name} unrecoverable` }, { ds: l.run1, filter: "$retest_recovered", label: `${l.name} recovered` }]), ...c.screen.map((x) => ({ ds: x, filter: scoped(c.good) }))];
+    R.sig = await api("signature", { a: first.run1, name: "case_bad", filter: scoped(c.good), exclude: c.exclude, exclude_set: "case_marginal", confirmed: "case_good", use_confirmed: true, max_rules: 5, range: S.co.range,
+      clean: clean().map((l) => ({ ds: l.run1, filter: scoped(c.good) })), stayed: others.map((l) => ({ a: l.run1, b: l.retest, key: c.key, filter: scoped(c.good) })), screen });
+    R.sigLot = first.name;
+  }
+  function drawSignature() {
+    const b = boxes.signature.body, d = R.sig;
+    if (!d) return b.replaceChildren();
+    const sg = d.signature;
+    b.replaceChildren(h("div", { class: "kpis" }, kpi("Learned from", R.sigLot, `${d.n_cand} bad candidates vs ${d.n_normal} ${d.normal}`), kpi("Reference pool", d.n_pool.toLocaleString(), d.sources.map((x) => x.name).join(" + ")),
+      kpi("Rules kept", `${d.rows.filter((r) => r.verdict === "keep").length} + ${d.rows.filter((r) => r.verdict === "caution").length}`, `of ${d.rows.length} tests`)),
+      sg.rules.length ? h("p", {}, `Signature: at least ${sg.m} of `, ...sg.rules.map((r, i) => h("span", {}, i ? ", " : "", h("b", {}, r.key), ` ${r.text} ${r.units || ""}`)), ` · catches ${pctS(sg.capture, 0)}, normal ${pctS(sg.fa_a)}, pooled reference ${pctS(sg.fa_ref)}`)
+        : h("p", {}, "No rule survives the reference pool: nothing in run 1 sets the bad candidates apart from good parts that stayed good."));
+  }
+  function drawScreen() {
+    const b = boxes.screen.body, d = R.sig;
+    if (!d) return b.replaceChildren();
+    const t = h("div");
+    b.replaceChildren(t);
+    if (!d.screen.length) { t.append(h("p", { class: "muted" }, "Nothing to screen: add a second issue lot or files to screen.")); return; }
+    table(t, [{ key: "name", label: "Screened" }, { key: "verdict", label: "Verdict", render: (v) => badge(v, SCREEN_VERDICT[v] || "neutral") }, { key: "n", label: "Parts", num: true }, { key: "hits", label: "Match", num: true }, { key: "rate", label: "Rate", num: true, fmt: (v) => pctS(v, 1) }, { key: "p_ref", label: "p vs reference", num: true, fmt: fmtP }], d.screen, { search: false });
+  }
+  const STEP = { recovery: [stepRecovery, drawRecovery], bad: [stepBad, drawBad], common: [stepCommon, drawCommon], signature: [stepSignature, drawSignature], screen: [stepSignature, drawScreen] };
+  async function run(k) {
+    setStatus(k, "running", "running…");
+    try {
+      await STEP[k][0]();
+      setStatus(k, "done", "done");
+      STEP[k][1]();
+      if (k === "recovery") drawBad();
+      if (k === "signature" || k === "screen") { setStatus("signature", "done", "done"); setStatus("screen", "done", "done"); drawSignature(); drawScreen(); }
+      return true;
+    } catch (e) { setStatus(k, "error", "error"); boxes[k].body.replaceChildren(h("div", { class: "err" }, e.message)); return false; }
+  }
+  async function runAll() { for (const k of ["recovery", "bad", "common", "signature"]) if (!(await run(k))) break; }
+  function openFull(k) {
+    const iss = issue(), l = iss[0];
+    if (k === "recovery" && l) { const x = (R.recovery || []).find((y) => y.d); const lot = iss.find((y) => x && y.name === x.lot) || l; S.rt = Object.assign(S.rt || {}, { runs: [lot.retest, ...lot.chain], mode: "test", tests: c.test, exclude: c.exclude }); S.rtLast = x ? x.d : null; go("retest"); }
+    else if (k === "bad" && l) { S.bc = Object.assign(S.bc || {}, { a: l.run1, b: l.retest, good: c.good, test: c.test, how: "fail", range: R.window ? `${g4(R.window.lo)}..${g4(R.window.hi)}` : "", rangeNote: R.window ? `from the case's recovery window (${R.window.how}, ${R.window.lot})` : "", incMarg: false, extra: "", name: "case_bad", exclude: c.exclude, coords: "auto" }); S.bcLast = null; go("candidates"); }
+    else if ((k === "signature" || k === "screen") && l) { Object.assign(sigState(), { a: l.run1, name: "case_bad", filter: c.good, exclude: c.exclude, confirmed: "case_good", noMarginal: true, clean: clean().map((x) => ({ ds: x.run1, filter: c.good })), stayed: iss.slice(1).map((x) => ({ a: x.run1, b: x.retest })) }); S.sgLast = R.sig || null; go("signature"); }
+    else if (k === "common") toast("Commonality is shown here; open a lot in Bad candidates for its own common factors", "neutral");
+  }
+  // redraw earlier results
+  for (const [k] of INV_STEPS) { const s = R[k + "_status"]; if (s) setStatus(k, s[0], s[1]); }
+  drawRecovery(); drawBad(); drawCommon(); drawSignature(); drawScreen();
+}
+
+// ---- Retest trace
+const RT_OUTCOME = { recovered: ["recovered", "@pass", "good"], still_bad: ["still bad", "@fail", "bad"], not_retested: ["not retested", "@warn", "warn"], passed_run1: ["stayed good", "@s1", "neutral"] };
+const RT_STATUS = { pass: "pass", fail: "fail", not_retested: "not retested", passed_earlier: "passed earlier" };
+/** A color token with transparency, for Sankey links. */
+function tokA(name, a) {
+  const c = getComputedStyle(document.documentElement).getPropertyValue("--" + name).trim();
+  const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})/i.exec(c);
+  return m ? `rgba(${parseInt(m[1], 16)},${parseInt(m[2], 16)},${parseInt(m[3], 16)},${a})` : `rgba(128,128,128,${a})`;
+}
+/** The hard-bad range to send: strict (observed), widened (to the nearest recovered part) or strict + tolerance (never past it). */
+function hardBadRange(z, mode, tol, unit) {
+  if (mode === "widened") return { lo: z.safe_lo ?? z.lo, hi: z.safe_hi ?? z.hi };
+  if (mode === "tolerance") {
+    const d = unit === "abs" ? tol : ((z.hi - z.lo) * tol) / 100;
+    return { lo: z.safe_lo != null ? Math.max(z.lo - d, z.safe_lo) : z.lo - d, hi: z.safe_hi != null ? Math.min(z.hi + d, z.safe_hi) : z.hi + d };
+  }
+  return { lo: z.lo, hi: z.hi };
+}
+function viewRetest(el) {
+  el.append(h("h1", {}, "Retest trace"), h("p", { class: "lead" }, "Follow parts through a chain of runs: run 1, then a retest of its rejects, then a retest of those rejects, and so on; a run may also retest good parts (e.g. the good parts of runs 1 and 2), and their rejects are followed on. Pick the starting parts in run 1 (e.g. the ones failing test 1013); each later run is searched for the same physical part, so you see per run whether it passed or failed, its bin and the traced test's value, and how the population shrinks."));
+  if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open run 1 and at least one retest file (without 'combine').")); return; }
+  const ids = S.datasets.map((d) => d.id);
+  const st = S.rt || (S.rt = { runs: ids.slice(0, 3), mode: "reject", custom: "", tests: "", exclude: "500, 80100-80104", valueFrom: "first", maxRate: 10, minZone: 10 });
+  st.runs = st.runs.filter((x) => ids.includes(x));
+  while (st.runs.length < 2) { const o = ids.find((x) => !st.runs.includes(x)); if (o === undefined) break; st.runs.push(o); }
+  const runsBox = h("div");
+  const drawRuns = () => {
+    runsBox.replaceChildren(...st.runs.map((id, i) => h("div", { class: "row tight", style: { marginBottom: "6px" } },
+      h("span", { style: { width: "54px" } }, `Run ${i + 1}`),
+      select(dsOptions(), String(id), (v) => { st.runs[i] = +v; updHint(); }),
+      h("button", { title: "Move up", disabled: i === 0, onclick: () => { [st.runs[i - 1], st.runs[i]] = [st.runs[i], st.runs[i - 1]]; drawRuns(); updHint(); } }, "↑"),
+      h("button", { title: "Move down", disabled: i === st.runs.length - 1, onclick: () => { [st.runs[i + 1], st.runs[i]] = [st.runs[i], st.runs[i + 1]]; drawRuns(); updHint(); } }, "↓"),
+      h("button", { title: "Remove", disabled: st.runs.length <= 2, onclick: () => { st.runs.splice(i, 1); drawRuns(); updHint(); } }, "×"),
+      h("span", { class: "muted small" }, i === 0 ? "first run: the starting parts" : "a retest: of the rejects, or of good parts"))),
+      h("button", { onclick: () => { st.runs.push(ids.find((x) => !st.runs.includes(x)) ?? ids[0]); drawRuns(); } }, "+ Add run"));
+  };
+  const kp = keyPicker("rt");
+  const mode = select([["reject", "rejects of run 1 (not pass)"], ["all", "all parts of run 1 (when a run retests good parts)"], ["test", "failing the traced test"], ["custom", "custom filter"]], st.mode, (v) => { st.mode = v; custom.hidden = v !== "custom"; });
+  const custom = h("input", { type: "text", class: "filter-input", value: st.custom, placeholder: "e.g. fail(1013) and site = 2", hidden: st.mode !== "custom", oninput: (e) => (st.custom = e.target.value) });
+  const tests = h("input", { type: "text", value: st.tests, placeholder: "blank = most common first fail", style: { width: "190px" }, title: "Test(s) to trace, e.g. 1013 or 1013, 1290. Values are shown in each test's display unit (logged UNITS scaled by RES_SCAL).", oninput: (e) => { st.tests = e.target.value; updHint(); } });
+  const unitHint = h("b", { class: "small" });
+  const excl = h("input", { type: "text", value: st.exclude, style: { width: "170px" }, title: "Left out when picking the most common first fail (identity tests)", oninput: (e) => (st.exclude = e.target.value) });
+  const out = h("div"), traceBox = h("div");
+  async function updHint() {
+    const q = tests.value.split(",")[0].trim().replace(/:.*/, "");
+    unitHint.textContent = "";
+    if (!q) return;
+    try { const t = (await testsFor(st.runs[0], "")).find((x) => x.key === q || String(x.num) === q || x.name === q); unitHint.textContent = t ? t.disp_units || t.units || "" : "not in run 1"; } catch (e) { }
+  }
+  const run = async () => {
+    const first = st.tests.split(",")[0].trim().replace(/:.*/, "");
+    if (st.mode === "test" && !first) return toast("Enter the test to trace first", "bad");
+    const filter = st.mode === "reject" ? "not pass" : st.mode === "all" ? "all" : st.mode === "test" ? `fail(${first})` : st.custom.trim() || "not pass";
+    loading(out, "Following the parts through the runs…");
+    try {
+      const d = await api("retest_trace", { runs: st.runs, key: kp.value(), filter: scoped(filter), tests: st.tests, exclude: st.exclude, value_from: st.valueFrom || "first", max_rate: (st.maxRate ?? 10) / 100, min_zone: st.minZone ?? 10 });
+      S.rtLast = d;
+      renderRetest(out, traceBox, d);
+    } catch (e) { showErr(out, e); }
+  };
+  S.rtRun = run;
+  drawRuns();
+  updHint();
+  el.append(
+    h("div", { class: "grid2" },
+      h("div", { class: "card pad" }, h("b", {}, "Runs, in test order"), runsBox),
+      h("div", { class: "card pad" }, h("b", {}, "Parts and tests"),
+        h("div", { class: "controls" }, field("Identify parts by", kp.el)),
+        h("p", { class: "muted small" }, "Part text (or wafer + X/Y) is safest: part IDs often restart at 1 in every run."),
+        h("div", { class: "controls" }, field("Start with", h("div", { class: "row tight" }, mode, custom))),
+        h("div", { class: "controls" }, field("Trace test(s)", h("div", { class: "row tight" }, tests, unitHint)), field("Leave out tests", excl), loadboardField(), h("button", { class: "primary", onclick: run }, "Trace")))),
+    out, traceBox);
+  if (S.rtLast) renderRetest(out, traceBox, S.rtLast);
+}
+function renderRetest(out, traceBox, d) {
+  const pctS = (v, n) => (v == null || !isFinite(v) ? "–" : (v * 100).toFixed(n ?? 1) + "%");
+  const N = d.runs.length, o = d.outcomes;
+  const rl = (k) => `Run ${k + 1}`;
+  out.replaceChildren(h("div", { class: "kpis" },
+    kpi("Traced parts", d.n_parts.toLocaleString(), `run 1: ${d.filter}`),
+    kpi("Recovered", o.recovered.toLocaleString(), `${pctS(o.recovered / ((o.recovered + o.still_bad + o.not_retested) || 1))} of the parts that failed passed a later retest`),
+    kpi("Still bad", o.still_bad.toLocaleString(), `failed in ${rl(N - 1)}`),
+    kpi("Not retested", o.not_retested.toLocaleString(), "failed, then no match in a later run"),
+    o.passed_run1 ? kpi("Stayed good", o.passed_run1.toLocaleString(), "passed run 1 and never failed after") : "",
+    kpi("Matched by", d.key_desc, "")),
+  h("div", { class: "row" },
+    h("button", { onclick: () => useFilter(d.runs[0].id, "$retest_recovered") }, "Analyse recovered ($retest_recovered)"),
+    h("button", { onclick: () => useFilter(d.runs[0].id, "$retest_still_bad") }, "Analyse still bad ($retest_still_bad)"),
+    o.not_retested ? h("button", { onclick: () => useFilter(d.runs[0].id, "$retest_not_retested") }, "Not retested ($retest_not_retested)") : ""),
+  retestHelp());
+
+  // per-run summary
+  const t0 = d.tests[0];
+  const lbOf = (r) => { const v = [...new Set((r.loadboard || []).filter((x) => x != null))]; return v.length ? `LB ${v.join("/")}${r.loadboard_changed ? " (changes in file!)" : ""}` : ""; };
+  const srows = d.summary.map((s, k) => Object.assign({ name: `${rl(k)}: ${d.runs[k].name}`, lb: lbOf(d.runs[k]) }, s));
+  const sb = h("div");
+  out.append(h("h2", {}, "Run by run"), sb);
+  table(sb, [
+    { key: "name", label: "Run" },
+    { key: "lb", label: "Loadboard", title: `test ${d.loadboard_test}: the most common value in the file (parts without it take the file's board)` },
+    { key: "due", label: "Due", num: true, title: "parts still bad coming into this run (run 1: every traced part)" },
+    { key: "retested", label: "Retested", num: true, title: "of those, found in this run" },
+    { key: "pass", label: "Pass", num: true, title: "passed in this run (recovered, from run 2 on)" },
+    { key: "fail", label: "Fail", num: true },
+    { key: "fail_test", label: `Fail ${t0.key}`, num: true, title: "failing the traced test here" },
+    { key: "fail_other", label: "Fail other", num: true, title: "failing, but not on the traced test" },
+    { key: "not_retested", label: "Not retested", num: true, title: "still bad but not found in this run" },
+    { key: "retest_good", label: "Retest of good", num: true, fmt: (v, r) => (v ? `${v} (${r.retest_good_fail} fail)` : "–"), title: "parts that had passed in an earlier run and were tested again here; those failing are due for the next run" },
+    { key: "cum_recovery_rate", label: "Cum. recovered", num: true, fmt: (v, r) => (r.run ? `${r.cum_recovered} (${pctS(v)})` : "–"), title: "parts that passed a retest up to this run, over run 1's fails" },
+  ], srows, { search: false });
+  if (d.by_board.length) {
+    const bb = h("div");
+    out.append(h("h3", {}, "Recovery by loadboard"), h("p", { class: "muted small" }, `Parts due for a retest, by the loadboard (test ${d.loadboard_test}) of the run that retested them. 95% Wilson interval in brackets. Each run only gets the previous run's rejects, so boards on different runs see different parts: compare boards at the same run position (e.g. run 2 of two lots).`), bb);
+    table(bb, [
+      { key: "run", label: "Run", fmt: (v) => rl(v) }, { key: "board", label: "Loadboard" }, { key: "retested", label: "Retested", num: true }, { key: "pass", label: "Recovered", num: true },
+      { key: "rate", label: "Recovery", num: true, fmt: (v, r) => `${pctS(v)} [${pctS(r.ci_lo, 0)}–${pctS(r.ci_hi, 0)}]` },
+    ], d.by_board, { search: false });
+  }
+
+  renderRetestCandidates(out, d);
+
+  // flow
+  const nodes = [], idx = {};
+  // flows carry labels ("passed earlier"); the lookups use status keys
+  const node = (k, s) => { s = s.replace(" ", "_"); const n = `${rl(k)} ${RT_STATUS[s]}`; if (!(n in idx)) { idx[n] = nodes.length; nodes.push([n, s]); } return idx[n]; };
+  const links = d.flows.map((f) => ({ s: node(f.run, f.from), t: node(f.run + 1, f.to), n: f.n, to: f.to.replace(" ", "_") }));
+  const nodeCol = { pass: "@pass", fail: "@fail", not_retested: "@warn", passed_earlier: "@muted" };
+  const linkCol = { pass: "pass", fail: "fail", not_retested: "warn", passed_earlier: "muted" };
+  // stacked full width so up to 8 runs stay readable
+  const g = h("div", { class: "grid1" });
+  out.append(h("h2", {}, "Flow and trajectories"), g);
+  {
+    const [card, c] = chartBox("tall");
+    g.append(card);
+    plot(c, { data: [{ type: "sankey", arrangement: "snap", node: { label: nodes.map(([n]) => n), color: nodes.map(([, s]) => nodeCol[s]), pad: 18, thickness: 16, line: { width: 0 } },
+      link: { source: links.map((l) => l.s), target: links.map((l) => l.t), value: links.map((l) => l.n), color: links.map((l) => tokA(linkCol[l.to], 0.35)), hovertemplate: "%{source.label} → %{target.label}: %{value}<extra></extra>" } }],
+      layout: { title: { text: "Where the fails went (parts that never failed left out)", x: 0.01, xanchor: "left", font: { size: 15 } }, margin: { l: 10, r: 10, t: 56, b: 20 } } });
+  }
+  // trajectory: one line per part over the runs, box per run behind
+  const trajBox = h("div", { class: "card" });
+  g.append(trajBox);
+  let ti = Math.min(S.rtTest || 0, d.tests.length - 1);
+  const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
+  const jit = (key) => { let x = 0; for (const c of key) x = (x * 31 + c.charCodeAt(0)) | 0; return ((x >>> 0) % 1000) / 1000 * 0.24 - 0.12; };
+  const drawTraj = () => {
+    const t = d.tests[ti];
+    const sel = d.tests.length > 1 ? select(d.tests.map((x, i) => [String(i), x.key]), String(ti), (v) => { ti = S.rtTest = +v; drawTraj(); drawRec(); drawDelta(); }) : null;
+    const [card, c] = chartBox("tall");
+    trajBox.replaceChildren(...(sel ? [h("div", { class: "controls", style: { padding: "8px 12px 0" } }, field("Test", sel))] : []), card.firstChild);
+    const bx = [], by = [];
+    const lines = {}, pts = { pass: [[], [], []], fail: [[], [], []], other: [[], [], []] };
+    for (const p of d.parts) {
+      const j = jit(p.key);
+      const L = lines[p.outcome] || (lines[p.outcome] = [[], []]);
+      p.runs.forEach((r, k) => {
+        const v = r.values ? r.values[ti] : null;
+        if (v == null) return;
+        bx.push(k + 1); by.push(v);
+        L[0].push(k + 1 + j); L[1].push(v);
+        const c = rtClass(r, ti);
+        const P = pts[c];
+        P[0].push(k + 1 + j); P[1].push(v); P[2].push(`${p.key}<br>${rl(k)}: ${RT_STATUS[r.status]}${r.retest_good ? " (retest of good)" : ""}, site ${r.site}, bin ${r.hbin}${c === "other" ? `<br>passes ${t.key}; ${rtOther(r)}` : ""}`);
+      });
+      L[0].push(null); L[1].push(null);
+    }
+    const data = [{ type: "box", x: bx, y: by, name: "distribution", boxpoints: false, width: 0.55, fillcolor: tokA("muted", 0.12), line: { color: tokA("muted", 0.6), width: 1 }, hoverinfo: "y", showlegend: false }];
+    for (const [k, [label, col]] of Object.entries(RT_OUTCOME)) if (lines[k]) data.push({ type: "scatter", mode: "lines", x: lines[k][0], y: lines[k][1], name: label, line: { color: col, width: 1 }, opacity: 0.35, hoverinfo: "skip", connectgaps: false });
+    data.push({ type: "scatter", mode: "markers", x: pts.fail[0], y: pts.fail[1], text: pts.fail[2], name: "fail in that run", marker: { color: "@fail", size: 6 }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>" });
+    data.push({ type: "scatter", mode: "markers", x: pts.pass[0], y: pts.pass[1], text: pts.pass[2], name: "pass in that run", marker: { color: "@pass", size: 6, symbol: "circle-open", line: { width: 2 } }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>" });
+    if (pts.other[0].length) data.push({ type: "scatter", mode: "markers", x: pts.other[0], y: pts.other[1], text: pts.other[2], name: `passes ${t.key}, fails another test or alarm`, marker: { color: "@warn", size: 7, symbol: "diamond" }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>" });
+    const hi = S.rtHi && d.parts.find((p) => p.key === S.rtHi);
+    if (hi) {
+      const xs = [], ys = [];
+      hi.runs.forEach((r, k) => { const v = r.values ? r.values[ti] : null; if (v != null) { xs.push(k + 1 + jit(hi.key)); ys.push(v); } });
+      data.push({ type: "scatter", mode: "lines+markers", x: xs, y: ys, name: hi.key, line: { color: "@text", width: 3 }, marker: { color: "@text", size: 9 } });
+    }
+    const shapes = [];
+    t.limits.forEach((l, k) => { if (!l) return; for (const y of [l.lo, l.hi]) if (y != null) shapes.push({ type: "line", x0: k + 0.55, x1: k + 1.45, y0: y, y1: y, line: { color: "@limit", width: 1.5, dash: "dash" } }); });
+    plot(c, { data, layout: { title: { text: `${t.key}${t.units ? ` [${t.units}]` : ""} per run (dashed: limits)`, x: 0.01, xanchor: "left", font: { size: 15 } },
+      xaxis: { tickvals: d.runs.map((_, k) => k + 1), ticktext: d.runs.map((r, k) => `${rl(k)}<br>${clip(r.name, N > 4 ? 16 : 28)}`), range: [0.4, N + 0.6], zeroline: false },
+      yaxis: { title: { text: t.units || "" } }, shapes, margin: { l: 60, r: 20, t: 56, b: 60 },
+      legend: { orientation: "h", x: 1, xanchor: "right", y: 1.0, yanchor: "bottom" } } });
+  };
+  // recovery by failing value
+  const recBox = h("div");
+  out.append(h("h2", {}, "Recovery by failing value"), h("p", { class: "lead" }, "Did a part's failing value decide whether a retest could recover it? Each part's value where it first failed the test (or, optionally, its value at every retest), colored by whether it passed again. The values are cut into three bands where the recovery rate changes (best fit of a separate rate per band); the middle band is hard bad when its recovery rate's 95% upper bound stays at or below the threshold. Marginal parts sit nearer the limits, extreme ones (e.g. clamped readings) farther out."), recBox);
+  const drawRec = () => {
+    const t = d.tests[ti], rc = d.recovery[ti], st = S.rt;
+    const vf = select([["first", "first failing value"], ["each", "value at every retest"]], st.valueFrom || "first", (v) => (st.valueFrom = v));
+    const mr = h("input", { type: "number", min: 1, max: 50, step: 1, value: st.maxRate ?? 10, style: { width: "70px" }, oninput: (e) => (st.maxRate = +e.target.value || 10) });
+    const mz = h("input", { type: "number", min: 3, step: 1, value: st.minZone ?? 10, style: { width: "70px" }, oninput: (e) => (st.minZone = +e.target.value || 10) });
+    const tol = select([["strict", "strict (observed)"], ["widened", "widened to the nearest recovered part"], ["tolerance", "strict + tolerance"]], st.rangeMode || "strict", (v) => { st.rangeMode = v; tolBox.hidden = v !== "tolerance"; preview(); });
+    tol.title = "Which range 'Use as hard-bad range' sends to Bad candidates. Strict (default): only values seen never to recover, the cleanest candidates. Widened: halfway to the nearest part that did recover. Strict + tolerance: both edges moved out by a share of the band width or a fixed amount, never past the nearest recovered part.";
+    const tolV = h("input", { type: "number", min: 0, step: "any", value: st.tolValue ?? 5, style: { width: "70px" }, oninput: (e) => { st.tolValue = +e.target.value || 0; preview(); } });
+    const tolU = select([["pct", "% of band width"], ["abs", `${t.units || "units"} (absolute)`]], st.tolUnit || "pct", (v) => { st.tolUnit = v; preview(); });
+    const tolBox = h("div", { class: "row tight", hidden: (st.rangeMode || "strict") !== "tolerance" }, tolV, tolU);
+    const prev = h("span", { class: "muted small", style: { paddingBottom: "8px" } });
+    const u = t.units ? ` ${t.units}` : "";
+    const g4 = (v) => (v == null || !isFinite(v) ? "–" : String(Number(v.toPrecision(5))));
+    const pts = rc.points;
+    const ok = pts.filter((p) => p.recovered), bad = pts.filter((p) => !p.recovered);
+    const zcol = { marginal: "warn", hard_bad: "fail", extreme: "muted" };
+    const zname = { marginal: "marginal", hard_bad: "hard bad", extreme: "extreme" };
+    const shapes = rc.zones.map((z) => ({ type: "rect", xref: "x", yref: "paper", x0: z.lo, x1: z.hi, y0: 0, y1: 1, fillcolor: tokA(zcol[z.kind], 0.16), line: { width: 0 }, layer: "below" }));
+    // the hard-bad band widened halfway to the nearest part outside it
+    for (const z of rc.zones.filter((x) => x.kind === "hard_bad")) for (const x of [z.safe_lo, z.safe_hi]) if (x != null) shapes.push({ type: "line", xref: "x", yref: "paper", x0: x, x1: x, y0: 0, y1: 1, line: { color: "@fail", dash: "dot", width: 1 } });
+    const lim = t.limits[0] || {};
+    for (const x of [lim.lo, lim.hi]) if (x != null) shapes.push({ type: "line", xref: "x", yref: "paper", x0: x, x1: x, y0: 0, y1: 1, line: { color: "@limit", dash: "dash", width: 1.5 } });
+    const ann = rc.zones.map((z, i) => ({ x: (z.lo + z.hi) / 2, y: 1 - 0.07 * (i % 2), xref: "x", yref: "paper", yanchor: "bottom", showarrow: false, text: `${zname[z.kind]}: ${z.recovered}/${z.n} recovered`, font: { size: 11 }, bgcolor: tokA("surface", 0.85) }));
+    const [c1, p1] = chartBox("tall"), [c2, p2] = chartBox("tall");
+    const zt = h("div");
+    recBox.replaceChildren(h("div", { class: "controls" }, field("Value", vf), field("Hard bad: recovery ≤ (%)", mr), field("Min parts per zone", mz), h("button", { onclick: () => S.rtRun && S.rtRun() }, "Recompute"), field("Hard-bad range to use", h("div", { class: "row tight" }, tol, tolBox)), prev),
+      pts.length ? h("div", { class: "grid2" }, c1, c2) : h("p", { class: "muted" }, "No part failed this test and was retested."), zt);
+    if (!pts.length) return;
+    plot(p1, { data: [
+      { type: "histogram", x: bad.map((p) => p.value), name: `never recovered (${bad.length})`, marker: { color: "@fail" }, nbinsx: 50 },
+      { type: "histogram", x: ok.map((p) => p.value), name: `recovered (${ok.length})`, marker: { color: "@pass" }, nbinsx: 50 }],
+      layout: { title: { text: `${t.key}: ${rc.value_from === "each" ? "value before each retest" : "first failing value"}`, x: 0.01, xanchor: "left", font: { size: 15 } }, barmode: "stack", xaxis: { title: { text: t.units || "" } }, yaxis: { title: { text: "parts" } }, shapes, annotations: ann, margin: { l: 55, r: 20, t: 70, b: 50 },
+        legend: { orientation: "h", x: 1, xanchor: "right", y: 1.08, yanchor: "bottom" } } });
+    const b = rc.bins;
+    plot(p2, { data: [{ type: "scatter", mode: "markers+lines", x: b.map((x) => (x.lo + x.hi) / 2), y: b.map((x) => x.rate * 100), text: b.map((x) => `${g4(x.lo)} … ${g4(x.hi)}${u}<br>${x.recovered} of ${x.n} recovered`),
+      error_y: { type: "data", symmetric: false, array: b.map((x) => (x.ci_hi - x.rate) * 100), arrayminus: b.map((x) => (x.rate - x.ci_lo) * 100), color: "@muted" }, line: { color: "@s1" }, marker: { size: 8, color: "@s1" }, hovertemplate: "%{text}<br>%{y:.0f}%<extra></extra>", name: "recovery rate" }],
+      layout: { title: { text: "Recovery rate per value bin (95% Wilson)", x: 0.01, xanchor: "left", font: { size: 15 } }, xaxis: { title: { text: t.units || "" } }, yaxis: { title: { text: "% recovered" }, range: [-3, 103] }, shapes, margin: { l: 55, r: 20, t: 56, b: 50 }, showlegend: false } });
+    const runOf = () => { const c = {}; for (const p of pts) c[p.run] = (c[p.run] || 0) + 1; return +Object.entries(c).sort((a, z) => z[1] - a[1])[0][0]; };
+    function sendRange(z) { return hardBadRange(z, st.rangeMode, st.tolValue ?? 5, st.tolUnit || "pct"); }
+    function rangeHow() { const m = st.rangeMode || "strict"; return m === "strict" ? "strict (observed)" : m === "widened" ? "widened to the nearest recovered part" : `strict + ${st.tolValue ?? 5}${(st.tolUnit || "pct") === "pct" ? "% of band width" : u} tolerance`; }
+    function preview() { const hb = rc.zones.find((x) => x.kind === "hard_bad"); if (!hb) { prev.textContent = ""; return; } const z = sendRange(hb); prev.textContent = `sends ${g4(z.lo)} … ${g4(z.hi)}${u}`; }
+    preview();
+    const useRange = (z0) => {
+      const z = sendRange(z0), how = rangeHow();
+      const bId = d.runs[runOf()].id;
+      const bc = S.bc || (S.bc = { a: S.ds, b: bId, good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: "500, 80100-80104", coords: "auto" });
+      Object.assign(bc, { b: bId, test: String(t.num), how: "fail", range: `${g4(z.lo)}..${g4(z.hi)}`, rangeNote: `from Retest trace, ${how}: ${rc.zones.find((x) => x.kind === "hard_bad").recovered} of ${rc.zones.find((x) => x.kind === "hard_bad").n} recovered in ${d.runs.map((r) => r.name).join(" → ")}` });
+      if (bc.a === bId) bc.a = otherDs(bId);
+      S.bcLast = null;
+      toast(`Bad candidates: test ${t.num} in ${g4(z.lo)}..${g4(z.hi)}${u} (${how}) on ${d.runs[runOf()].name} (file 2). Pick file 1 (where they were good).`, "good");
+      go("candidates");
+    };
+    table(zt, [
+      { key: "kind", label: "Zone", render: (v) => badge(zname[v], v === "hard_bad" ? "bad" : v === "marginal" ? "warn" : "neutral") },
+      { key: "lo", label: `Range${u}`, fmt: (v, r) => `${g4(r.lo)} … ${g4(r.hi)}` },
+      { key: "safe_lo", label: "Up to the nearest recovered", fmt: (v, r) => (r.kind === "hard_bad" ? `${g4(r.safe_lo)} … ${g4(r.safe_hi)}` : ""), title: "the hard-bad band widened to halfway to the nearest part outside it" },
+      { key: "n", label: "Parts", num: true }, { key: "recovered", label: "Recovered", num: true },
+      { key: "rate", label: "Recovery", num: true, fmt: (v, r) => `${pctS(v)} [${pctS(r.ci_lo, 0)}–${pctS(r.ci_hi, 0)}]`, title: "recovered share, 95% Wilson interval" },
+      { key: "use", label: "", render: (v, r) => (r.kind === "hard_bad" ? h("button", { onclick: (e) => { e.stopPropagation(); useRange(r); } }, "Use as hard-bad range") : "") },
+    ], rc.zones, { search: false });
+    if (!rc.zones.some((z) => z.kind === "hard_bad")) zt.append(h("p", { class: "muted small" }, `No middle value band with at least ${rc.min_zone} parts recovers less than its neighbours with a 95% upper bound under ${Math.round(rc.max_rate * 100)}%: lower the minimum or raise the threshold, or there is no unrecoverable band.`));
+  };
+
+  // run k vs run k+1, same parts
+  const deltaBox = h("div");
+  out.append(h("h2", {}, "Run to run"), h("p", { class: "lead" }, "The same parts' values in two consecutive runs: on the dotted y = x line the reading repeated; above or below it, it moved. Dashed lines are each run's limits."), deltaBox);
+  let pk = 0;
+  const drawDelta = () => {
+    const t = d.tests[ti];
+    const pairSel = select(d.runs.slice(0, -1).map((_, k) => [String(k), `${rl(k)} → ${rl(k + 1)}`]), String(pk), (v) => { pk = +v; drawDelta(); });
+    const P = { pass: [[], [], []], fail: [[], [], []], other: [[], [], []] };
+    for (const p of d.parts) {
+      const a = p.runs[pk], b = p.runs[pk + 1];
+      const x = a.values ? a.values[ti] : null, y = b.values ? b.values[ti] : null;
+      if (x == null || y == null) continue;
+      const c = rtClass(b, ti);
+      const Q = P[c];
+      Q[0].push(x); Q[1].push(y); Q[2].push(`${p.key}<br>site ${a.site} → ${b.site}${c === "other" ? `<br>passes ${t.key}; ${rtOther(b)}` : ""}`);
+    }
+    const all = [...P.pass[0], ...P.fail[0], ...P.other[0]], allY = [...P.pass[1], ...P.fail[1], ...P.other[1]];
+    const n = all.length;
+    const dl = allY.map((y, i) => y - all[i]).sort((a, b) => a - b);
+    const mean = (v) => v.reduce((a, b) => a + b, 0) / v.length;
+    let r = null;
+    if (n > 2) { const mx = mean(all), my = mean(allY); let sxy = 0, sxx = 0, syy = 0; all.forEach((x, i) => { sxy += (x - mx) * (allY[i] - my); sxx += (x - mx) ** 2; syy += (allY[i] - my) ** 2; }); r = sxy / Math.sqrt(sxx * syy); }
+    const lo = Math.min(...all, ...allY), hi = Math.max(...all, ...allY);
+    const shapes = [{ type: "line", x0: lo, x1: hi, y0: lo, y1: hi, line: { color: "@muted", dash: "dot" } }];
+    const la = t.limits[pk], lb = t.limits[pk + 1];
+    for (const x of [la && la.lo, la && la.hi]) if (x != null) shapes.push({ type: "line", x0: x, x1: x, yref: "paper", y0: 0, y1: 1, line: { color: "@limit", dash: "dash", width: 1 } });
+    for (const y of [lb && lb.lo, lb && lb.hi]) if (y != null) shapes.push({ type: "line", y0: y, y1: y, xref: "paper", x0: 0, x1: 1, line: { color: "@limit", dash: "dash", width: 1 } });
+    const [card, c] = chartBox("tall");
+    deltaBox.replaceChildren(h("div", { class: "controls" }, field("Runs", pairSel), h("span", { class: "muted small", style: { paddingBottom: "8px" } }, n ? `${n} parts in both · median change ${fmt(dl[Math.floor(n / 2)], 4)} ${t.units || ""} · r ${fmt(r, 3)}` : "no part has values in both runs")), card);
+    plot(c, { data: [
+      { type: "scatter", mode: "markers", x: P.fail[0], y: P.fail[1], text: P.fail[2], name: `fail in ${rl(pk + 1)}`, marker: { color: "@fail", size: 7, opacity: 0.8 }, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" },
+      { type: "scatter", mode: "markers", x: P.pass[0], y: P.pass[1], text: P.pass[2], name: `pass in ${rl(pk + 1)}`, marker: { color: "@pass", size: 7, opacity: 0.8 }, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" },
+      { type: "scatter", mode: "markers", x: P.other[0], y: P.other[1], text: P.other[2], name: `passes ${t.key}, fails another test or alarm`, marker: { color: "@warn", size: 8, symbol: "diamond", opacity: 0.9 }, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" }],
+      layout: { title: { text: `${t.key}: ${rl(pk)} vs ${rl(pk + 1)}`, x: 0.01, xanchor: "left", font: { size: 15 } }, xaxis: { title: { text: `${rl(pk)} ${t.units || ""}` } }, yaxis: { title: { text: `${rl(pk + 1)} ${t.units || ""}` } }, shapes, margin: { l: 60, r: 20, t: 56, b: 50 },
+        legend: { orientation: "h", x: 1, xanchor: "right", y: 1.0, yanchor: "bottom" } } });
+  };
+  drawTraj();
+  drawRec();
+  drawDelta();
+
+  // one row per part
+  const flat = d.parts.map((p) => {
+    const o2 = { key: p.key, outcome: p.outcome };
+    p.runs.forEach((r, k) => {
+      o2[`s${k}`] = r.row != null && rtClass(r, 0) === "other" ? (r.status === "pass" ? "pass, alarm" : `fail, not ${d.tests[0].key}`) : RT_STATUS[r.status];
+      o2[`site${k}`] = r.site ?? null;
+      o2[`b${k}`] = r.hbin ?? null;
+      o2[`f${k}`] = r.first_fail || "";
+      d.tests.forEach((_, i) => (o2[`v${k}_${i}`] = r.values ? r.values[i] : null));
+    });
+    return o2;
+  });
+  const cols = [{ key: "key", label: "Part" }, { key: "outcome", label: "Outcome", render: (v) => badge(RT_OUTCOME[v][0], RT_OUTCOME[v][2]) }];
+  d.runs.forEach((_, k) => {
+    cols.push({ key: `s${k}`, label: `R${k + 1}`, title: `yellow: passes ${d.tests[0].key} but fails another test or has an alarm`, render: (v) => (v === "pass" ? badge("pass", "good") : v === "fail" ? badge("fail", "bad") : v && (v.startsWith("pass,") || v.startsWith("fail,")) ? badge(v, "warn") : h("span", { class: "muted small" }, v || "")) },
+      { key: `site${k}`, label: `R${k + 1} site`, num: true }, { key: `b${k}`, label: `R${k + 1} bin`, num: true });
+    d.tests.forEach((t, i) => cols.push({ key: `v${k}_${i}`, label: `R${k + 1} ${t.key}${t.units ? ` (${t.units})` : ""}`, num: true, fmt: (v) => (v == null ? "" : fmt(v, 4)) }));
+    cols.push({ key: `f${k}`, label: `R${k + 1} 1st fail` });
+  });
+  const tb = h("div");
+  out.append(h("h2", {}, "Parts"), h("p", { class: "muted" }, "Click a part to highlight its line in the trajectory chart and trace it (all its results in run 1 and the last run it was found in)."), tb);
+  const keys = { key_a: d.key, key_b: d.key };
+  table(tb, cols, flat, {
+    placeholder: "Search parts…",
+    onClick: (r) => {
+      S.rtHi = r.key;
+      drawTraj();
+      const p = d.parts.find((x) => x.key === r.key);
+      const last = p.runs.map((x) => x.row != null).lastIndexOf(true);
+      const kb = last > 0 ? last : 1;
+      trace(traceBox, Object.assign({ a: d.runs[0].id, b: d.runs[kb].id, row_a: p.runs[0].row }, p.runs[kb].row != null ? { row_b: p.runs[kb].row } : {}, keys, { value: r.key }));
+    },
+    tools: h("button", { onclick: () => SC.download("retest_trace.csv", SC.toCSV(cols.map((c) => (c.key === "outcome" ? { key: "outcome", label: "Outcome" } : c.render ? { key: c.key, label: c.label } : c)), flat)) }, "Download CSV"),
+  });
+  if (d.truncated) out.append(h("p", { class: "muted small" }, "Only the first 20,000 parts are listed."));
+  renderRetestSites(out, d, pctS);
+}
+// bad candidates straight from the chain: good in run 1, failing the traced
+// test on a retest of good parts and never passing after; then which run-1
+// tests set them apart from the other good parts
+function renderRetestCandidates(out, d) {
+  const c = d.candidates;
+  if (!c || !c.good_runs.length) return;
+  const rl = (k) => `Run ${k + 1}`, t0 = d.tests[0], a = d.runs[0].id;
+  const later = d.runs[c.good_runs[0]].id;
+  const popF = c.n_marginal ? "pass and not $rt_marginal" : "pass";
+  const box = h("div"), mkBox = h("div");
+  out.append(h("h2", {}, "Bad candidates from the retests of good parts"),
+    h("p", { class: "lead" }, `${c.good_runs.map(rl).join(", ")} retested good parts. Parts good in run 1 that failed ${t0.key} there and never passed again are the bad candidates ($rt_bad_candidate in run 1); those that passed again later are marginal ($rt_marginal, left out of the comparison); those passing every retest of good parts are confirmed good ($rt_confirmed_good). Find candidate tests ranks every run-1 test by how well it sets the candidates apart from the other good parts, as on the Bad candidates page.`), box, mkBox);
+  box.append(h("div", { class: "kpis" },
+    kpi("Bad candidates", c.n_cand.toLocaleString(), `good in run 1, failed ${t0.key} on a retest of good parts, never passed after`),
+    kpi("Marginal", c.n_marginal.toLocaleString(), "failed it there, passed again later"),
+    kpi("Confirmed good", c.n_confirmed.toLocaleString(), "passed every retest of good parts"),
+    c.n_other_fail ? kpi("Failed another test", c.n_other_fail.toLocaleString(), `on a retest of good parts, but not ${t0.key}`) : ""));
+  if (!c.n_cand) { box.append(h("p", { class: "muted" }, `No good part of run 1 failed ${t0.key} on a retest of good parts without passing again.`)); return; }
+  const find = async () => {
+    loading(mkBox, "Ranking every run-1 test…");
+    try {
+      const mk = await api("markers", { mode: "group", a, select: "$rt_bad_candidate", vs: "", filter: popF, later, key_a: d.key, key_b: d.key, exclude: S.rt.exclude || "", range: S.co.range, methods: mkMethods() });
+      mkBox.replaceChildren();
+      const fetchTop = (key) => api("chart", { kind: "compare_test", mode: "group", ds: a, select: "$rt_bad_candidate", vs: "", filter: popF, test: key, range: S.co.range }).then((x) => x.hist);
+      renderMarkers(mkBox, mk, null, { fetchTop });
+    } catch (e) { showErr(mkBox, e); }
+  };
+  box.append(h("div", { class: "row" },
+    h("button", { class: "primary", onclick: find }, "Find candidate tests"),
+    h("button", { onclick: () => useFilter(a, "$rt_bad_candidate") }, "Analyse the candidates ($rt_bad_candidate)"),
+    h("button", { title: "Profile run 1 against the first retest of good parts on the Bad candidates page (outlier scores, sites, wafer zones, focus tests)", onclick: () => {
+      S.bc = Object.assign(S.bc || {}, { a, b: later, good: "pass", test: String(t0.num), how: "fail", range: "", rangeNote: `from Retest trace: ${rl(c.good_runs[0])} retested good parts`, incMarg: false, extra: "", name: "bad_candidate", exclude: S.rt.exclude || "500, 80100-80104", coords: "auto" });
+      S.bcLast = null; go("candidates");
+    } }, "Full profile in Bad candidates →")));
+}
+// pass/fail of the traced parts per test site, per run and over all runs
+function renderRetestSites(out, d, pctS) {
+  const bs = d.by_site;
+  if (!bs || !bs.counts.length) return;
+  const N = d.runs.length;
+  const sites = [...new Set(bs.counts.map((c) => c.site))].sort((a, b) => a - b);
+  const at = (k, s) => bs.counts.find((c) => c.run === k && c.site === s);
+  const pS = (p) => (p == null ? "–" : p < 0.001 ? "< 0.001" : p.toFixed(3));
+  const cell = (c) => (c ? `${c.pass}/${c.tested} (${pctS(c.rate, 0)})` : "–");
+  const rows = sites.map((s) => {
+    const r = { site: s };
+    for (let k = 0; k < N; k++) r[`r${k}`] = at(k, s);
+    r.all = at(null, s);
+    r.rate = r.all ? r.all.rate : null;
+    return r;
+  });
+  const cols = [{ key: "site", label: "Site", num: true }];
+  for (let k = 0; k < N; k++) cols.push({ key: `r${k}`, label: `Run ${k + 1}`, num: true, fmt: (v) => cell(v), sortVal: (r) => (r[`r${k}`] ? r[`r${k}`].rate : -1), title: `pass / tested (pass rate) on this site in run ${k + 1}; χ² p = ${pS(bs.p[k])}` });
+  cols.push({ key: "rate", label: "All runs", num: true, fmt: (v, r) => (r.all ? `${r.all.pass}/${r.all.tested} ${pctS(v)} [${pctS(r.all.ci_lo, 0)}–${pctS(r.all.ci_hi, 0)}]` : "–"), title: "every test of the traced parts on this site, over all runs (95% Wilson interval)" });
+  const tb = h("div");
+  const pRow = [`All runs p = ${pS(bs.p[N])}`, ...d.runs.map((_, k) => `run ${k + 1}: ${pS(bs.p[k])}`)].join(" · ");
+  out.append(h("h2", {}, "Pass/fail by test site"),
+    h("p", { class: "lead" }, "Could the test site cause it? Every traced part tested in a run counts under the site it was tested on there (rejects and retested good parts alike). χ² p-value of pass/fail against site: a small value (e.g. below 0.05) means the pass rate differs between sites more than chance explains."),
+    h("p", { class: "muted small" }, pRow), tb);
+  table(tb, cols, rows, { search: false });
+  const [card, c] = chartBox("");
+  out.append(card);
+  plot(c, { data: sites.map((s, i) => {
+    const pts = d.runs.map((_, k) => at(k, s));
+    return { type: "bar", name: `site ${s}`, x: d.runs.map((_, k) => `Run ${k + 1}`), y: pts.map((p) => (p ? p.rate * 100 : null)), marker: { color: `@s${(i % 8) + 1}` },
+      text: pts.map((p) => (p ? `${p.pass}/${p.tested}` : "")), textposition: "outside",
+      error_y: { type: "data", symmetric: false, array: pts.map((p) => (p ? (p.ci_hi - p.rate) * 100 : 0)), arrayminus: pts.map((p) => (p ? (p.rate - p.ci_lo) * 100 : 0)), color: "@muted" },
+      hovertemplate: `site ${s}, %{x}<br>%{text} pass (%{y:.0f}%)<extra></extra>` };
+  }), layout: { title: { text: "Pass rate per site and run (95% Wilson)", x: 0.01, xanchor: "left", font: { size: 15 } }, barmode: "group", yaxis: { title: { text: "% pass" }, range: [0, 110] }, margin: { l: 55, r: 20, t: 56, b: 40 }, legend: { orientation: "h", x: 1, xanchor: "right", y: 1.0, yanchor: "bottom" } } });
+}
+// a run result: "pass", "fail" (fails the traced test ti) or "other" (passes
+// it, but the part fails another test or carries an alarm)
+function rtClass(r, ti) {
+  const alarm = (r.alarms || []).length > 0;
+  if (r.status === "pass") return alarm ? "other" : "pass";
+  return r.fails && r.fails[ti] ? "fail" : "other";
+}
+function rtOther(r) {
+  const a = (r.alarms || []);
+  return [r.status === "fail" ? `fails ${r.first_fail || "another test"}` : "", a.length ? `alarm on ${a.slice(0, 3).join(", ")}${a.length > 3 ? "…" : ""}` : ""].filter(Boolean).join("; ");
+}
+function retestHelp() {
+  const li = (n, t) => h("li", {}, h("b", {}, n), " — ", t);
+  return h("details", { class: "adv help" }, h("summary", {}, "ⓘ How parts are followed and how to read the charts"),
+    h("ul", { class: "small" },
+      li("Matching", "each starting part of run 1 is looked up in every later run by the chosen identity (the last row with that identity, so a part retested twice in one file counts once, with its last result)."),
+      li("Per run", "pass or fail (the part's bin), its bin, the traced test's value in display units (logged UNITS scaled by RES_SCAL), whether it failed that test, and its first failing test. Not retested = still bad but not found in that run; passed earlier = passed in an earlier run (good parts are usually not retested)."),
+      li("Outcome", "recovered = failed somewhere, then passed in the last run it was found in; still bad = failed in the last run; not retested = failed, then never found again; stayed good = passed run 1 and never failed after (also when a later run retested it good)."),
+      li("Flow", "where run 1's fails went at every retest: pass, fail again or not retested. Bands are proportional to part counts."),
+      li("Trajectories", "one thin line per part across the runs (spread slightly sideways so they do not hide each other), colored by outcome; markers show pass (open green), fail on the traced test (red) or passing the traced test while failing another test or carrying an alarm (yellow diamond) in that run; a box per run shows the distribution of the parts tested there, and dashed lines each run's limits. A part that recovers because its reading came back inside the limits drops below the limit line; one that passes with an unchanged value points at another cause."),
+      li("Recovery by failing value", "the value where each part first failed the traced test (or its value before every retest), recovered vs never. The sorted values are cut at the two points that best fit a separate recovery rate per band (binomial maximum likelihood), so the cuts fall where the recovery rate changes; the middle band is hard bad when it has at least the minimum number of parts, recovers less often than both sides, and its 95% Wilson upper bound is at or below the threshold. Parts nearer the limits are marginal, those farther out extreme (e.g. clamped readings). Use as hard-bad range sends the band to Bad candidates as the file-2 value range of the test."),
+      li("Loadboard", "read from the loadboard test (default 5100) as a file-level value: the most common value in each file, so parts missing it still get their file's board; a file whose board changes is flagged."),
+      li("Run to run", "the same parts' values in two consecutive runs. Points on y = x repeated; a cloud shifted off the line is a tester or condition offset; a wide cloud is poor repeatability.")));
+}
+
 // ---- Home
 const FILE_HINT = "STDF v4 files: .stdf, .std or gzip-compressed .gz";
 async function viewHome(el) {
@@ -1370,11 +2389,13 @@ async function viewHome(el) {
   const merge = h("input", { type: "checkbox", checked: !!S.optMerge, onchange: (e) => (S.optMerge = e.target.checked) });
   const dedup = select([["", "keep every test (incl. retests)"], ["last", "keep the last test of each part"], ["first", "keep the first test of each part"]], S.optDedup || "", (v) => (S.optDedup = v));
   const browse = h("button", { class: "primary big", onclick: openFiles }, "Open STDF files…");
+  const folder = S.info && S.info.native_dialogs ? h("button", { onclick: (e) => { e.stopPropagation(); openFolder(); } }, "Open folder…") : null;
+  const sortSel = select([["time", "by test start time (MIR), else file time"], ["name", "by file name (run2 before run10)"], ["none", "as given"]], S.optSort, (v) => { S.optSort = v; try { localStorage.setItem("sc-sort", v); } catch (e) {} });
   const drop = h("div", { class: "dropzone", onclick: openFiles },
     h("img", { src: "/static/icon.png", alt: "", width: 64, height: 64 }),
-    h("div", { class: "dz-title" }, has ? "Add more files" : "Drop STDF files here"),
+    h("div", { class: "dz-title" }, has ? "Add more files" : "Drop STDF files or folders here"),
     h("div", { class: "muted" }, FILE_HINT),
-    h("div", { class: "dz-actions" }, browse, h("button", { onclick: (e) => { e.stopPropagation(); openSamples(); } }, "Try sample data")));
+    h("div", { class: "dz-actions" }, browse, folder, h("button", { onclick: (e) => { e.stopPropagation(); openSamples(); } }, "Try sample data")));
   el.append(h("div", { class: "home-head" },
     h("div", {}, h("h1", {}, has ? "Your data" : "Welcome to STDF Cypher"),
       h("p", { class: "lead" }, has ? "Pick a dataset to analyse, or add more files." : "Fast, private STDF v4 analysis on your own PC: yield, bins, wafer maps, lot and tester comparison, correlation, ANOVA, outlier screening and machine learning.")),
@@ -1384,7 +2405,7 @@ async function viewHome(el) {
   const left = h("div", {});
   const right = h("div", {});
   grid.append(left, right);
-  left.append(drop, h("div", { class: "home-opts" }, h("label", { class: "chk" }, merge, "Combine the files I open into one dataset (lot-to-lot, ANOVA by file)"), field("Retested parts", dedup)));
+  left.append(drop, h("div", { class: "home-opts" }, h("label", { class: "chk" }, merge, "Combine the files I open into one dataset (lot-to-lot, ANOVA by file)"), field("Retested parts", dedup), field("Order of opened files", sortSel)));
 
   if (has) {
     left.append(h("h2", {}, "Open datasets"));
@@ -1454,6 +2475,12 @@ async function openFiles() {
     inp.click();
   }
 }
+async function openFolder() {
+  try {
+    const r = await api("pick_folder", { title: "Open every STDF file in a folder" });
+    if (r.path) await loadPaths([r.path]);
+  } catch (e) { toast(e.message, "bad"); }
+}
 async function openSamples() {
   busy("Creating sample data…");
   try {
@@ -1468,8 +2495,9 @@ async function loadPaths(paths, opts) {
   if (!paths.length) return;
   busy(`Loading ${paths.length === 1 ? paths[0].split(/[\\/]/).pop() : paths.length + " files"}…`);
   try {
-    const r = await api("load", { paths, merge: !!S.optMerge && paths.length > 1, dedup: S.optDedup || "" });
+    const r = await api("load", { paths, merge: !!S.optMerge && paths.length > 1, dedup: S.optDedup || "", sort: S.optSort || "time" });
     await refreshDatasets(r.ids[r.ids.length - 1]);
+    if (r.skipped) toast(`Skipped ${r.skipped} file${r.skipped > 1 ? "s" : ""} that ${r.skipped > 1 ? "are" : "is"} not STDF`, "", 6000);
     for (const e of r.errors || []) toast(`Could not read ${e.name}: ${e.error}`, "bad", 10000);
     if (!opts.quiet) toast(`Opened ${r.ids.length} dataset${r.ids.length > 1 ? "s" : ""}`, "good");
     go("overview");
@@ -1487,9 +2515,14 @@ function uploadOne(file, onProgress) {
     x.send(file);
   });
 }
-async function uploadFiles(files) {
+const STDF_EXT = /\.(stdf|std|stdf_gz|stdfz|gz)$/i;
+async function uploadFiles(files, skipped) {
   files = files.filter((f) => f.size > 0);
-  if (!files.length) return;
+  skipped = skipped || 0;
+  if (!files.length) { if (skipped) toast(`No STDF files found (${skipped} other file(s) skipped)`, "bad"); return; }
+  // copies lose their file time, so put them in time order before uploading
+  if ((S.optSort || "time") === "time") files.sort((a, b) => a.lastModified - b.lastModified);
+  if (skipped) toast(`Skipped ${skipped} file${skipped > 1 ? "s" : ""} that ${skipped > 1 ? "are" : "is"} not STDF`, "", 6000);
   const total = files.reduce((a, f) => a + f.size, 0);
   let done = 0;
   const paths = [];
@@ -1509,12 +2542,30 @@ let dragDepth = 0;
 window.addEventListener("dragenter", (e) => { if ([...(e.dataTransfer?.types || [])].includes("Files")) { dragDepth++; document.body.classList.add("dragging"); e.preventDefault(); } });
 window.addEventListener("dragleave", () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) document.body.classList.remove("dragging"); });
 window.addEventListener("dragover", (e) => e.preventDefault());
-window.addEventListener("drop", (e) => {
+window.addEventListener("drop", async (e) => {
   e.preventDefault();
   dragDepth = 0;
   document.body.classList.remove("dragging");
-  const files = [...(e.dataTransfer?.files || [])];
-  if (files.length) uploadFiles(files);
+  // folders: read them (with subfolders) and keep the STDF files only
+  const entries = [...(e.dataTransfer?.items || [])].map((i) => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+  if (!entries.some((x) => x.isDirectory)) {
+    const files = [...(e.dataTransfer?.files || [])];
+    if (files.length) uploadFiles(files);
+    return;
+  }
+  busy("Reading folder…");
+  const files = [];
+  let skipped = 0;
+  const fileOf = (en) => new Promise((res) => en.file(res, () => res(null)));
+  const list = (dir) => new Promise((res) => { const r = dir.createReader(), all = []; const next = () => r.readEntries((b) => { if (!b.length) return res(all); all.push(...b); next(); }, () => res(all)); next(); });
+  const walk = async (en, depth) => {
+    if (en.isDirectory) { if (depth < 8) for (const c of await list(en)) await walk(c, depth + 1); return; }
+    if (!STDF_EXT.test(en.name)) { skipped++; return; }
+    const f = await fileOf(en);
+    if (f) files.push(f);
+  };
+  try { for (const en of entries) await walk(en, 0); } finally { busy(null); }
+  uploadFiles(files, skipped);
 });
 
 // ---- busy overlay & toasts

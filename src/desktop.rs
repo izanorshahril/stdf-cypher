@@ -1,6 +1,8 @@
 //! Desktop app mode: double-click `stdf-cypher.exe` (or drop STDF files on it)
 //! and the dashboard opens in a chromeless app window. The app exits when the
-//! window is closed. A second launch hands its files to the running instance.
+//! window is closed. Every launch is its own instance with its own window and
+//! files, except launches a few seconds apart (Explorer starts one process per
+//! file for a multi-file "Open with"), which join the first.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -173,8 +175,15 @@ impl Session {
             self.pending_open.lock().unwrap().extend(paths);
         }
     }
-    pub fn remember(&self, paths: &[String]) {
+    /// Settings re-read from disk first, so instances running side by side
+    /// don't overwrite each other's recent files.
+    pub fn synced_settings(&self) -> std::sync::MutexGuard<'_, Settings> {
         let mut s = self.settings.lock().unwrap();
+        *s = Settings::load();
+        s
+    }
+    pub fn remember(&self, paths: &[String]) {
+        let mut s = self.synced_settings();
         s.add_recent(paths);
         s.save();
     }
@@ -184,6 +193,19 @@ impl Session {
 struct InstanceInfo {
     port: u16,
     pid: u32,
+    /// unix seconds when the instance started listening
+    #[serde(default)]
+    started: u64,
+}
+
+/// Launches this close together are one "Open with" on several files.
+const JOIN_WINDOW_SECS: u64 = 5;
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn instance_file() -> PathBuf {
@@ -197,6 +219,7 @@ pub fn write_instance(port: u16) {
         serde_json::to_string(&InstanceInfo {
             port,
             pid: std::process::id(),
+            started: unix_now(),
         })
         .unwrap_or_default(),
     );
@@ -227,14 +250,21 @@ fn post_local(port: u16, path: &str, body: &str) -> Result<String> {
     Ok(out)
 }
 
-/// If another instance is running, give it our files and return true.
+/// If another instance started moments ago (same multi-file "Open with"),
+/// give it our files and return true. Otherwise this launch runs on its own.
 pub fn hand_off_to_running(files: &[String]) -> bool {
+    if files.is_empty() {
+        return false;
+    }
     let Ok(s) = std::fs::read_to_string(instance_file()) else {
         return false;
     };
     let Ok(info) = serde_json::from_str::<InstanceInfo>(&s) else {
         return false;
     };
+    if unix_now().saturating_sub(info.started) > JOIN_WINDOW_SECS {
+        return false;
+    }
     let body = serde_json::json!({ "paths": files, "focus": true }).to_string();
     match post_local(info.port, "/api/open", &body) {
         Ok(resp) => resp.contains("\"ok\":true") && resp.contains("stdf-cypher"),
@@ -379,14 +409,25 @@ mod owner {
             Ok(DisplayHandle::windows())
         }
     }
-    /// The app window (Edge/Chrome --app window titled like the page).
+    /// The app window (Edge/Chrome --app window titled like the page). With
+    /// several instances open, the foreground one is the window that was clicked.
     pub fn find() -> Option<Owner> {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, GetForegroundWindow, GetWindowTextW, SetForegroundWindow,
+        };
         let title: Vec<u16> = super::APP_NAME
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        let fg = unsafe { GetForegroundWindow() };
+        let mut buf = [0u16; 256];
+        let n = unsafe { GetWindowTextW(fg, buf.as_mut_ptr(), buf.len() as i32) };
+        let fg_is_app = n > 0 && buf[..n as usize].starts_with(&title[..title.len() - 1]);
+        let hwnd = if fg_is_app {
+            fg
+        } else {
+            unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) }
+        };
         let h = NonZeroIsize::new(hwnd as isize)?;
         unsafe { SetForegroundWindow(hwnd) };
         Some(Owner(h))

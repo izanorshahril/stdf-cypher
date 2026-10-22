@@ -190,9 +190,212 @@ pub fn zones(pos: &[Option<(String, f64, f64)>]) -> Vec<Option<String>> {
         .collect()
 }
 
+/// SI prefix scale of a leading character.
+fn si_scale(c: char) -> Option<f64> {
+    Some(match c {
+        'f' => 1e-15,
+        'p' => 1e-12,
+        'n' => 1e-9,
+        'u' | 'µ' | 'μ' => 1e-6,
+        'm' => 1e-3,
+        'k' | 'K' => 1e3,
+        'M' => 1e6,
+        'G' => 1e9,
+        'T' => 1e12,
+        _ => return None,
+    })
+}
+
+/// Splits a unit such as `mA` into its prefix scale and base unit (`A`);
+/// units without a recognised prefix (`A`, `ohm`, `%`, `code`) scale by 1.
+pub fn unit_scale(units: &str) -> (f64, &str) {
+    let u = units.trim();
+    let mut ch = u.chars();
+    if let Some(c) = ch.next() {
+        let rest = ch.as_str();
+        let base = matches!(
+            rest,
+            "A" | "V" | "Hz" | "s" | "W" | "F" | "H" | "Ω" | "ohm" | "Ohm"
+        );
+        if base {
+            if let Some(s) = si_scale(c) {
+                return (s, rest);
+            }
+        }
+    }
+    (1.0, u)
+}
+
+/// How a tester shows a test's results: the logged `units` scaled by the PTR
+/// `RES_SCAL` (shown value = stored × 10^RES_SCAL, so A with RES_SCAL 3 is
+/// shown in mA). Returns the display unit and that factor; falls back to the
+/// logged unit (factor 1) without a scale or without a matching SI prefix.
+pub fn display_unit(units: &str, res_scal: i8) -> (String, f64) {
+    let u = units.trim();
+    if res_scal == 0 || u.is_empty() {
+        return (u.to_string(), 1.0);
+    }
+    let (s0, base) = unit_scale(u);
+    if !matches!(
+        base,
+        "A" | "V" | "Hz" | "s" | "W" | "F" | "H" | "Ω" | "ohm" | "Ohm"
+    ) {
+        return (u.to_string(), 1.0);
+    }
+    let prefix = match s0.log10().round() as i32 - res_scal as i32 {
+        -15 => "f",
+        -12 => "p",
+        -9 => "n",
+        -6 => "u",
+        -3 => "m",
+        0 => "",
+        3 => "k",
+        6 => "M",
+        9 => "G",
+        12 => "T",
+        _ => return (u.to_string(), 1.0),
+    };
+    (format!("{prefix}{base}"), 10f64.powi(res_scal as i32))
+}
+
+/// One bound of a value range in a test's stored `units`: a plain number is
+/// in the display unit (`disp`: stored × disp = shown, see [`display_unit`]);
+/// `10m`, `10mA`, `2.5uA` override it and are converted from the SI prefix
+/// (and checked against the test's base unit, if given).
+pub fn parse_si(s: &str, units: &str, disp: f64) -> anyhow::Result<f64> {
+    let s = s.trim();
+    let end = s
+        .char_indices()
+        .find(|&(i, c)| {
+            !(c.is_ascii_digit()
+                || c == '.'
+                || ((c == '-' || c == '+')
+                    && (i == 0 || matches!(s[..i].chars().last(), Some('e' | 'E'))))
+                || ((c == 'e' || c == 'E')
+                    && s[i + 1..]
+                        .starts_with(|d: char| d.is_ascii_digit() || d == '-' || d == '+')))
+        })
+        .map(|p| p.0)
+        .unwrap_or(s.len());
+    let v: f64 = s[..end]
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{s}' is not a number"))?;
+    let suffix = s[end..].trim();
+    if suffix.is_empty() {
+        return Ok(v / disp);
+    }
+    let (t_scale, t_base) = unit_scale(units);
+    // the suffix: a prefix alone (`m`), prefix + unit (`mA`) or a unit (`A`)
+    let mut ch = suffix.chars();
+    let prefix = ch.next().and_then(si_scale);
+    let (scale, base) = match prefix {
+        Some(sc) if !suffix.eq_ignore_ascii_case(t_base) => (sc, ch.as_str()),
+        _ => (1.0, suffix),
+    };
+    if !base.is_empty() && !t_base.is_empty() && !base.eq_ignore_ascii_case(t_base) {
+        anyhow::bail!("'{s}' is in {base}, but the test is in {units}");
+    }
+    Ok(v * scale / t_scale)
+}
+
+/// A value range `lo..hi` (either end may be left open) in the test's stored units.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq)]
+pub struct Range {
+    pub lo: Option<f64>,
+    pub hi: Option<f64>,
+}
+
+impl Range {
+    /// `10..20` (in the display unit of `units` and `res_scal`), or with SI
+    /// suffixes `10m..20m`, `10mA..20mA`, `10mA..`, `..20mA`; `to` and `–`
+    /// also separate the ends.
+    pub fn parse(s: &str, units: &str, res_scal: i8) -> anyhow::Result<Range> {
+        let disp = display_unit(units, res_scal).1;
+        let s = s.trim();
+        let (a, b) = s
+            .split_once("..")
+            .or_else(|| s.split_once(" to "))
+            .or_else(|| s.split_once('–'))
+            .ok_or_else(|| anyhow::anyhow!("write the range as low..high, e.g. 10mA..20mA"))?;
+        let side = |x: &str| -> anyhow::Result<Option<f64>> {
+            let x = x.trim();
+            if x.is_empty() {
+                Ok(None)
+            } else {
+                parse_si(x, units, disp).map(Some)
+            }
+        };
+        let (lo, hi) = (side(a)?, side(b)?);
+        if lo.is_none() && hi.is_none() {
+            anyhow::bail!("the range needs at least one end");
+        }
+        if let (Some(l), Some(h)) = (lo, hi) {
+            if l > h {
+                anyhow::bail!("the range's low end is above its high end");
+            }
+        }
+        Ok(Range { lo, hi })
+    }
+    /// Inside the range, ends included; NaN is never inside.
+    pub fn contains(&self, v: f64) -> bool {
+        v.is_finite() && self.lo.is_none_or(|l| v >= l) && self.hi.is_none_or(|h| v <= h)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn si_ranges() {
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        let r = Range::parse("10m..20m", "A", 0).unwrap();
+        assert!(near(r.lo.unwrap(), 0.01) && near(r.hi.unwrap(), 0.02));
+        let r = Range::parse("10mA..20mA", "A", 0).unwrap();
+        assert!(near(r.lo.unwrap(), 0.01) && near(r.hi.unwrap(), 0.02));
+        assert_eq!(
+            Range::parse("0.01..0.02", "A", 0).unwrap(),
+            Range {
+                lo: Some(0.01),
+                hi: Some(0.02)
+            }
+        );
+        // a test logged in uA: mA values are converted, plain numbers are uA
+        let r = Range::parse("10mA..20mA", "uA", 0).unwrap();
+        assert!(near(r.lo.unwrap(), 10_000.0) && near(r.hi.unwrap(), 20_000.0));
+        assert_eq!(Range::parse("5..", "uA", 0).unwrap().hi, None);
+        let si = |x: &str, u: &str| parse_si(x, u, 1.0).unwrap();
+        assert!(near(si("2.5k", "ohm"), 2500.0));
+        assert!(near(si("1e-3", "A"), 1e-3));
+        assert!(near(si("-5mV", "V"), -5e-3));
+        assert!(near(si("3A", "A"), 3.0));
+        assert!(Range::parse("10mV..20mV", "A", 0).is_err(), "wrong unit");
+        assert!(Range::parse("20m..10m", "A", 0).is_err());
+        assert!(Range::parse("10m", "A", 0).is_err());
+        let r = Range::parse("10m..20m", "A", 0).unwrap();
+        assert!(
+            r.contains(0.01) && r.contains(0.015) && !r.contains(0.021) && !r.contains(f64::NAN)
+        );
+    }
+
+    #[test]
+    fn plain_numbers_follow_the_res_scal_display_unit() {
+        let near = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b.abs().max(1.0);
+        assert_eq!(display_unit("A", 3), ("mA".to_string(), 1e3));
+        assert_eq!(display_unit("A", 6).0, "uA");
+        assert_eq!(display_unit("Hz", -6).0, "MHz");
+        assert_eq!(display_unit("mA", 3).0, "uA");
+        assert_eq!(display_unit("uA", 0), ("uA".to_string(), 1.0));
+        // no matching prefix, or not an SI unit: the logged unit, unscaled
+        assert_eq!(display_unit("A", 1), ("A".to_string(), 1.0));
+        assert_eq!(display_unit("code", 3), ("code".to_string(), 1.0));
+        // stored in A, shown in mA: 10..20 means 10 mA..20 mA
+        let r = Range::parse("10..20", "A", 3).unwrap();
+        assert!(near(r.lo.unwrap(), 0.01) && near(r.hi.unwrap(), 0.02));
+        // an explicit suffix still overrides the hint
+        let r = Range::parse("10uA..20uA", "A", 3).unwrap();
+        assert!(near(r.lo.unwrap(), 1e-5) && near(r.hi.unwrap(), 2e-5));
+    }
 
     #[test]
     fn factor_finds_the_concentrated_level() {

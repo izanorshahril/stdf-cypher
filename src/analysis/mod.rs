@@ -6,5 +6,7 @@ pub mod candidates;
 pub mod compare;
 pub mod correlation;
 pub mod markers;
+pub mod retest;
+pub mod signature;
 pub mod stats;
 pub mod summary;

@@ -32,6 +32,43 @@ pub struct SampleSpec {
     pub meas_noise: f64,
     /// per-test offsets in sigma units applied to every 3rd test (tester offset)
     pub tester_offset: f64,
+    /// log prefixed units (uA, mV, MHz…) as the base unit (A, V, Hz) with the
+    /// PTR RES_SCAL a tester uses to show them in the prefixed unit again
+    pub base_units: bool,
+    /// another draw of the re-measurement noise: same seed, meas_noise and a
+    /// different meas_seed = the same parts on a further retest
+    pub meas_seed: u64,
+    /// loadboard (DIB) ID logged as test 5100 for every part
+    pub loadboard: Option<f64>,
+    /// share of parts whose loadboard result is missing
+    pub loadboard_missing: f64,
+    /// plant a retest pattern on these test numbers: some dies fail it just
+    /// above the high limit (marginal), well above it (hard bad) or at a clamp
+    /// value (extreme). On a retest (`meas_seed` ≠ 0) marginal and extreme
+    /// dies mostly pass again; hard-bad dies never do. Each test picks its
+    /// own dies.
+    pub band_tests: Vec<u32>,
+    /// extra parametric tests with these numbers (e.g. 1013, 2000), placed in
+    /// test-number order among the generated ones
+    pub extra_tests: Vec<u32>,
+    /// the dies a band test would fail still pass these tests here, just
+    /// inside the high limit: a run 1 where they are good, before a later
+    /// file (with `band_tests`) fails them
+    pub latent_tests: Vec<u32>,
+}
+
+/// Uniform 0..1 from a die position and a salt (splitmix64), independent of
+/// the random streams so a die keeps its role in every file.
+fn die_u(wafer: usize, x: i16, y: i16, salt: u64) -> f64 {
+    let mut z = (wafer as u64) << 40
+        ^ ((x as u16 as u64) << 20)
+        ^ (y as u16 as u64)
+        ^ salt.wrapping_mul(0xD1B5_4A32_D192_ED03);
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 impl Default for SampleSpec {
@@ -50,6 +87,13 @@ impl Default for SampleSpec {
             final_test: false,
             meas_noise: 0.0,
             tester_offset: 0.0,
+            base_units: false,
+            meas_seed: 0,
+            loadboard: None,
+            loadboard_missing: 0.0,
+            band_tests: vec![],
+            extra_tests: vec![],
+            latent_tests: vec![],
         }
     }
 }
@@ -108,8 +152,32 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
             radial: if i % 4 == 0 { 1.2 } else { 0.0 },
         });
     }
+    for &num in &spec.extra_tests {
+        if defs.iter().any(|d| d.num == num) {
+            continue;
+        }
+        let r = &mut rand::rngs::StdRng::seed_from_u64(num as u64);
+        let mean: f64 = r.gen_range(0.5..50.0);
+        let sigma = mean * r.gen_range(0.01..0.05);
+        let k = r.gen_range(4.0..7.0);
+        defs.push(TDef {
+            num,
+            name: format!("DUMMY_{num}"),
+            units: "V",
+            mean,
+            sigma,
+            lo: mean - k * sigma,
+            hi: mean + k * sigma,
+            load: 0.5,
+            site_off: 0.0,
+            radial: 0.0,
+        });
+    }
+    defs.sort_by_key(|d| d.num);
     let n01 = Normal::new(0.0, 1.0).unwrap();
-    let mut mrng = rand::rngs::StdRng::seed_from_u64(spec.seed ^ 0xABCD_1234);
+    let mut mrng = rand::rngs::StdRng::seed_from_u64(
+        spec.seed ^ 0xABCD_1234 ^ spec.meas_seed.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+    );
     // separate stream so alarms do not change the generated values
     let mut arng = rand::rngs::StdRng::seed_from_u64(spec.seed ^ 0x5A5A_0001);
     let e = spec.endian;
@@ -118,7 +186,8 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
         cpu_type: e.cpu_type(),
         stdf_ver: 4,
     }))?;
-    let t0 = 1_760_000_000u32;
+    // a retest (meas_seed) starts later, so files sort by test time
+    let t0 = 1_760_000_000u32 + spec.meas_seed as u32 * 7200;
     w.write(&Record::MIR(Box::new(Mir {
         setup_t: t0,
         start_t: t0,
@@ -250,7 +319,35 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     if ti % 3 == 2 {
                         z += spec.tester_offset;
                     }
-                    let v = d.mean + z * d.sigma;
+                    let mut v = d.mean + z * d.sigma;
+                    // which dies, per lot (seed) and test; the first test keeps the
+                    // original salt
+                    let lot = (spec.seed << 16)
+                        + if spec.band_tests.first() == Some(&d.num) {
+                            0
+                        } else {
+                            d.num as u64 * 100
+                        };
+                    if spec.latent_tests.contains(&d.num) && die_u(wi, x, y, lot + 1) < 0.11 {
+                        // good for now, but just inside the high limit
+                        v = d.hi - (d.hi - d.lo) * (0.02 + 0.08 * die_u(wi, x, y, lot + 5));
+                    }
+                    if spec.band_tests.contains(&d.num) {
+                        // 4% marginal, 4% hard bad, 3% extreme (clamp)
+                        // and whether a retest recovers them
+                        let (u, w) = (die_u(wi, x, y, lot + 1), d.hi - d.lo);
+                        let again = die_u(wi, x, y, lot + 2 + spec.meas_seed) < 0.85;
+                        let retest = spec.meas_seed != 0;
+                        if u < 0.04 && !(retest && again) {
+                            v = d.hi + w * (0.02 + 0.08 * die_u(wi, x, y, lot + 3));
+                        } else if (0.04..0.08).contains(&u) {
+                            v = d.hi
+                                + w * (0.3 + 0.4 * die_u(wi, x, y, lot + 4))
+                                + z * d.sigma * 0.1;
+                        } else if (0.08..0.11).contains(&u) && !(retest && again) {
+                            v = d.hi + w * 3.0;
+                        }
+                    }
                     let fail = v < d.lo || v > d.hi;
                     if fail && fail_test.is_none() {
                         fail_test = Some(ti);
@@ -261,8 +358,16 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
             }
             // interleave test records site by site (as testers typically do)
             for (ti, d) in defs.iter().enumerate() {
+                // stored = shown / 10^RES_SCAL (e.g. 12 uA logged as 1.2e-5 A, RES_SCAL 6)
+                let (scale, base) = crate::analysis::candidates::unit_scale(d.units);
+                let (scale, units, res_scal) = if spec.base_units && scale != 1.0 {
+                    (scale, base, -(scale.log10().round() as i8))
+                } else {
+                    (1.0, d.units, 0)
+                };
                 for (site, _, _, vals, _, _) in &results {
                     let (v, fail) = vals[ti];
+                    let v = v * scale;
                     let full = first_ptr[ti];
                     w.write(&Record::PTR(Ptr {
                         test_num: d.num,
@@ -275,9 +380,10 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                         test_txt: d.name.clone(),
                         alarm_id: String::new(),
                         opt_flag: if full { Some(0x0C) } else { None },
-                        lo_limit: full.then_some(d.lo as f32),
-                        hi_limit: full.then_some(d.hi as f32),
-                        units: full.then(|| d.units.to_string()),
+                        res_scal,
+                        lo_limit: full.then_some((d.lo * scale) as f32),
+                        hi_limit: full.then_some((d.hi * scale) as f32),
+                        units: full.then(|| units.to_string()),
                         lo_spec: full.then_some(0.0),
                         hi_spec: full.then_some(0.0),
                         ..Default::default()
@@ -346,7 +452,18 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     (80102, "DIE_Y_RAW", (*y - oy) as f64),
                     (80103, "RETICLE_OX", ox as f64),
                     (80104, "RETICLE_OY", oy as f64),
+                    (
+                        5100,
+                        "DIB_ID",
+                        match spec.loadboard {
+                            Some(b) if die_u(wi, *x, *y, 9) >= spec.loadboard_missing => b,
+                            _ => f64::NAN,
+                        },
+                    ),
                 ] {
+                    if v.is_nan() {
+                        continue;
+                    }
                     w.write(&Record::PTR(Ptr {
                         test_num: num,
                         head_num: 1,

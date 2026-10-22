@@ -309,6 +309,29 @@ enum Cmd {
         big_endian: bool,
         #[arg(long)]
         final_test: bool,
+        /// log prefixed units (uA, mV…) as base units (A, V) with RES_SCAL
+        #[arg(long)]
+        base_units: bool,
+        /// another draw of the re-measurement noise (a further retest)
+        #[arg(long, default_value_t = 0)]
+        meas_seed: u64,
+        /// loadboard (DIB) ID written as test 5100
+        #[arg(long)]
+        loadboard: Option<f64>,
+        /// share of parts without the loadboard result
+        #[arg(long, default_value_t = 0.0)]
+        loadboard_missing: f64,
+        /// plant marginal / hard-bad / clamped fails on this test that retests
+        /// (--meas-seed) partly recover (repeat for several tests)
+        #[arg(long)]
+        band_test: Vec<u32>,
+        /// add extra parametric tests with these numbers (repeat, e.g. 1013 and 2000)
+        #[arg(long)]
+        extra_test: Vec<u32>,
+        /// the dies --band-test would fail pass this test here, just inside the
+        /// high limit (a run 1 before a retest fails them; repeatable)
+        #[arg(long)]
+        latent_test: Vec<u32>,
     },
 }
 
@@ -457,7 +480,19 @@ fn output(out: &Option<PathBuf>, headers: &[&str], rows: &[Vec<String>], top: us
 fn main() {
     // Double-click / drag-and-drop / "Open with": no sub-command, only files (or nothing)
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let is_app = args.is_empty() || args.iter().all(|a| Path::new(a).is_file());
+    // files or folders (a folder opens its STDF files); a sub-command wins
+    // over a folder of the same name (e.g. `tests` in the current folder)
+    let is_cmd = args.first().is_some_and(|a| {
+        use clap::CommandFactory;
+        Cli::command()
+            .get_subcommands()
+            .any(|c| a.to_str() == Some(c.get_name()))
+    });
+    let is_app = args.is_empty()
+        || !is_cmd
+            && args
+                .iter()
+                .all(|a| Path::new(a).is_file() || Path::new(a).is_dir());
     if is_app {
         let files: Vec<String> = args.iter().map(|a| absolute(Path::new(a))).collect();
         if let Err(e) = run_app(files, true) {
@@ -1406,6 +1441,13 @@ fn run() -> Result<()> {
             outlier_rate,
             big_endian,
             final_test,
+            base_units,
+            meas_seed,
+            loadboard,
+            loadboard_missing,
+            band_test,
+            extra_test,
+            latent_test,
         } => {
             let spec = sample::SampleSpec {
                 lot_id: lot,
@@ -1424,6 +1466,13 @@ fn run() -> Result<()> {
                     stdf_cypher::stdf::Endian::Little
                 },
                 final_test,
+                base_units,
+                meas_seed,
+                loadboard,
+                loadboard_missing,
+                band_tests: band_test,
+                extra_tests: extra_test,
+                latent_tests: latent_test,
                 ..Default::default()
             };
             let n = sample::generate(&out, &spec)?;

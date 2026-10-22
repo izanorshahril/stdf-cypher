@@ -25,9 +25,10 @@
 //!   model's hold-out skill (2·AUC − 1) so a model that cannot separate the
 //!   groups does not promote its noise features.
 //!
-//! The candidate score is the strongest of these normalized signals, with the
-//! signal that produced it reported, so a test surfaces if it is a strong
-//! marker in any one view.
+//! The candidate score is the strongest of these normalized signals (of the
+//! methods chosen, [`METHODS`]), with the signal that produced it reported, so
+//! a test surfaces if it is a strong marker in any one view. Every sub-score
+//! is returned too, so a client can re-rank with other methods.
 
 use super::anova;
 use super::stats;
@@ -35,7 +36,30 @@ use crate::data::Dataset;
 use crate::ml::{features, forest};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+
+/// The score methods, in tie-break order: separation, tails, PAT, ANOVA,
+/// drift, correlation break, residual, random forest.
+pub const METHODS: [&str; 8] = [
+    "separation",
+    "tails",
+    "PAT",
+    "ANOVA",
+    "drift",
+    "correlation break",
+    "residual",
+    "random forest",
+];
+
+/// Methods counted in the score unless chosen otherwise: all but ANOVA, which
+/// repeats the separation view under a normality assumption.
+pub fn default_methods() -> Vec<String> {
+    METHODS
+        .iter()
+        .filter(|m| **m != "ANOVA")
+        .map(|m| m.to_string())
+        .collect()
+}
 
 /// One group of parts in one dataset.
 pub struct Group<'a> {
@@ -59,6 +83,8 @@ pub struct MarkerOptions {
     pub match_by: String,
     /// test numbers left out (e.g. identity tests: wafer, X/Y, die ID)
     pub exclude: Vec<u32>,
+    /// sub-scores counted in the score (names from [`METHODS`])
+    pub methods: Vec<String>,
 }
 
 impl Default for MarkerOptions {
@@ -69,6 +95,7 @@ impl Default for MarkerOptions {
             trees: 150,
             match_by: "key".into(),
             exclude: vec![],
+            methods: default_methods(),
         }
     }
 }
@@ -119,6 +146,9 @@ pub struct MarkerRow {
     /// median residual of affected units vs the reference regression, in σ
     pub resid_sigma: Option<f64>,
     pub importance: Option<f64>,
+    /// every available 0–1 sub-score by method name
+    pub subs: BTreeMap<String, f64>,
+    /// the largest sub-score among the chosen methods
     pub score: f64,
     pub why: String,
 }
@@ -182,7 +212,8 @@ fn vals(ds: &Dataset, t: usize, rows: &[usize]) -> Vec<f64> {
     ds.values_of(t, Some(rows))
 }
 
-fn pair_test(a: &Dataset, b: &Dataset, t: usize, by: &str) -> Option<usize> {
+/// The test of `b` matching test `t` of `a`: by key (number + name), number or name.
+pub fn pair_test(a: &Dataset, b: &Dataset, t: usize, by: &str) -> Option<usize> {
     let info = &a.tests[t];
     match by {
         "num" => b.tests.iter().position(|x| x.num == info.num),
@@ -345,39 +376,35 @@ pub fn find(refg: &Group, aff: &Group, later: Option<&Later>, opt: &MarkerOption
         .map(|a| (2.0 * a - 1.0).clamp(0.0, 1.0))
         .unwrap_or(0.0);
     for r in rows.iter_mut() {
-        let sig = r.q < 0.05;
-        let mut cands: Vec<(f64, &str)> = vec![
-            (
-                if sig {
-                    r.separation
-                } else {
-                    r.separation * 0.5
-                },
-                "separation",
-            ),
-            ((r.tail_excess * 2.0).clamp(0.0, 1.0), "tails"),
-            ((r.pat_excess * 4.0).clamp(0.0, 1.0), "PAT"),
+        let half = |v: f64, p: f64| if p < 0.05 { v } else { v * 0.5 };
+        let mut subs: Vec<(&str, f64)> = vec![
+            ("separation", half(r.separation, r.q)),
+            ("tails", (r.tail_excess * 2.0).clamp(0.0, 1.0)),
+            ("PAT", (r.pat_excess * 4.0).clamp(0.0, 1.0)),
+            // η, the correlation ratio: share of spread explained, on the
+            // same 0–1 footing as separation
+            ("ANOVA", half(r.eta2.max(0.0).sqrt(), r.anova_p)),
         ];
         if let Some(d) = r.drift_sep {
-            cands.push((d, "drift"));
+            subs.push(("drift", d));
         }
         if let Some(c) = r.corr_break {
-            cands.push((c.min(1.0), "correlation break"));
+            subs.push(("correlation break", c.min(1.0)));
         }
         if let Some(s) = r.resid_sigma {
-            cands.push(((s.abs() / 6.0).min(1.0), "residual"));
+            subs.push(("residual", (s.abs() / 6.0).min(1.0)));
         }
         if let Some(i) = r.importance {
             // importance is relative to the top feature, so it only counts as
             // much as the model can actually tell the groups apart
-            cands.push((i * skill, "random forest"));
+            subs.push(("random forest", i * skill));
         }
-        let (s, why) = cands
+        r.subs = subs
             .into_iter()
-            .filter(|c| c.0.is_finite())
-            .fold((0.0, "separation"), |a, c| if c.0 > a.0 { c } else { a });
-        r.score = s;
-        r.why = why.to_string();
+            .filter(|c| c.1.is_finite())
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        (r.score, r.why) = pick_score(&r.subs, &opt.methods);
     }
     rows.sort_by(|a, b| {
         b.score
@@ -425,6 +452,20 @@ pub fn find(refg: &Group, aff: &Group, later: Option<&Later>, opt: &MarkerOption
         forest_error,
         sdc,
     }
+}
+
+/// The largest sub-score among `methods` and the method that gave it (ties go
+/// to the earlier method in [`METHODS`]); (0, "") when none is available.
+pub fn pick_score(subs: &BTreeMap<String, f64>, methods: &[String]) -> (f64, String) {
+    let mut best = (0.0, String::new());
+    for m in METHODS.iter().filter(|m| methods.iter().any(|x| x == *m)) {
+        if let Some(&v) = subs.get(*m) {
+            if best.1.is_empty() || v > best.0 {
+                best = (v, m.to_string());
+            }
+        }
+    }
+    best
 }
 
 /// Random-forest importance (by test key) and hold-out AUC.

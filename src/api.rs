@@ -448,7 +448,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             Ok(json!({"app": "stdf-cypher"}))
         }
         "recent" => {
-            let s = reg.session.settings.lock().unwrap();
+            let s = reg.session.synced_settings();
             Ok(json!(s.recent.iter().map(|r| {
                 let m = std::fs::metadata(&r.path).ok();
                 json!({"path": r.path, "name": data::short_name(&r.path), "exists": m.is_some(), "size": m.map(|m| m.len()).unwrap_or(0), "opened": r.opened})
@@ -456,7 +456,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         }
         "forget_recent" => {
             let path = pp.str("path");
-            let mut s = reg.session.settings.lock().unwrap();
+            let mut s = reg.session.synced_settings();
             if path.is_empty() {
                 s.recent.clear();
             } else {
@@ -684,6 +684,12 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             if paths.is_empty() {
                 bail!("no paths given");
             }
+            // folders: their STDF files only; then the chosen order
+            let (paths, skipped) = data::expand_paths(&paths);
+            if paths.is_empty() {
+                bail!("no STDF files found ({skipped} other file(s) skipped)");
+            }
+            let sort = pp.str("sort");
             let opt = LoadOptions {
                 dedup: match pp.str("dedup").as_str() {
                     "last" => Some(data::loader::DedupMode::Last),
@@ -696,15 +702,29 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             let mut errors = vec![];
             let mut ok_paths = vec![];
             if pp.bool("merge", false) && paths.len() > 1 {
+                // start times are only known after loading: merge by file time then
+                let mut paths = paths.clone();
+                data::sort_opened(&mut paths, &sort, |p| p, |_| None);
                 let ds = data::load_many(&paths, &opt)?;
                 ids.push(reg.add(format!("merged: {}", ds.name), paths.clone(), ds));
                 ok_paths = paths.clone();
             } else {
                 use rayon::prelude::*;
-                let results: Vec<(String, Result<Dataset>)> = paths
+                let mut results: Vec<(String, Result<Dataset>)> = paths
                     .par_iter()
                     .map(|p| (p.clone(), data::load(p, &opt)))
                     .collect();
+                data::sort_opened(
+                    &mut results,
+                    &sort,
+                    |x| &x.0,
+                    |x| {
+                        x.1.as_ref()
+                            .ok()
+                            .and_then(|d| d.sources.first())
+                            .map(|s| s.start_t)
+                    },
+                );
                 for (path, r) in results {
                     match r {
                         Ok(ds) => {
@@ -731,7 +751,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             }
             let paths = ok_paths;
             reg.session.remember(&paths);
-            Ok(json!({"ids": ids, "errors": errors}))
+            Ok(json!({"ids": ids, "errors": errors, "skipped": skipped}))
         }
         "overview" => {
             let id = pp.usize("ds", 0);
@@ -772,6 +792,8 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             let s = summary::tests(&ds, &r);
             Ok(json!(s.iter().map(|t| json!({
                 "key": t.key, "num": t.num, "name": t.name, "kind": t.kind, "units": t.units, "lo": on(t.lo), "hi": on(t.hi),
+                "res_scal": ds.tests[ds.test_index[&t.key]].res_scal,
+                "disp_units": crate::analysis::candidates::display_unit(&t.units, ds.tests[ds.test_index[&t.key]].res_scal).0,
                 "n": t.stats.n, "mean": n(t.stats.mean), "std": n(t.stats.std), "min": n(t.stats.min), "max": n(t.stats.max),
                 "median": n(t.stats.median), "cpk": on(t.stats.cpk), "fails": t.stats.fails, "fail_pct": n(t.fail_pct)
             })).collect::<Vec<_>>()))
@@ -803,10 +825,21 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "records" => records_op(reg, &pp),
         "part_records" => part_records_op(reg, &pp),
         "match" => match_op(reg, &pp),
+        "candidate_sets" => candidate_sets_op(reg, &pp),
         "match_dual" => match_dual_op(reg, &pp),
         "trace" => trace_op(reg, &pp),
         "markers" => markers_op(reg, &pp),
         "candidates" => candidates_op(reg, &pp),
+        "signature" => signature_op(reg, &pp),
+        "retest_trace" => retest_op(reg, &pp),
+        "commonality" => commonality_op(reg, &pp),
+        "case_save" | "case_load" | "case_list" => case_op(&pp, op),
+        "loadboard" => {
+            if let Some(t) = pp.opt_usize("test") {
+                data::set_loadboard_test(t as u32);
+            }
+            Ok(json!({"test": data::loadboard_test()}))
+        }
         "subset_ds" => subset_op(reg, &pp),
         "part_detail" => {
             let id = pp.usize("ds", 0);
@@ -1555,6 +1588,154 @@ fn match_op(reg: &Registry, pp: &P) -> Result<Value> {
     }))
 }
 
+/// Bad candidates and their counterparts, as part sets in file 1 (`a`):
+///
+/// * `$name` (bad_candidate): good in file 1 (`filter_a`), bad in file 2
+///   (`filter_b`) and, with a `range`, the file-2 value of `test` inside it;
+/// * `$marginal`: the file-2 fails outside the range; they count as
+///   candidates only with `include_marginal`, and are listed either way;
+/// * `$confirmed_good`: good in file 1 and passing in file 2 (`pass_b`).
+///
+/// Also keeps the file 1 ↔ file 2 link of the candidates (for tracing and
+/// paired charts), like `match`.
+fn candidate_sets_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::analysis::candidates::{display_unit, Range};
+    use data::matching::{match_parts, KeySpec};
+    use std::collections::HashMap;
+    let (a, b) = (pp.usize("a", 0), pp.usize("b", 1));
+    if a == b {
+        bail!("pick two different files");
+    }
+    let (da, _) = reg.get(a)?;
+    let (db, _) = reg.get(b)?;
+    let ks_a = pp.str_or("key_a", "part_txt");
+    let ks_b = pp.str_or("key_b", &ks_a);
+    let ka = KeySpec::parse(&ks_a, &da)?;
+    let kb = KeySpec::parse(&ks_b, &db)?;
+    let ra = reg.rows(a, &da, &pp.str("filter_a"))?;
+    let rb = reg.rows(b, &db, &pp.str_or("filter_b", "not pass"))?;
+    let name = set_name(&pp.str_or("name", "bad_candidate"));
+    let marg_name = set_name(&pp.str_or("marginal", "marginal"));
+    let conf_name = set_name(&pp.str_or("confirmed", "confirmed_good"));
+    let include = pp.bool("include_marginal", false);
+    // the range applies to the failing test's value in file 2
+    let range_s = pp.str("range");
+    let range = if range_s.trim().is_empty() {
+        None
+    } else {
+        let q = pp.str("test");
+        if q.trim().is_empty() {
+            bail!("a value range needs the failing test (e.g. 1013)");
+        }
+        let tb = test_ref(&db, q.split(':').next().unwrap_or(&q).trim())?;
+        let ti = &db.tests[tb];
+        Some((tb, Range::parse(&range_s, &ti.units, ti.res_scal)?))
+    };
+
+    let m = match_parts(&da, &ra, &ka, &db, &rb, &kb);
+    // classify each matched unit by its file-2 value
+    let mut class: HashMap<&str, bool> = HashMap::new(); // key → in range
+    let (mut cand_pairs, mut marg_pairs) = (vec![], vec![]);
+    for p in &m.pairs {
+        let inside = range
+            .as_ref()
+            .map(|(t, r)| r.contains(db.value(*t, p.1)))
+            .unwrap_or(true);
+        class.insert(p.2.as_str(), inside);
+        if inside {
+            cand_pairs.push(p.clone());
+        } else {
+            marg_pairs.push(p.clone());
+        }
+    }
+    let mut cand = vec![false; da.n_parts()];
+    let mut marg = vec![false; da.n_parts()];
+    for &r in &ra {
+        if !m.in_a[r] {
+            continue;
+        }
+        match ka.key(&da, r).and_then(|k| class.get(k.as_str()).copied()) {
+            Some(true) => cand[r] = true,
+            Some(false) => {
+                marg[r] = true;
+                cand[r] |= include;
+            }
+            None => {}
+        }
+    }
+    let (mut cand_b, mut marg_b) = (vec![false; db.n_parts()], vec![false; db.n_parts()]);
+    for &r in &rb {
+        if !m.in_b[r] {
+            continue;
+        }
+        match kb.key(&db, r).and_then(|k| class.get(k.as_str()).copied()) {
+            Some(true) => cand_b[r] = true,
+            Some(false) => {
+                marg_b[r] = true;
+                cand_b[r] |= include;
+            }
+            None => {}
+        }
+    }
+    // good in file 1, passing in file 2, and not among the bad
+    let rp = reg.rows(b, &db, &pp.str_or("pass_b", "pass"))?;
+    let mc = match_parts(&da, &ra, &ka, &db, &rp, &kb);
+    let conf: Vec<bool> = (0..da.n_parts())
+        .map(|r| mc.in_a[r] && !cand[r] && !marg[r])
+        .collect();
+    let conf_b: Vec<bool> = (0..db.n_parts())
+        .map(|r| mc.in_b[r] && !cand_b[r] && !marg_b[r])
+        .collect();
+    let count = |v: &[bool]| v.iter().filter(|&&x| x).count();
+    let (n_cand, n_marg, n_conf) = (count(&cand), count(&marg), count(&conf));
+    reg.put_set(a, &name, cand);
+    reg.put_set(b, &name, cand_b);
+    reg.put_set(a, &marg_name, marg);
+    reg.put_set(b, &marg_name, marg_b);
+    reg.put_set(a, &conf_name, conf);
+    reg.put_set(b, &conf_name, conf_b);
+    let mut link_pairs = cand_pairs.clone();
+    if include {
+        link_pairs.extend(marg_pairs.iter().cloned());
+        link_pairs.sort_unstable_by_key(|p| p.0);
+    }
+    let link = {
+        let mut v = reg.matches.write().unwrap();
+        v.retain(|l| !(l.a == a && l.b == b && l.name == name));
+        v.push(MatchLink {
+            a,
+            b,
+            name: name.clone(),
+            key_a: ks_a,
+            key_b: ks_b,
+            pairs: link_pairs,
+        });
+        v.len() - 1
+    };
+    // values as the tester shows them (RES_SCAL applied)
+    let (disp_units, disp) = range
+        .as_ref()
+        .map(|(t, _)| display_unit(&db.tests[*t].units, db.tests[*t].res_scal))
+        .unwrap_or_default();
+    let row = |(x, y, k): &(usize, usize, String)| {
+        let (pa, pb) = (&da.parts[*x], &db.parts[*y]);
+        json!({"key": k, "a_row": x, "b_row": y, "a_part_id": pa.part_id, "b_part_id": pb.part_id,
+            "b_hbin": pb.hbin, "b_value": range.as_ref().map(|(t, _)| n(db.value(*t, *y) * disp)),
+            "a_wafer": da.wafer_name(pa), "a_x": pa.x, "a_y": pa.y, "a_site": pa.site})
+    };
+    let limit = pp.usize("limit", 5000);
+    Ok(json!({
+        "link": link, "name": name, "marginal": marg_name, "confirmed": conf_name, "a": a, "b": b,
+        "key_a": m.key_a, "key_b": m.key_b, "n_a": ra.len(), "n_b": rb.len(), "only_b": m.only_b,
+        "matched": m.pairs.len(), "pairs": n_cand, "n_cand": n_cand, "n_marginal": n_marg, "n_confirmed": n_conf,
+        "n_pass_b": rp.len(), "include_marginal": include,
+        "range": range.as_ref().map(|(t, r)| json!({"test": db.tests[*t].key, "units": disp_units, "stored_units": db.tests[*t].units,
+            "res_scal": db.tests[*t].res_scal, "lo": r.lo.map(|v| n(v * disp)), "hi": r.hi.map(|v| n(v * disp))})),
+        "rows": cand_pairs.iter().take(limit).map(row).collect::<Vec<_>>(),
+        "marginal_rows": marg_pairs.iter().take(limit).map(row).collect::<Vec<_>>(),
+    }))
+}
+
 /// Paired charts: test X of file A and test Y of file B over the same
 /// (matched) parts, colored by a field of either side.
 fn match_dual_op(reg: &Registry, pp: &P) -> Result<Value> {
@@ -1830,6 +2011,7 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
         match_by: pp.str_or("match_by", "key"),
         min_n: pp.usize("min_n", 5),
         exclude: parse_nums(&pp.str("exclude"))?,
+        methods: methods_param(pp)?,
     };
     let rep = markers::find(
         &Group {
@@ -1845,7 +2027,7 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
     );
     let range = viz::RangeMode::parse(&pp.str("range"));
     // overlays of the top candidates
-    let top: Vec<Value> = rep
+    let (top_keys, top): (Vec<String>, Vec<Value>) = rep
         .rows
         .iter()
         .take(pp.usize("top_charts", 6))
@@ -1870,9 +2052,9 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
                 m.why,
                 m.score
             ));
-            Some(f)
+            Some((m.key.clone(), f))
         })
-        .collect();
+        .unzip();
     let bars: Vec<&markers::MarkerRow> = rep.rows.iter().take(20).collect();
     let why_color = |w: &str| match w {
         "separation" => "@s1",
@@ -1880,6 +2062,7 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
         "drift" => "@s3",
         "correlation break" => "@s7",
         "residual" => "@s4",
+        "ANOVA" => "@s6",
         _ => "@s5",
     };
     let mut whys: Vec<&str> = bars.iter().map(|r| r.why.as_str()).collect();
@@ -1934,8 +2117,33 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
         "label_ref": la, "label_aff": lb, "n_ref": rep.n_ref, "n_aff": rep.n_aff, "n_tests": rep.n_tests,
         "later": rep.later, "forest_auc": rep.forest_auc.map(n), "forest_error": rep.forest_error,
         "sdc_auc": n(rep.sdc.aff_auc), "rows": rows,
-        "figures": {"scores": score_fig, "top": top, "sdc": sdc},
+        "methods": opt.methods, "methods_all": markers::METHODS,
+        "figures": {"scores": score_fig, "top": top, "top_keys": top_keys, "sdc": sdc},
     }))
+}
+
+/// `methods`: the marker score methods to count, as a list or a comma-separated
+/// string; missing = the defaults.
+fn methods_param(pp: &P) -> Result<Vec<String>> {
+    use crate::analysis::markers::{default_methods, METHODS};
+    let v: Vec<String> = match pp.0.get("methods") {
+        None | Some(Value::Null) => return Ok(default_methods()),
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        Some(_) => str_list(pp.0, "methods"),
+    };
+    for m in &v {
+        if !METHODS.contains(&m.as_str()) {
+            bail!("unknown score method '{m}' (use {})", METHODS.join(", "));
+        }
+    }
+    if v.is_empty() {
+        bail!("tick at least one score method");
+    }
+    Ok(v)
 }
 
 /// CSV export of the part table plus selected (or all numeric) test columns.
@@ -2238,6 +2446,23 @@ fn candidates_op(reg: &Registry, pp: &P) -> Result<Value> {
         ),
         ("zone", "Wafer zone (radius)", cand::zones(&pos)),
     ];
+    let lbt = data::loadboard_test();
+    fl.push((
+        "loadboard",
+        "Loadboard (file-level test value)",
+        lab(&|r| {
+            ds.file_value(r, lbt)
+                .map(|b| format!("LB {}", data::FieldValue::Num(b).as_group_key()))
+        }),
+    ));
+    fl.push((
+        "site_loadboard",
+        "Site × loadboard",
+        lab(&|r| match ds.field(r, "site_loadboard") {
+            data::FieldValue::Str(s) => Some(s),
+            _ => None,
+        }),
+    ));
     if let Some(t) = txy.as_ref().filter(|_| !use_prr) {
         fl.push((
             "field",
@@ -2345,5 +2570,1060 @@ fn candidates_op(reg: &Registry, pp: &P) -> Result<Value> {
         "b_fails": b_fails.iter().map(|(k, c)| json!({"key": k, "n": c, "share": *c as f64 / n_aff as f64})).collect::<Vec<_>>(),
         "b_bins": b_bins.iter().map(|(k, c)| json!({"bin": k, "n": c})).collect::<Vec<_>>(),
         "parts": parts,
+    }))
+}
+
+/// Retest trace: follow the parts of run 1 (`runs[0]`, rows matching
+/// `filter`, default `not pass`) through the later runs (`runs`: dataset ids
+/// in order, each a retest of the previous run's rejects), matched by `key`.
+/// Traces the values of `tests` (blank = the most common first fail of the
+/// traced parts, leaving out `exclude`) in display units, summarizes each
+/// run, and stores `$retest_recovered` / `$retest_still_bad` /
+/// `$retest_not_retested` part sets in every run.
+fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::analysis::candidates::display_unit;
+    use crate::analysis::markers::pair_test;
+    use crate::analysis::retest::{self, Outcome, Run, Status};
+    use data::matching::KeySpec;
+    let ids: Vec<usize> = match pp.0.get("runs") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok()))
+            .map(|v| v as usize)
+            .collect(),
+        Some(Value::String(s)) => s.split(',').filter_map(|x| x.trim().parse().ok()).collect(),
+        _ => vec![],
+    };
+    if ids.len() < 2 {
+        bail!("pick at least two runs: run 1 and its retest");
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !ids.iter().all(|i| seen.insert(*i)) {
+        bail!("each run must be a different dataset");
+    }
+    let dss: Vec<Arc<Dataset>> = ids
+        .iter()
+        .map(|&i| reg.get(i).map(|d| d.0))
+        .collect::<Result<_>>()?;
+    let key_s = pp.str_or("key", "part_txt");
+    let runs: Vec<Run> = dss
+        .iter()
+        .map(|d| {
+            Ok(Run {
+                ds: d,
+                key: KeySpec::parse(&key_s, d)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let d1 = &dss[0];
+    let filter = pp.str_or("filter", "not pass");
+    let start = reg.rows(ids[0], d1, &filter)?;
+    if start.is_empty() {
+        bail!("no part of run 1 matches '{filter}'");
+    }
+    let parts = retest::trace(&runs, &start);
+    if parts.is_empty() {
+        bail!(
+            "none of the {} selected parts of run 1 has a key ({})",
+            start.len(),
+            runs[0].key.describe(d1)
+        );
+    }
+
+    // traced tests: as given, else the most common first fail
+    let exclude = parse_nums(&pp.str("exclude"))?;
+    let q = pp.str("tests");
+    let tests: Vec<usize> = if q.trim().is_empty() {
+        let mut c: IndexMap<usize, usize> = IndexMap::new();
+        for p in &parts {
+            if let Some(f) = p.rows[0].and_then(|r| d1.parts[r].first_fail) {
+                if !exclude.contains(&d1.tests[f as usize].num) {
+                    *c.entry(f as usize).or_default() += 1;
+                }
+            }
+        }
+        c.sort_by(|_, a, _, b| b.cmp(a));
+        let t = c.keys().next().copied().ok_or_else(|| {
+            anyhow!("the traced parts have no first fail: enter the test to trace")
+        })?;
+        vec![t]
+    } else {
+        q.split([',', ';'])
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| test_ref(d1, s.split(':').next().unwrap_or(s).trim()))
+            .collect::<Result<_>>()?
+    };
+    let by = pp.str_or("match_by", "key");
+    // each traced test in each run, with its display scale
+    let tmap: Vec<Vec<Option<(usize, f64)>>> = tests
+        .iter()
+        .map(|&t| {
+            dss.iter()
+                .map(|d| {
+                    let t2 = if Arc::ptr_eq(d, d1) {
+                        Some(t)
+                    } else {
+                        pair_test(d1, d, t, &by).or_else(|| pair_test(d1, d, t, "num"))
+                    }?;
+                    Some((t2, display_unit(&d.tests[t2].units, d.tests[t2].res_scal).1))
+                })
+                .collect()
+        })
+        .collect();
+    let fails_on = |ti: usize, k: usize, r: usize| -> bool {
+        tmap[ti][k]
+            .map(|(t, _)| {
+                let v = dss[k].value(t, r);
+                dss[k].parts[r].has_fail(t) || (v.is_finite() && !dss[k].tests[t].within_limits(v))
+            })
+            .unwrap_or(false)
+    };
+    let summary = retest::summarize(&parts, dss.len(), &|k, r| fails_on(0, k, r));
+
+    // recovery by failing value, per traced test: (value, recovered) points
+    // from each part's first fail on the test, or from every retest of a
+    // failing part (`value_from` = each); repeatability loops can feed the
+    // same points later
+    let each = pp.str("value_from") == "each";
+    let (max_rate, min_zone) = (pp.f64("max_rate", 0.10), pp.usize("min_zone", 10));
+    let recovery: Vec<Value> = (0..tests.len())
+        .map(|ti| {
+            let val = |k: usize, r: usize| tmap[ti][k].map(|(t, f)| dss[k].value(t, r) * f);
+            let mut pts: Vec<(f64, bool, &str, usize)> = vec![];
+            for p in &parts {
+                if each {
+                    for k in 0..dss.len() - 1 {
+                        if let (Some(r), Some(_)) = (p.rows[k], p.rows[k + 1]) {
+                            if p.status[k] == Status::Fail && fails_on(ti, k, r) {
+                                if let Some(v) = val(k, r).filter(|v| v.is_finite()) {
+                                    pts.push((v, p.status[k + 1] == Status::Pass, &p.key, k));
+                                }
+                            }
+                        }
+                    }
+                } else if p.outcome != Outcome::PassedRun1 {
+                    let first = (0..dss.len()).find(|&k| {
+                        p.status[k] == Status::Fail && p.rows[k].is_some_and(|r| fails_on(ti, k, r))
+                    });
+                    // not retested at the end still counts once it was retested
+                    // after that fail (e.g. the reject chain ended, the next
+                    // run retested good parts)
+                    let retested_after = |k: usize| p.rows[k + 1..].iter().any(|r| r.is_some());
+                    if let Some(k) = first.filter(|&k| p.outcome != Outcome::NotRetested || retested_after(k)) {
+                        if let Some(v) = val(k, p.rows[k].unwrap()).filter(|v| v.is_finite()) {
+                            pts.push((v, p.outcome == Outcome::Recovered, &p.key, k));
+                        }
+                    }
+                }
+            }
+            let xy: Vec<(f64, bool)> = pts.iter().map(|p| (p.0, p.1)).collect();
+            let lim = tmap[ti][0].map(|(t, f)| {
+                let i = &dss[0].tests[t];
+                (i.lo.map(|v| v * f), i.hi.map(|v| v * f))
+            });
+            let (lo, hi) = lim.unwrap_or((None, None));
+            json!({
+                "value_from": if each { "each" } else { "first" }, "max_rate": max_rate, "min_zone": min_zone,
+                "points": pts.iter().map(|p| json!({"key": p.2, "value": n(p.0), "recovered": p.1, "run": p.3})).collect::<Vec<_>>(),
+                "bins": retest::recovery_bins(&xy, pp.usize("n_bins", 10)),
+                "zones": retest::recovery_zones(&xy, max_rate, min_zone, lo, hi),
+            })
+        })
+        .collect();
+
+    // loadboard per run (a file-level attribute), and retest recovery per board
+    let lb = data::loadboard_test();
+    let board_of = |k: usize, r: usize| dss[k].file_value(r, lb);
+    let mut by_board: IndexMap<(usize, String), (usize, usize)> = IndexMap::new();
+    for p in &parts {
+        for k in 1..dss.len() {
+            if let (true, Some(r)) = (p.due(k), p.rows[k]) {
+                let b = board_of(k, r)
+                    .map(|b| data::FieldValue::Num(b).as_group_key())
+                    .unwrap_or_else(|| "?".into());
+                let e = by_board.entry((k, b)).or_default();
+                e.0 += 1;
+                e.1 += (p.status[k] == Status::Pass) as usize;
+            }
+        }
+    }
+
+    // bad candidates: good in run 1, then failing the (first) traced test on
+    // a retest of good parts and never passing after ($rt_bad_candidate);
+    // passing again later ($rt_marginal); passing every retest of good parts
+    // ($rt_confirmed_good). Marked in run 1, where their values were good.
+    let mut cand_sets: IndexMap<&str, Vec<bool>> =
+        ["rt_bad_candidate", "rt_marginal", "rt_confirmed_good"]
+            .into_iter()
+            .map(|n| (n, vec![false; d1.n_parts()]))
+            .collect();
+    let mut good_runs = std::collections::BTreeSet::new();
+    let mut other_fail = 0;
+    for p in &parts {
+        let (Some(r1), Status::Pass) = (p.rows[0], p.status[0]) else {
+            continue;
+        };
+        let ks: Vec<usize> = (1..dss.len()).filter(|&k| p.retested_good(k)).collect();
+        if ks.is_empty() {
+            continue;
+        }
+        good_runs.extend(ks.iter().copied());
+        let first_bad = ks
+            .iter()
+            .copied()
+            .find(|&k| p.status[k] == Status::Fail && p.rows[k].is_some_and(|r| fails_on(0, k, r)));
+        let set = match first_bad {
+            Some(k) if p.status[k + 1..].contains(&Status::Pass) => "rt_marginal",
+            Some(_) => "rt_bad_candidate",
+            None if ks.iter().all(|&k| p.status[k] == Status::Pass) => "rt_confirmed_good",
+            None => {
+                other_fail += 1;
+                continue;
+            }
+        };
+        cand_sets[set][r1] = true;
+    }
+    let cand_count = |n: &str| cand_sets[n].iter().filter(|&&b| b).count();
+    let candidates = json!({"good_runs": good_runs.iter().collect::<Vec<_>>(), "n_cand": cand_count("rt_bad_candidate"),
+        "n_marginal": cand_count("rt_marginal"), "n_confirmed": cand_count("rt_confirmed_good"), "n_other_fail": other_fail});
+    for (name, f) in cand_sets {
+        reg.put_set(ids[0], name, f);
+    }
+
+    // part sets in every run
+    for o in [
+        Outcome::Recovered,
+        Outcome::StillBad,
+        Outcome::NotRetested,
+        Outcome::PassedRun1,
+    ] {
+        for (k, d) in dss.iter().enumerate() {
+            let mut f = vec![false; d.n_parts()];
+            for p in parts.iter().filter(|p| p.outcome == o) {
+                if let Some(r) = p.rows[k] {
+                    f[r] = true;
+                }
+            }
+            reg.put_set(ids[k], o.set_name(), f);
+        }
+    }
+
+    // the same outcome sets in other datasets (e.g. the lot's first run), by key
+    for v in
+        pp.0.get("also")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+    {
+        let Some(id) = v.as_u64().map(|x| x as usize) else {
+            continue;
+        };
+        let (d, _) = reg.get(id)?;
+        let k = KeySpec::parse(&key_s, &d)?;
+        let by_key: std::collections::HashMap<&str, Outcome> =
+            parts.iter().map(|p| (p.key.as_str(), p.outcome)).collect();
+        let mut flags: IndexMap<&str, Vec<bool>> = IndexMap::new();
+        for o in [
+            Outcome::Recovered,
+            Outcome::StillBad,
+            Outcome::NotRetested,
+            Outcome::PassedRun1,
+        ] {
+            flags.insert(o.set_name(), vec![false; d.n_parts()]);
+        }
+        for r in 0..d.n_parts() {
+            if let Some(o) = k
+                .key(&d, r)
+                .and_then(|key| by_key.get(key.as_str()).copied())
+            {
+                flags[o.set_name()][r] = true;
+            }
+        }
+        for (name, f) in flags {
+            reg.put_set(id, name, f);
+        }
+    }
+
+    // flows between consecutive runs, for the Sankey
+    let label = |s: Status| match s {
+        Status::Pass => "pass",
+        Status::Fail => "fail",
+        Status::NotRetested => "not retested",
+        Status::PassedEarlier => "passed earlier",
+    };
+    let mut flows: IndexMap<(usize, &str, &str), usize> = IndexMap::new();
+    // parts that never failed would swamp the chart: leave them out
+    for p in parts.iter().filter(|p| p.outcome != Outcome::PassedRun1) {
+        for k in 1..dss.len() {
+            // fails moving on, and good parts that a later run retested
+            if p.status[k - 1] == Status::Fail || p.rows[k].is_some() {
+                *flows
+                    .entry((k - 1, label(p.status[k - 1]), label(p.status[k])))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let ff = |r: usize, d: &Dataset| {
+        d.parts[r]
+            .first_fail
+            .map(|t| d.tests[t as usize].key.clone())
+            .unwrap_or_default()
+    };
+    let limit = pp.usize("limit", 20000);
+    let part_rows: Vec<Value> = parts
+        .iter()
+        .take(limit)
+        .map(|p| {
+            let runs: Vec<Value> = p
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(k, r)| match r {
+                    Some(r) => {
+                        let d = &dss[k];
+                        let vals: Vec<Value> = tmap
+                            .iter()
+                            .map(|m| m[k].map(|(t, f)| n(d.value(t, *r) * f)).unwrap_or(Value::Null))
+                            .collect();
+                        let fl: Vec<bool> = (0..tests.len()).map(|ti| fails_on(ti, k, *r)).collect();
+                        let alarms: Vec<&str> = d.parts[*r].alarms.iter().map(|&t| d.tests[t as usize].key.as_str()).collect();
+                        json!({"row": r, "status": p.status[k], "site": d.parts[*r].site, "retest_good": p.retested_good(k), "alarms": alarms, "hbin": d.parts[*r].hbin, "sbin": d.parts[*r].sbin,
+                            "first_fail": ff(*r, d), "values": vals, "fails": fl})
+                    }
+                    None => json!({"row": Value::Null, "status": p.status[k]}),
+                })
+                .collect();
+            json!({"key": p.key, "outcome": p.outcome, "recovered_in": p.recovered_in, "runs": runs})
+        })
+        .collect();
+    let by_site = retest::by_site(&parts, dss.len(), &|k, r| dss[k].parts[r].site);
+    let count = |o: Outcome| parts.iter().filter(|p| p.outcome == o).count();
+    Ok(json!({
+        "runs": ids.iter().zip(&dss).map(|(&i, d)| {
+            let fv = d.file_values(lb);
+            json!({"id": i, "name": reg.name(i), "n_parts": d.n_parts(), "loadboard": fv.iter().map(|f| f.value.map(n)).collect::<Vec<_>>(),
+                "loadboard_changed": fv.iter().any(|f| f.distinct > 1), "loadboard_missing": fv.iter().map(|f| f.missing).sum::<usize>()})
+        }).collect::<Vec<_>>(),
+        "loadboard_test": lb, "recovery": recovery,
+        "by_board": by_board.iter().map(|((k, b), (n_, k_))| {
+            let (l, u) = retest::wilson(*k_, *n_);
+            json!({"run": k, "board": b, "retested": n_, "pass": k_, "rate": *k_ as f64 / *n_ as f64, "ci_lo": l, "ci_hi": u})
+        }).collect::<Vec<_>>(),
+        "key": key_s, "key_desc": runs[0].key.describe(d1), "filter": filter, "n_start": start.len(), "n_parts": parts.len(),
+        "tests": tests.iter().zip(&tmap).map(|(&t, m)| {
+            let info = &d1.tests[t];
+            json!({"key": info.key, "num": info.num, "units": display_unit(&info.units, info.res_scal).0,
+                "limits": m.iter().enumerate().map(|(k, x)| match x {
+                    Some((t2, f)) => { let ti = &dss[k].tests[*t2]; json!({"lo": ti.lo.map(|v| n(v * f)), "hi": ti.hi.map(|v| n(v * f))}) }
+                    None => Value::Null,
+                }).collect::<Vec<_>>()})
+        }).collect::<Vec<_>>(),
+        "outcomes": {"passed_run1": count(Outcome::PassedRun1), "recovered": count(Outcome::Recovered),
+            "still_bad": count(Outcome::StillBad), "not_retested": count(Outcome::NotRetested)},
+        "summary": summary, "candidates": candidates,
+        "by_site": {"counts": by_site.counts, "p": by_site.p.iter().map(|&v| n(v)).collect::<Vec<_>>()},
+        "flows": flows.iter().map(|((k, a, b), c)| json!({"run": k, "from": a, "to": b, "n": c})).collect::<Vec<_>>(),
+        "parts": part_rows, "truncated": parts.len() > limit,
+    }))
+}
+
+/// Commonality across the lots of an investigation case. Each lot (`lots`:
+/// [{name, ds, kind: issue | clean, bad, good, groups: [{label, filter}]}])
+/// contrasts a bad group with a good group of its first run (filters). Per
+/// factor (site, loadboard, site × loadboard, wafer, wafer zone, reticle
+/// position, test-time quartile): the share of every group per level, a χ²
+/// test of bad vs good per lot (BH-corrected within the lot), and two flags:
+/// the factor sets the bad parts apart in every issue lot but in no clean lot
+/// (within lots), or one level holds most bad parts of every issue lot but
+/// few parts of the clean lots (across lots, e.g. a loadboard used for the
+/// issue lots only). Also the top marker tests of each lot side by side.
+fn commonality_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::analysis::candidates as cand;
+    use crate::analysis::markers::{self, Group, MarkerOptions};
+    use std::collections::{BTreeSet, HashMap, HashSet};
+    let lots_in =
+        pp.0.get("lots")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+    if lots_in.is_empty() {
+        bail!("add at least one lot to the case");
+    }
+    let exclude = parse_nums(&pp.str("exclude"))?;
+    const FACTORS: [(&str, &str); 7] = [
+        ("site", "Test site"),
+        ("loadboard", "Loadboard"),
+        ("site_loadboard", "Site × loadboard"),
+        ("wafer", "Wafer"),
+        ("zone", "Wafer zone (radius)"),
+        ("reticle", "Reticle position"),
+        ("test_time", "Test time (quartile)"),
+    ];
+    struct Lot {
+        name: String,
+        kind: String,
+        ds: Arc<Dataset>,
+        bad: Vec<usize>,
+        good: Vec<usize>,
+        groups: Vec<(String, Vec<usize>)>,
+        /// factor → row → level
+        labels: Vec<HashMap<usize, String>>,
+    }
+    let mut lots: Vec<Lot> = vec![];
+    for (i, l) in lots_in.iter().enumerate() {
+        let lp = P(l);
+        let id = lp.usize("ds", usize::MAX);
+        let (ds, _) = reg.get(id).with_context(|| format!("lot {}", i + 1))?;
+        let name = lp.str_or("name", &reg.name(id));
+        let bad = reg
+            .rows(id, &ds, &lp.str("bad"))
+            .with_context(|| format!("{name}: bad parts"))?;
+        let bad_set: HashSet<usize> = bad.iter().copied().collect();
+        let good: Vec<usize> = reg
+            .rows(id, &ds, &lp.str_or("good", "pass"))
+            .with_context(|| format!("{name}: good parts"))?
+            .into_iter()
+            .filter(|r| !bad_set.contains(r))
+            .collect();
+        let mut groups = vec![];
+        for g in l
+            .get("groups")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default()
+        {
+            let gp = P(&g);
+            // a group whose part set does not exist yet is left out
+            if let Ok(rows) = reg.rows(id, &ds, &gp.str("filter")) {
+                groups.push((gp.str("label"), rows));
+            }
+        }
+        // the factor levels of every row in play
+        let mut rows: BTreeSet<usize> = bad.iter().chain(&good).copied().collect();
+        for g in &groups {
+            rows.extend(g.1.iter().copied());
+        }
+        let rows: Vec<usize> = rows.into_iter().collect();
+        let txy = TestXy::parse(&ds, pp).ok();
+        let prr = rows.iter().any(|&r| ds.parts[r].x != -32768);
+        let pos: Vec<Option<(String, f64, f64)>> = rows
+            .iter()
+            .map(|&r| {
+                let p = &ds.parts[r];
+                if prr {
+                    (p.x != -32768).then(|| {
+                        (
+                            format!("{}|{}", p.file, ds.wafer_name(p)),
+                            p.x as f64,
+                            p.y as f64,
+                        )
+                    })
+                } else {
+                    let t = txy.as_ref()?;
+                    let (x, y) = t.xy(&ds, r)?;
+                    Some((t.wafer(&ds, r)?, x as f64, y as f64))
+                }
+            })
+            .collect();
+        let zones = cand::zones(&pos);
+        let mut tt: Vec<f64> = rows
+            .iter()
+            .map(|&r| ds.parts[r].test_t as f64)
+            .filter(|&v| v > 0.0)
+            .collect();
+        tt.sort_by(|a, b| a.total_cmp(b));
+        let q = |f: f64| {
+            tt.get(((tt.len() as f64 - 1.0) * f).round() as usize)
+                .copied()
+        };
+        let (q1, q2, q3) = (q(0.25), q(0.5), q(0.75));
+        let mut labels: Vec<HashMap<usize, String>> = vec![HashMap::new(); FACTORS.len()];
+        for (k, &r) in rows.iter().enumerate() {
+            let p = &ds.parts[r];
+            let lab: [Option<String>; 7] = [
+                Some(format!("site {}", p.site)),
+                ds.file_value(r, data::loadboard_test())
+                    .map(|b| format!("LB {}", data::FieldValue::Num(b).as_group_key())),
+                match ds.field(r, "site_loadboard") {
+                    data::FieldValue::Str(s) => Some(s),
+                    _ => None,
+                },
+                Some(ds.wafer_name(p).to_string()).filter(|w| !w.is_empty()),
+                zones[k].clone(),
+                txy.as_ref()
+                    .and_then(|t| t.field_xy(&ds, r))
+                    .map(|(x, y)| format!("({x},{y})")),
+                match (p.test_t as f64, q1, q2, q3) {
+                    (v, Some(a), Some(b), Some(c)) if v > 0.0 => Some(
+                        if v <= a {
+                            "Q1 fastest"
+                        } else if v <= b {
+                            "Q2"
+                        } else if v <= c {
+                            "Q3"
+                        } else {
+                            "Q4 slowest"
+                        }
+                        .to_string(),
+                    ),
+                    _ => None,
+                },
+            ];
+            for (f, l) in lab.into_iter().enumerate() {
+                if let Some(l) = l {
+                    labels[f].insert(r, l);
+                }
+            }
+        }
+        lots.push(Lot {
+            name,
+            kind: lp.str_or("kind", "issue"),
+            ds,
+            bad,
+            good,
+            groups,
+            labels,
+        });
+    }
+
+    // bad vs good per lot and factor, BH within the lot
+    let mut tests: Vec<Vec<Option<cand::Factor>>> = vec![];
+    for l in &lots {
+        let rows: Vec<usize> = l.bad.iter().chain(&l.good).copied().collect();
+        let aff: Vec<bool> = (0..rows.len()).map(|i| i < l.bad.len()).collect();
+        tests.push(
+            FACTORS
+                .iter()
+                .enumerate()
+                .map(|(f, (k, n))| {
+                    let lab: Vec<Option<String>> =
+                        rows.iter().map(|r| l.labels[f].get(r).cloned()).collect();
+                    cand::factor(k, n, &lab, &aff)
+                })
+                .collect(),
+        );
+    }
+    let qs: Vec<Vec<f64>> = tests
+        .iter()
+        .map(|t| {
+            let p: Vec<f64> = t
+                .iter()
+                .map(|f| f.as_ref().map(|f| f.p).unwrap_or(f64::NAN))
+                .collect();
+            let present: Vec<f64> = p.iter().copied().filter(|v| v.is_finite()).collect();
+            let q = stats::bh_adjust(&present);
+            let mut it = q.into_iter();
+            p.iter()
+                .map(|v| {
+                    if v.is_finite() {
+                        it.next().unwrap_or(f64::NAN)
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    let share = |l: &Lot, f: usize, rows: &[usize]| -> IndexMap<String, usize> {
+        let mut c = IndexMap::new();
+        for r in rows {
+            if let Some(v) = l.labels[f].get(r) {
+                *c.entry(v.clone()).or_default() += 1;
+            }
+        }
+        c
+    };
+    let issue: Vec<usize> = (0..lots.len())
+        .filter(|&i| lots[i].kind != "clean")
+        .collect();
+    let clean: Vec<usize> = (0..lots.len())
+        .filter(|&i| lots[i].kind == "clean")
+        .collect();
+    let factors: Vec<Value> = FACTORS
+        .iter()
+        .enumerate()
+        .filter(|(f, _)| lots.iter().any(|l| !l.labels[*f].is_empty()))
+        .map(|(f, (key, name))| {
+            let mut levels: BTreeSet<String> = BTreeSet::new();
+            for l in &lots {
+                levels.extend(l.labels[f].values().cloned());
+            }
+            let sig = |i: usize| qs[i][f] < 0.05;
+            let within = !issue.is_empty() && issue.iter().all(|&i| sig(i)) && clean.iter().all(|&i| !sig(i));
+            // across lots: one level holds most bad parts of every issue lot
+            let frac = |c: &IndexMap<String, usize>, lv: &str| {
+                let n: usize = c.values().sum();
+                if n == 0 { f64::NAN } else { *c.get(lv).unwrap_or(&0) as f64 / n as f64 }
+            };
+            let across = levels.iter().find_map(|lv| {
+                let bad_share = issue
+                    .iter()
+                    .map(|&i| frac(&share(&lots[i], f, &lots[i].bad), lv))
+                    .fold(f64::INFINITY, f64::min);
+                let clean_share = clean
+                    .iter()
+                    .map(|&i| {
+                        let l = &lots[i];
+                        let all: Vec<usize> = l.bad.iter().chain(&l.good).copied().collect();
+                        frac(&share(l, f, &all), lv)
+                    })
+                    .fold(0.0, f64::max);
+                (issue.len() >= 2 && !clean.is_empty() && bad_share >= 0.5 && clean_share <= bad_share / 2.0)
+                    .then(|| json!({"level": lv, "issue_share": bad_share, "clean_share": clean_share}))
+            });
+            json!({
+                "key": key, "name": name, "levels": levels,
+                "flag_within": within, "flag_across": across,
+                "lots": lots.iter().enumerate().map(|(i, l)| {
+                    let t = tests[i][f].as_ref();
+                    let mut groups = vec![("bad".to_string(), l.bad.clone()), ("good".to_string(), l.good.clone())];
+                    groups.extend(l.groups.iter().cloned());
+                    json!({
+                        "lot": l.name, "kind": l.kind,
+                        "test": t.map(|t| json!({"p": n(t.p), "q": n(qs[i][f]), "cramers_v": n(t.cramers_v),
+                            "top": t.levels[0].level, "top_rate": n(t.levels[0].rate), "top_lift": n(t.levels[0].lift), "levels": t.levels})),
+                        "groups": groups.iter().map(|(g, rows)| json!({"label": g, "n": rows.len(), "counts": share(l, f, rows)})).collect::<Vec<_>>(),
+                    })
+                }).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    // top marker tests of each lot, side by side
+    let opt = MarkerOptions {
+        forest: pp.bool("forest", false),
+        trees: pp.usize("trees", 60),
+        exclude,
+        ..Default::default()
+    };
+    let mut scores: IndexMap<String, Vec<Option<(f64, String)>>> = IndexMap::new();
+    let mut ranked = vec![];
+    for (i, l) in lots.iter().enumerate() {
+        if l.bad.len() < 5 || l.good.len() < 10 {
+            ranked.push(false);
+            continue;
+        }
+        ranked.push(true);
+        let rep = markers::find(
+            &Group {
+                ds: &l.ds,
+                rows: l.good.clone(),
+            },
+            &Group {
+                ds: &l.ds,
+                rows: l.bad.clone(),
+            },
+            None,
+            &opt,
+        );
+        for r in rep.rows {
+            scores
+                .entry(r.key.clone())
+                .or_insert_with(|| vec![None; lots.len()])[i] = Some((r.score, r.why));
+        }
+    }
+    let common = |v: &[Option<(f64, String)>]| {
+        issue
+            .iter()
+            .filter(|&&i| ranked[i])
+            .map(|&i| v[i].as_ref().map(|s| s.0).unwrap_or(0.0))
+            .fold(f64::INFINITY, f64::min)
+    };
+    let mut mk: Vec<(&String, &Vec<Option<(f64, String)>>)> = scores.iter().collect();
+    mk.sort_by(|a, b| common(b.1).total_cmp(&common(a.1)));
+    Ok(json!({
+        "lots": lots.iter().map(|l| json!({"name": l.name, "kind": l.kind, "n_bad": l.bad.len(), "n_good": l.good.len(),
+            "groups": l.groups.iter().map(|g| json!({"label": g.0, "n": g.1.len()})).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+        "factors": factors,
+        "markers": mk.iter().take(pp.usize("top", 30)).map(|(k, v)| json!({"key": k, "common": n(common(v)),
+            "lots": v.iter().map(|s| s.as_ref().map(|(sc, w)| json!({"score": n(*sc), "why": w}))).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+        "marker_lots": ranked,
+    }))
+}
+
+/// Investigation cases are kept as JSON files in the settings folder.
+fn cases_dir() -> std::path::PathBuf {
+    crate::desktop::config_dir().join("cases")
+}
+
+fn case_op(pp: &P, op: &str) -> Result<Value> {
+    match op {
+        "case_save" => {
+            let case =
+                pp.0.get("case")
+                    .cloned()
+                    .ok_or_else(|| anyhow!("nothing to save"))?;
+            let name = set_name(case.get("name").and_then(|v| v.as_str()).unwrap_or("case"));
+            let path = match pp.str("path") {
+                p if p.trim().is_empty() => {
+                    std::fs::create_dir_all(cases_dir())?;
+                    cases_dir().join(format!("{name}.json"))
+                }
+                p => std::path::PathBuf::from(p),
+            };
+            std::fs::write(&path, serde_json::to_string_pretty(&case)?)
+                .with_context(|| format!("write {}", path.display()))?;
+            Ok(json!({"path": path.to_string_lossy()}))
+        }
+        "case_load" => {
+            let path = pp.str("path");
+            let text = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
+            Ok(
+                json!({"path": path, "case": serde_json::from_str::<Value>(&text).context("not a case file")?}),
+            )
+        }
+        _ => {
+            let mut v = vec![];
+            if let Ok(rd) = std::fs::read_dir(cases_dir()) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "json") {
+                        let t = e
+                            .metadata()
+                            .and_then(|m| m.modified())
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs());
+                        v.push(json!({"name": p.file_stem().map(|s| s.to_string_lossy()), "path": p.to_string_lossy(), "modified": t}));
+                    }
+                }
+            }
+            v.sort_by(|a, b| b["modified"].as_u64().cmp(&a["modified"].as_u64()));
+            Ok(json!(v))
+        }
+    }
+}
+
+/// Signature check: threshold rules learned from part set `name` (bad
+/// candidates) in dataset `a` against its normal parts, validated on a pool
+/// of good reference parts (clean lots `clean`: [{ds, filter}], and the parts
+/// a later file confirmed good, set `confirmed`), combined into one signature
+/// and applied to the files in `screen` ([{ds, filter}]).
+///
+/// The normal parts are the other good parts of the population, or the
+/// confirmed good ones when no clean lot is used and there are at least
+/// `min_confirmed` of them. `exclude_set` (e.g. `marginal`) leaves its parts
+/// out of every group.
+fn signature_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::analysis::markers::pair_test;
+    use crate::analysis::signature::{self as sig, Pop};
+    let id = pp.usize("a", 0);
+    let (ds, _) = reg.get(id)?;
+    let name = set_name(&pp.str("name"));
+    let flags = reg.set(id, &name).ok_or_else(|| {
+        anyhow!("part set ${name} does not exist yet: find the bad candidates first")
+    })?;
+    let mut pop = reg.rows(id, &ds, &pp.str("filter"))?;
+    let mut notes: Vec<String> = vec![];
+    let is = |f: &[bool], r: usize| f.get(r).copied().unwrap_or(false);
+    let drop_set = pp.str("exclude_set");
+    if !drop_set.trim().is_empty() {
+        let dn = set_name(&drop_set);
+        if let Some(f) = reg.set(id, &dn) {
+            let before = pop.len();
+            pop.retain(|&r| !is(&f, r));
+            if pop.len() < before {
+                notes.push(format!(
+                    "{} ${dn} parts are left out of every group",
+                    before - pop.len()
+                ));
+            }
+        }
+    }
+    let (cand_rows, other_rows): (Vec<usize>, Vec<usize>) =
+        pop.iter().partition(|&&r| is(&flags, r));
+    let conf_name = set_name(&pp.str_or("confirmed", "confirmed_good"));
+    let conf_rows: Vec<usize> = reg
+        .set(id, &conf_name)
+        .map(|f| other_rows.iter().copied().filter(|&r| is(&f, r)).collect())
+        .unwrap_or_default();
+    let min_n = pp.usize("min_n", 5);
+    if cand_rows.len() < min_n {
+        bail!(
+            "only {} bad candidates in the population; need at least {min_n}",
+            cand_rows.len()
+        );
+    }
+    let by = pp.str_or("match_by", "key");
+    // other files: (dataset id, filter) → loaded population
+    let side = |k: &str| -> Result<Vec<(Arc<Dataset>, Vec<usize>, String)>> {
+        let mut v = vec![];
+        for (i, s) in
+            pp.0.get(k)
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+        {
+            let sp = P(s);
+            let d = sp.usize("ds", usize::MAX);
+            let (dd, _) = reg.get(d).with_context(|| format!("{k} file {}", i + 1))?;
+            let rows = reg.rows(d, &dd, &sp.str("filter"))?;
+            v.push((dd, rows, sp.str_or("label", &reg.name(d))));
+        }
+        Ok(v)
+    };
+    let use_clean = pp.bool("use_clean", true);
+    let use_conf = pp.bool("use_confirmed", true);
+    let min_conf = pp.usize("min_confirmed", 30);
+    let clean_in = if use_clean { side("clean")? } else { vec![] };
+    let screen_in = side("screen")?;
+    // stayed good on retest: good in a run 1 (`filter`, default pass) and
+    // passing again on its 100% retest (`b`), matched by `key`; run-1 values
+    let mut stayed_in: Vec<(Arc<Dataset>, Vec<usize>, String)> = vec![];
+    if pp.bool("use_stayed", true) {
+        let items =
+            pp.0.get("stayed")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default();
+        for (i, s) in items.iter().enumerate() {
+            use data::matching::{match_parts, KeySpec};
+            let sp = P(s);
+            let (a, b) = (sp.usize("a", usize::MAX), sp.usize("b", usize::MAX));
+            if a == b {
+                bail!(
+                    "stayed-good source {}: pick a run 1 and a different retest file",
+                    i + 1
+                );
+            }
+            let (da, _) = reg
+                .get(a)
+                .with_context(|| format!("stayed-good source {}", i + 1))?;
+            let (db, _) = reg
+                .get(b)
+                .with_context(|| format!("stayed-good source {}", i + 1))?;
+            let ks = sp.str_or("key", "part_txt");
+            let (ka, kb) = (KeySpec::parse(&ks, &da)?, KeySpec::parse(&ks, &db)?);
+            let ra = reg.rows(a, &da, &sp.str_or("filter", "pass"))?;
+            let rb = reg.rows(b, &db, "pass")?;
+            let m = match_parts(&da, &ra, &ka, &db, &rb, &kb);
+            let rows: Vec<usize> = ra.into_iter().filter(|&r| m.in_a[r]).collect();
+            stayed_in.push((da, rows, format!("stayed good: {}", reg.name(a))));
+        }
+    }
+    fn pop_of((d, r, n): &(Arc<Dataset>, Vec<usize>, String)) -> Pop<'_> {
+        Pop {
+            name: n.clone(),
+            ds: d,
+            rows: r.clone(),
+        }
+    }
+    let cand = Pop {
+        name: "bad candidates".into(),
+        ds: &ds,
+        rows: cand_rows,
+    };
+    // the normal parts the rules are learned against: without a clean lot,
+    // the parts the later file confirmed good, if there are enough of them
+    let conf_label = "confirmed good".to_string();
+    let learn_conf = clean_in.is_empty() && stayed_in.is_empty() && conf_rows.len() >= min_conf;
+    if clean_in.is_empty() && stayed_in.is_empty() && !learn_conf {
+        notes.push(if conf_rows.is_empty() {
+            format!("no ${conf_name} parts in the population (run Bad candidates to create them): rules are learned against all other good parts of lot A")
+        } else {
+            format!("only {} ${conf_name} parts (fewer than {min_conf}): rules are learned against all other good parts of lot A instead", conf_rows.len())
+        });
+    }
+    let normal = if learn_conf {
+        Pop {
+            name: conf_label.clone(),
+            ds: &ds,
+            rows: conf_rows.clone(),
+        }
+    } else {
+        Pop {
+            name: "lot A normal".into(),
+            ds: &ds,
+            rows: other_rows,
+        }
+    };
+    // the reference pool: good parts only, from each ticked source
+    let mut sources: Vec<Pop> = clean_in.iter().map(pop_of).collect();
+    let mut kinds: Vec<&str> = vec!["clean"; sources.len()];
+    sources.extend(stayed_in.iter().map(pop_of));
+    kinds.resize(sources.len(), "stayed_good");
+    if use_conf && !conf_rows.is_empty() {
+        sources.push(Pop {
+            name: conf_label.clone(),
+            ds: &ds,
+            rows: conf_rows.clone(),
+        });
+        kinds.push("confirmed");
+        notes.push(format!(
+            "${conf_name} parts are also {} the rules are learned against, so their false-alarm rate is in-sample (optimistic)",
+            if learn_conf { "the normal parts" } else { "among the normal parts" }
+        ));
+    }
+    if sources.is_empty() {
+        bail!(
+            "the reference pool is empty: add a clean lot or a stayed-good lot, or tick the confirmed good parts (${conf_name}, created by Bad candidates)"
+        );
+    }
+    let screens: Vec<Pop> = screen_in.iter().map(pop_of).collect();
+
+    let exclude = parse_nums(&pp.str("exclude"))?;
+    let tests: Vec<(usize, Vec<Option<usize>>)> = ds
+        .numeric_tests()
+        .into_iter()
+        .filter(|&t| !exclude.contains(&ds.tests[t].num))
+        .map(|t| {
+            (
+                t,
+                sources
+                    .iter()
+                    .map(|c| pair_test(&ds, c.ds, t, &by))
+                    .collect(),
+            )
+        })
+        .collect();
+    let rows = sig::rules(&cand, &normal, &sources, &tests, min_n);
+
+    // the signature: kept rules added one at a time while they improve it
+    let usable: Vec<sig::RuleRow> = rows
+        .iter()
+        .filter(|r| r.verdict == "keep" || r.verdict == "caution")
+        .cloned()
+        .collect();
+    let pair_in = |rules: &[sig::RuleRow], p: &Pop| -> Vec<Option<usize>> {
+        rules
+            .iter()
+            .map(|r| {
+                ds.find_test(&r.key)
+                    .and_then(|t| pair_test(&ds, p.ds, t, &by))
+            })
+            .collect()
+    };
+    let mat = |p: &Pop| sig::hit_matrix(p, &pair_in(&usable, p), &usable);
+    let src_mats: Vec<(String, Vec<Vec<bool>>)> =
+        sources.iter().map(|c| (c.name.clone(), mat(c))).collect();
+    let signature = sig::select(
+        usable.clone(),
+        &mat(&cand),
+        &mat(&normal),
+        &src_mats,
+        pp.usize("max_rules", 5),
+    );
+    let kept = signature.rules.clone();
+    let in_a: Vec<Option<usize>> = kept.iter().map(|r| ds.find_test(&r.key)).collect();
+    let paired = |p: &Pop| pair_in(&kept, p);
+    let h_src: Vec<(String, Vec<usize>)> = sources
+        .iter()
+        .map(|c| (c.name.clone(), sig::hits(c, &paired(c), &kept)))
+        .collect();
+    let m = signature.m;
+    let count = |h: &[usize]| h.iter().filter(|&&x| x >= m).count();
+    let (ref_k, ref_n) = h_src
+        .iter()
+        .fold((0, 0), |a, h| (a.0 + count(&h.1), a.1 + h.1.len()));
+    // lot A as a whole: candidates and every other part of the population
+    let h_pop = sig::hits(
+        &Pop {
+            name: String::new(),
+            ds: &ds,
+            rows: pop.clone(),
+        },
+        &in_a,
+        &kept,
+    );
+    let (a_k, a_n) = (count(&h_pop), h_pop.len());
+
+    // screening
+    let screen: Vec<Value> = screens
+        .iter()
+        .map(|p| {
+            let t = paired(p);
+            let h = sig::hits(p, &t, &kept);
+            let k = count(&h);
+            let rate = if h.is_empty() { f64::NAN } else { k as f64 / h.len() as f64 };
+            let p_ref = sig::fisher_greater(k, h.len(), ref_k, ref_n);
+            let rate_a = a_k as f64 / a_n.max(1) as f64;
+            let verdict = if kept.is_empty() {
+                "no signature"
+            } else if p_ref < 0.01 && rate >= 0.5 * rate_a {
+                "resembles lot A"
+            } else if p_ref < 0.01 {
+                "elevated"
+            } else {
+                "like the reference"
+            };
+            let per_rule: Vec<Value> = kept
+                .iter()
+                .zip(&t)
+                .map(|(r, t)| {
+                    let v = t.map(|t| p.ds.values_of(t, Some(&p.rows))).unwrap_or_default();
+                    json!({"key": r.key, "rate": n(sig::rate(&r.rule, &v)), "n": v.len()})
+                })
+                .collect();
+            let parts: Vec<Value> = p
+                .rows
+                .iter()
+                .zip(&h)
+                .filter(|(_, &c)| c >= m && m > 0 && !kept.is_empty())
+                .take(2000)
+                .map(|(&r, &c)| {
+                    let q = &p.ds.parts[r];
+                    let which: Vec<&str> = kept
+                        .iter()
+                        .zip(&t)
+                        .filter(|(rr, t)| t.map(|t| rr.rule.hit(p.ds.value(t, r))).unwrap_or(false))
+                        .map(|(rr, _)| rr.key.as_str())
+                        .collect();
+                    json!({"row": r, "part_id": q.part_id, "part_txt": q.part_txt, "wafer": p.ds.wafer_name(q), "x": q.x, "y": q.y,
+                        "site": q.site, "hbin": q.hbin, "n_rules": c, "rules": which.join(", ")})
+                })
+                .collect();
+            json!({"name": p.name, "n": h.len(), "hits": k, "rate": n(rate), "p_ref": n(p_ref), "verdict": verdict,
+                "per_rule": per_rule, "parts": parts})
+        })
+        .collect();
+
+    // histograms of the leading rules over every population, with the cut
+    let range = viz::RangeMode::parse(&pp.str("range"));
+    let top_charts = pp.usize("top_charts", 8);
+    let figures: Vec<Value> = rows
+        .iter()
+        .enumerate()
+        .filter(|(i, r)| *i < top_charts || r.verdict == "keep" || r.verdict == "caution")
+        .take(30)
+        .filter_map(|(_, r)| {
+            let t = ds.find_test(&r.key)?;
+            let mut g = vec![
+                (normal.name.clone(), ds.values_of(t, Some(&normal.rows))),
+                ("bad candidates".to_string(), ds.values_of(t, Some(&cand.rows))),
+            ];
+            // each population once (a clean lot may also be screened)
+            for p in sources.iter().chain(&screens) {
+                if g.len() >= 6 || g.iter().any(|x| x.0 == p.name) {
+                    continue;
+                }
+                if let Some(t2) = pair_test(&ds, p.ds, t, &by) {
+                    g.push((p.name.clone(), p.ds.values_of(t2, Some(&p.rows))));
+                }
+            }
+            let mut f = viz::histogram_r(&ds.tests[t], &g, None, true, range);
+            let cut = |x: f64| json!({"type": "line", "xref": "x", "yref": "paper", "x0": x, "x1": x, "y0": 0, "y1": 1, "line": {"color": "@warn", "width": 2, "dash": "dot"}});
+            if let Some(sh) = f["layout"]["shapes"].as_array_mut() {
+                sh.push(cut(r.rule.a));
+                if r.rule.kind == sig::Kind::Outside {
+                    sh.push(cut(r.rule.b));
+                }
+            }
+            f["layout"]["title"]["text"] = json!(format!("{} · rule {} · {}", ds.tests[t].label(), r.text, r.verdict));
+            Some(json!({"key": r.key, "figure": f}))
+        })
+        .collect();
+
+    Ok(json!({
+        "name": name, "n_cand": cand.rows.len(), "n_normal": normal.rows.len(), "normal": normal.name,
+        "n_confirmed": conf_rows.len(), "confirmed": conf_name, "notes": notes,
+        "sources": sources.iter().zip(&kinds).map(|(c, k)| json!({"name": c.name, "n": c.rows.len(), "kind": k})).collect::<Vec<_>>(),
+        "n_pool": sources.iter().map(|c| c.rows.len()).sum::<usize>(),
+        "rows": rows, "signature": signature,
+        "rate_a": n(a_k as f64 / a_n.max(1) as f64), "rate_ref": n(ref_k as f64 / ref_n.max(1) as f64),
+        "screen": screen, "figures": figures,
     }))
 }

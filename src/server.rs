@@ -211,7 +211,15 @@ pub async fn run(reg: Arc<Registry>, listener: tokio::net::TcpListener) -> Resul
 }
 
 pub async fn serve(reg: Arc<Registry>, host: &str, port: u16, open: bool) -> Result<()> {
-    let listener = tokio::net::TcpListener::bind((host, port)).await?;
+    let listener = match tokio::net::TcpListener::bind((host, port)).await {
+        Ok(l) => l,
+        // another dashboard already has the port: take any free one
+        Err(e) if port != 0 && e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("port {port} is in use, picking a free one");
+            tokio::net::TcpListener::bind((host, 0)).await?
+        }
+        Err(e) => return Err(e.into()),
+    };
     let addr = listener.local_addr()?;
     let url = format!(
         "http://{}:{}/",

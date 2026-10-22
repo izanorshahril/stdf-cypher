@@ -8,6 +8,34 @@ pub mod matching;
 use indexmap::IndexMap;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// Test number holding the loadboard (DIB) ID, read by the `loadboard` field.
+static LOADBOARD_TEST: AtomicU32 = AtomicU32::new(5100);
+
+pub fn loadboard_test() -> u32 {
+    LOADBOARD_TEST.load(Ordering::Relaxed)
+}
+
+pub fn set_loadboard_test(num: u32) {
+    LOADBOARD_TEST.store(num, Ordering::Relaxed);
+}
+
+/// A test read as a file-level attribute (e.g. the loadboard ID): its most
+/// common value in one source file.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FileValue {
+    pub value: Option<f64>,
+    /// distinct values seen in the file (more than 1 = it changed mid-file)
+    pub distinct: usize,
+    /// parts of the file without a value
+    pub missing: usize,
+}
+
+/// Per-test cache of [`FileValue`]s, filled on first use.
+#[derive(Debug, Clone, Default)]
+pub struct FileValueCache(Arc<Mutex<HashMap<u32, Arc<Vec<FileValue>>>>>);
 
 pub use filter::Filter;
 pub use loader::{load, load_many, LoadOptions};
@@ -136,6 +164,8 @@ pub struct Dataset {
     pub wafers: Vec<String>,
     pub hbins: IndexMap<u16, BinDef>,
     pub sbins: IndexMap<u16, BinDef>,
+    #[serde(skip)]
+    pub file_vals: FileValueCache,
 }
 
 /// A value of a part attribute, used by filters and grouping.
@@ -185,6 +215,8 @@ pub const PART_FIELDS: &[&str] = &[
     "alarm",
     "first_fail",
     "n_fails",
+    "loadboard",
+    "site_loadboard",
 ];
 
 impl Dataset {
@@ -327,8 +359,77 @@ impl Dataset {
                 .map(|f| FieldValue::Num(self.tests[f as usize].num as f64))
                 .unwrap_or(FieldValue::Missing),
             "n_fails" => FieldValue::Num(p.fails.len() as f64),
-            _ => FieldValue::Missing,
+            "loadboard" | "lb" | "dib" => self
+                .file_value(row, loadboard_test())
+                .map(FieldValue::Num)
+                .unwrap_or(FieldValue::Missing),
+            "site_loadboard" => match self.file_value(row, loadboard_test()) {
+                Some(b) => FieldValue::Str(format!(
+                    "site {} / LB {}",
+                    p.site,
+                    FieldValue::Num(b).as_group_key()
+                )),
+                None => FieldValue::Missing,
+            },
+            // any test as a factor: `test:5100`
+            f => match f
+                .strip_prefix("test:")
+                .and_then(|n| n.trim().parse::<u32>().ok())
+            {
+                Some(num) => self
+                    .tests
+                    .iter()
+                    .position(|t| t.num == num)
+                    .map(|t| self.value(t, row))
+                    .filter(|v| v.is_finite())
+                    .map(FieldValue::Num)
+                    .unwrap_or(FieldValue::Missing),
+                None => FieldValue::Missing,
+            },
         }
+    }
+
+    /// Test `num` read as a file-level attribute: its most common value in
+    /// each source file (parts without a value take it too), cached.
+    pub fn file_values(&self, num: u32) -> Arc<Vec<FileValue>> {
+        if let Some(v) = self.file_vals.0.lock().unwrap().get(&num) {
+            return v.clone();
+        }
+        let mut counts: Vec<IndexMap<String, (usize, f64)>> =
+            vec![IndexMap::new(); self.sources.len().max(1)];
+        let mut missing = vec![0usize; counts.len()];
+        let t = self.tests.iter().position(|t| t.num == num);
+        for (r, p) in self.parts.iter().enumerate() {
+            let f = (p.file as usize).min(counts.len() - 1);
+            match t.map(|t| self.value(t, r)).filter(|v| v.is_finite()) {
+                Some(v) => {
+                    let e = counts[f]
+                        .entry(FieldValue::Num(v).as_group_key())
+                        .or_insert((0, v));
+                    e.0 += 1;
+                }
+                None => missing[f] += 1,
+            }
+        }
+        let out: Arc<Vec<FileValue>> = Arc::new(
+            counts
+                .iter()
+                .zip(missing)
+                .map(|(c, missing)| FileValue {
+                    value: c.values().max_by_key(|e| e.0).map(|e| e.1),
+                    distinct: c.len(),
+                    missing,
+                })
+                .collect(),
+        );
+        self.file_vals.0.lock().unwrap().insert(num, out.clone());
+        out
+    }
+
+    /// The file-level value of test `num` for the file of `row`.
+    pub fn file_value(&self, row: usize, num: u32) -> Option<f64> {
+        let f = self.parts[row].file as usize;
+        self.file_values(num).get(f).and_then(|v| v.value)
     }
 
     /// Group rows by a part field (or the special "all"). Groups are sorted
@@ -387,6 +488,7 @@ impl Dataset {
             wafers: self.wafers.clone(),
             hbins: self.hbins.clone(),
             sbins: self.sbins.clone(),
+            file_vals: Default::default(),
         };
         d.recount_tests();
         d
@@ -517,4 +619,119 @@ pub fn short_name(path: &str) -> String {
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string())
+}
+
+/// Paths to open: files as given, folders searched (with subfolders) for
+/// files that read as STDF (plain or gzip; other files are skipped and
+/// counted). Duplicates are dropped, first one kept.
+pub fn expand_paths(paths: &[String]) -> (Vec<String>, usize) {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>, skipped: &mut usize, depth: usize) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        entries.sort();
+        for p in entries {
+            if p.is_dir() {
+                if depth < 8 {
+                    walk(&p, out, skipped, depth + 1);
+                }
+            } else if crate::stdf::StdfReader::open(&p).is_ok() {
+                out.push(p.to_string_lossy().to_string());
+            } else {
+                *skipped += 1;
+            }
+        }
+    }
+    let (mut out, mut skipped) = (vec![], 0);
+    for p in paths {
+        let pb = std::path::Path::new(p);
+        if pb.is_dir() {
+            // canonical, so the same file always gets the same path (recent list)
+            let c = std::fs::canonicalize(pb).unwrap_or_else(|_| pb.to_path_buf());
+            let c = c.to_string_lossy();
+            walk(
+                std::path::Path::new(c.strip_prefix(r"\\?\").unwrap_or(&c)),
+                &mut out,
+                &mut skipped,
+                0,
+            );
+        } else {
+            out.push(p.clone());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|p| seen.insert(p.clone()));
+    (out, skipped)
+}
+
+/// Order for opened files: `time` = test start time (MIR START_T, else the
+/// file's modified time), `name` = file name (natural: run2 before run10);
+/// anything else keeps the given order.
+pub fn sort_opened<T>(
+    items: &mut [T],
+    how: &str,
+    path: impl Fn(&T) -> &str,
+    start_t: impl Fn(&T) -> Option<u32>,
+) {
+    let mtime = |p: &str| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    match how {
+        "time" => items.sort_by_cached_key(|x| {
+            (
+                start_t(x)
+                    .filter(|&t| t > 0)
+                    .map(u64::from)
+                    .unwrap_or_else(|| mtime(path(x))),
+                natural_key(&short_name(path(x))),
+            )
+        }),
+        "name" => items.sort_by_cached_key(|x| natural_key(&short_name(path(x)))),
+        _ => {}
+    }
+}
+
+/// Sort key that compares digit runs by value ("run2" < "run10"), ignoring case.
+fn natural_key(s: &str) -> Vec<(u8, u64, String)> {
+    let mut out = vec![];
+    let mut cur = String::new();
+    let mut digits = false;
+    let push = |out: &mut Vec<(u8, u64, String)>, cur: &mut String, digits: bool| {
+        if !cur.is_empty() {
+            out.push(if digits {
+                (0, cur.parse().unwrap_or(u64::MAX), String::new())
+            } else {
+                (1, 0, cur.to_lowercase())
+            });
+            cur.clear();
+        }
+    };
+    for c in s.chars() {
+        if c.is_ascii_digit() != digits {
+            push(&mut out, &mut cur, digits);
+            digits = c.is_ascii_digit();
+        }
+        cur.push(c);
+    }
+    push(&mut out, &mut cur, digits);
+    out
+}
+
+#[cfg(test)]
+mod open_tests {
+    #[test]
+    fn natural_name_order() {
+        let mut v = vec!["run10.stdf", "Run2.stdf", "run1.stdf"];
+        super::sort_opened(&mut v, "name", |x| x, |_| None);
+        assert_eq!(v, ["run1.stdf", "Run2.stdf", "run10.stdf"]);
+        let mut v = vec![("b", 20u32), ("a", 30), ("c", 10)];
+        super::sort_opened(&mut v, "time", |x| x.0, |x| Some(x.1));
+        assert_eq!(v.iter().map(|x| x.0).collect::<String>(), "cba");
+    }
 }

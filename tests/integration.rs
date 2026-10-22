@@ -424,8 +424,12 @@ fn desktop_ops() {
         1,
         "bad file reported, not fatal"
     );
+    // the recent list is shared on disk and capped at 15: tests running in
+    // parallel push to it too, so only check that it is kept
     let recent = api::run(&reg, "recent", &json!({})).unwrap();
-    assert_eq!(recent.as_array().unwrap().len(), 3);
+    let recent = recent.as_array().unwrap();
+    assert!(!recent.is_empty() && recent.len() <= 15);
+    assert!(recent.iter().all(|r| r["path"].is_string()));
     // close a dataset: ids of the others stay valid
     api::run(&reg, "remove", &json!({"ds": 1})).unwrap();
     let ds = api::run(&reg, "datasets", &json!({})).unwrap();
@@ -803,4 +807,808 @@ fn bad_candidates_profile_without_splitting() {
         .collect();
     assert_eq!(names.len(), 2);
     assert!(names[1].starts_with("$bad_candidate"), "{names:?}");
+}
+
+#[test]
+fn signature_learned_in_one_lot_checked_against_a_clean_lot() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let a1 = gen(d.path(), "a1.stdf", SampleSpec::default());
+    let a2 = gen(
+        d.path(),
+        "a2.stdf",
+        SampleSpec {
+            meas_noise: 0.3,
+            ..SampleSpec::default()
+        },
+    );
+    let b = gen(
+        d.path(),
+        "b.stdf",
+        SampleSpec {
+            lot_id: "LOTB".into(),
+            seed: 7,
+            ..SampleSpec::default()
+        },
+    );
+    let reg = api::Registry::app();
+    let paths: Vec<String> = [&a1, &a2, &b]
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    api::run(&reg, "load", &json!({ "paths": paths })).unwrap();
+    api::run(&reg, "match", &json!({"a": 0, "b": 1, "key_a": "part_txt", "filter_a": "hbin = 1", "filter_b": "not pass", "name": "bad_candidate"})).unwrap();
+
+    let s = api::run(&reg, "signature", &json!({"a": 0, "name": "bad_candidate", "filter": "hbin = 1", "exclude": "500, 80100-80104",
+        "clean": [{"ds": 2, "filter": "hbin = 1"}], "screen": [{"ds": 2, "filter": "hbin = 1"}, {"ds": 0, "filter": "hbin = 1"}]})).unwrap();
+    let rows = s["rows"].as_array().unwrap();
+    assert!(rows.len() > 30);
+    let verdicts = ["keep", "caution", "drop", "untested", "weak", "no data"];
+    for r in rows {
+        assert!(verdicts.contains(&r["verdict"].as_str().unwrap()), "{r}");
+        let num = r["num"].as_u64().unwrap();
+        assert!(num != 500 && !(80100..=80104).contains(&num));
+        // the rule is valid filter syntax that selects what it claims to
+        let f = format!(
+            "hbin = 1 and $bad_candidate and {}",
+            r["filter"].as_str().unwrap()
+        );
+        let hits = reg.rows(0, &reg.get(0).unwrap().0, &f).unwrap().len() as f64;
+        let n = s["n_cand"].as_f64().unwrap();
+        assert!(
+            (hits / n - r["capture"].as_f64().unwrap()).abs() < 1e-9,
+            "{f}"
+        );
+    }
+    // the same process in another lot: most per-test rules are not specific
+    let dropped = rows.iter().filter(|r| r["verdict"] == "drop").count();
+    assert!(dropped * 2 > rows.len(), "{dropped} of {}", rows.len());
+    // screening the clean lot itself is never worse than the clean lot
+    let scr = s["screen"].as_array().unwrap();
+    assert_eq!(scr.len(), 2);
+    if !s["signature"]["rules"].as_array().unwrap().is_empty() {
+        assert_eq!(scr[0]["verdict"], "like the reference");
+    }
+    assert!(api::run(
+        &reg,
+        "signature",
+        &json!({"a": 0, "name": "nope", "clean": [{"ds": 2}]})
+    )
+    .is_err());
+}
+
+#[test]
+fn candidate_range_marginal_confirmed_good_and_score_methods() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let a1 = gen(d.path(), "a1.stdf", SampleSpec::default());
+    let a2 = gen(
+        d.path(),
+        "a2.stdf",
+        SampleSpec {
+            meas_noise: 0.3,
+            ..SampleSpec::default()
+        },
+    );
+    let b = gen(
+        d.path(),
+        "b.stdf",
+        SampleSpec {
+            lot_id: "LOTB".into(),
+            seed: 7,
+            ..SampleSpec::default()
+        },
+    );
+    let reg = api::Registry::app();
+    let paths: Vec<String> = [&a1, &a2, &b]
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    api::run(&reg, "load", &json!({ "paths": paths })).unwrap();
+    let (da, db) = (reg.get(0).unwrap().0, reg.get(1).unwrap().0);
+
+    // the test most of file 2's fails fail, and a cut through its failing values
+    let bad_b = reg.rows(1, &db, "not pass").unwrap();
+    let mut counts = std::collections::HashMap::new();
+    for &r in &bad_b {
+        for &t in &db.parts[r].fails {
+            *counts.entry(t as usize).or_insert(0usize) += 1;
+        }
+    }
+    let t = *counts.iter().max_by_key(|c| *c.1).unwrap().0;
+    let num = db.tests[t].num;
+    let mut v: Vec<f64> = bad_b
+        .iter()
+        .map(|&r| db.value(t, r))
+        .filter(|x| x.is_finite())
+        .collect();
+    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    // halfway between two distinct values, so rounding cannot move a part across
+    let i = v.len() / 2;
+    let j = (i..v.len()).find(|&j| v[j] > v[i]).unwrap();
+    let cut = (v[i] + v[j]) / 2.0;
+    let sets = |include: bool| {
+        api::run(&reg, "candidate_sets", &json!({"a": 0, "b": 1, "key_a": "part_txt", "filter_a": "hbin = 1",
+            "filter_b": format!("not pass and fail({num})"), "test": num.to_string(), "range": format!("{cut}.."),
+            "include_marginal": include})).unwrap()
+    };
+    let cs = sets(false);
+    let (nc, nm, nconf) = (
+        cs["n_cand"].as_u64().unwrap() as usize,
+        cs["n_marginal"].as_u64().unwrap() as usize,
+        cs["n_confirmed"].as_u64().unwrap() as usize,
+    );
+    assert!(nc >= 5 && nm > 0, "{nc} candidates, {nm} marginal");
+    assert_eq!(nc + nm, cs["matched"].as_u64().unwrap() as usize);
+    // the range is on the file-2 value
+    assert!(cs["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["b_value"].as_f64().unwrap() >= cut));
+    assert!(cs["marginal_rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["b_value"].as_f64().is_none_or(|v| v < cut)));
+    let count = |f: &str| reg.rows(0, &da, f).unwrap().len();
+    assert_eq!(count("$bad_candidate"), nc);
+    assert_eq!(count("$marginal"), nm);
+    assert_eq!(count("$bad_candidate and $marginal"), 0);
+    // confirmed good: good in file 1, passing in file 2, never a candidate
+    assert!(nconf > 30);
+    assert_eq!(count("$confirmed_good"), nconf);
+    assert_eq!(count("$confirmed_good and not (hbin = 1)"), 0);
+    assert_eq!(
+        count("$confirmed_good and ($bad_candidate or $marginal)"),
+        0
+    );
+    assert_eq!(
+        reg.rows(1, &db, "$confirmed_good and not pass")
+            .unwrap()
+            .len(),
+        0
+    );
+    // marginal fails as candidates
+    let inc = sets(true);
+    assert_eq!(inc["n_cand"].as_u64().unwrap() as usize, nc + nm);
+    assert_eq!(count("$bad_candidate and $marginal"), nm);
+    sets(false);
+    // SI suffixes on the failing test's units: the same cut, written in milli-units
+    let (scale, _) = stdf_cypher::analysis::candidates::unit_scale(&db.tests[t].units);
+    let si = api::run(&reg, "candidate_sets", &json!({"a": 0, "b": 1, "filter_a": "hbin = 1", "filter_b": format!("not pass and fail({num})"),
+        "test": num.to_string(), "range": format!("{}m..", cut * scale * 1000.0), "name": "si_check", "marginal": "si_marg", "confirmed": "si_conf"})).unwrap();
+    assert_eq!(si["n_cand"].as_u64().unwrap() as usize, nc);
+    assert!(
+        api::run(
+            &reg,
+            "candidate_sets",
+            &json!({"a": 0, "b": 1, "filter_a": "hbin = 1", "range": "1..2", "name": "x"})
+        )
+        .is_err(),
+        "a range needs the test"
+    );
+
+    // signature without a clean lot: learned against $confirmed_good, marginal parts out
+    let sig = |extra: serde_json::Value| {
+        let mut p = json!({"a": 0, "name": "bad_candidate", "filter": "hbin = 1", "exclude": "500, 80100-80104", "exclude_set": "marginal"});
+        p.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        api::run(&reg, "signature", &p)
+    };
+    let s = sig(json!({})).unwrap();
+    assert_eq!(s["normal"], "confirmed good");
+    assert_eq!(s["n_normal"].as_u64().unwrap() as usize, nconf);
+    assert_eq!(s["n_cand"].as_u64().unwrap() as usize, nc);
+    assert_eq!(s["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(s["sources"][0]["kind"], "confirmed");
+    let notes = s["notes"].to_string();
+    assert!(
+        notes.contains("$marginal") && notes.contains("in-sample"),
+        "{notes}"
+    );
+    // fewer confirmed good than asked for: back to all other good parts, with a note
+    let s = sig(json!({"min_confirmed": nconf + 1})).unwrap();
+    assert_eq!(s["normal"], "lot A normal");
+    assert!(s["notes"].to_string().contains("fewer than"));
+
+    // both sources: per-source rates, verdicts on the pooled reference
+    let s = sig(json!({"clean": [{"ds": 2, "filter": "hbin = 1"}], "screen": [{"ds": 2, "filter": "hbin = 1"}]})).unwrap();
+    assert_eq!(s["normal"], "lot A normal");
+    let kinds: Vec<&str> = s["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["clean", "confirmed"]);
+    let rows = s["rows"].as_array().unwrap();
+    assert!(rows.len() > 30);
+    for r in rows.iter().filter(|r| r["pool"].is_object()) {
+        let src = r["sources"].as_array().unwrap();
+        let sum = |k: &str| src.iter().map(|x| x[k].as_u64().unwrap()).sum::<u64>();
+        assert_eq!(r["pool"]["n"].as_u64().unwrap(), sum("n"));
+        assert_eq!(r["pool"]["hits"].as_u64().unwrap(), sum("hits"));
+        assert_eq!(r["fa_ref"], r["pool"]["rate"]);
+    }
+    let src = s["signature"]["sources"].as_array().unwrap();
+    assert_eq!(src.len(), 2);
+    // any one source can drop a rule, and says so
+    for r in rows {
+        let drop = r["verdict"] == "drop";
+        assert_eq!(drop, r["drop_by"].is_string(), "{}", r["key"]);
+        if !drop {
+            let cap = r["capture"].as_f64().unwrap();
+            for x in r["sources"].as_array().unwrap() {
+                assert!(
+                    x["rate"].as_f64().unwrap() < 0.5 * cap,
+                    "{} {}",
+                    r["key"],
+                    x["lot"]
+                );
+            }
+        }
+    }
+    // the greedy signature is never worse than its best single rule
+    let usable: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|r| r["verdict"] == "keep" || r["verdict"] == "caution")
+        .collect();
+    let sg = &s["signature"];
+    assert_eq!(sg["considered"].as_u64().unwrap() as usize, usable.len());
+    assert_eq!(
+        sg["steps"].as_array().unwrap().len(),
+        sg["rules"].as_array().unwrap().len()
+    );
+    if let Some(best) = usable
+        .iter()
+        .map(|r| r["score"].as_f64().unwrap())
+        .reduce(f64::max)
+    {
+        assert!(sg["score"].as_f64().unwrap() >= best - 1e-9);
+        assert_eq!(
+            sg["steps"][0]["key"],
+            usable
+                .iter()
+                .max_by(|a, b| a["score"]
+                    .as_f64()
+                    .partial_cmp(&b["score"].as_f64())
+                    .unwrap())
+                .unwrap()["key"]
+        );
+    }
+    let s =
+        sig(json!({"clean": [{"ds": 2, "filter": "hbin = 1"}], "use_confirmed": false})).unwrap();
+    assert_eq!(s["sources"].as_array().unwrap().len(), 1);
+    assert!(
+        sig(json!({"clean": [{"ds": 2}], "use_clean": false, "use_confirmed": false})).is_err()
+    );
+    // stayed good on retest: good in run 1, passing again on the retest
+    let s = sig(json!({"use_confirmed": false, "stayed": [{"a": 0, "b": 1}]})).unwrap();
+    assert_eq!(s["sources"][0]["kind"], "stayed_good");
+    assert_eq!(s["sources"][0]["n"].as_u64().unwrap() as usize, nconf);
+    assert_eq!(
+        s["normal"], "lot A normal",
+        "an independent source: no confirmed-good learning"
+    );
+    assert!(sig(json!({"use_confirmed": false, "stayed": [{"a": 0, "b": 0}]})).is_err());
+
+    // score methods: the score is the largest ticked sub-score
+    let mk = |methods: serde_json::Value| {
+        api::run(&reg, "markers", &json!({"mode": "group", "a": 0, "select": "$bad_candidate", "vs": "", "filter": "hbin = 1 and not $marginal",
+            "later": 1, "key_a": "part_txt", "exclude": "500, 80100-80104", "trees": 30, "methods": methods})).unwrap()
+    };
+    let all = mk(serde_json::Value::Null);
+    let rows = all["rows"].as_array().unwrap();
+    assert_eq!(all["n_aff"].as_u64().unwrap() as usize, nc);
+    assert!(
+        rows.iter()
+            .all(|r| r["subs"]["ANOVA"].is_number() && r["why"] != "ANOVA"),
+        "ANOVA is off by default"
+    );
+    let tails = mk(json!(["tails"]));
+    for r in tails["rows"].as_array().unwrap() {
+        assert_eq!(r["why"], "tails");
+        assert_eq!(r["score"], r["subs"]["tails"]);
+    }
+    let two = mk(json!("ANOVA, separation"));
+    for r in two["rows"].as_array().unwrap() {
+        let (x, y) = (
+            r["subs"]["ANOVA"].as_f64().unwrap(),
+            r["subs"]["separation"].as_f64().unwrap(),
+        );
+        assert_eq!(r["score"].as_f64().unwrap(), x.max(y));
+    }
+    assert!(api::run(
+        &reg,
+        "markers",
+        &json!({"mode": "group", "a": 0, "select": "$bad_candidate", "methods": ["magic"]})
+    )
+    .is_err());
+
+    // file 2 logged in base units with RES_SCAL (12 uA stored as 1.2e-5 A):
+    // plain numbers follow the display unit, so the same range gives the same parts
+    let a2b = gen(
+        d.path(),
+        "a2b.stdf",
+        SampleSpec {
+            meas_noise: 0.3,
+            base_units: true,
+            ..SampleSpec::default()
+        },
+    );
+    api::run(&reg, "load", &json!({ "paths": [a2b.to_string_lossy()] })).unwrap();
+    let d3 = reg.get(3).unwrap().0;
+    let prefixed = |u: &str| stdf_cypher::analysis::candidates::unit_scale(u).0 != 1.0;
+    let tp = (0..db.n_tests())
+        .filter(|&t| prefixed(&db.tests[t].units))
+        .max_by_key(|&t| {
+            bad_b
+                .iter()
+                .filter(|&&r| db.parts[r].fails.contains(&(t as u32)))
+                .count()
+        })
+        .unwrap();
+    let (num, units) = (db.tests[tp].num, db.tests[tp].units.clone());
+    let t3 = d3.find_test(&num.to_string()).unwrap();
+    assert_ne!(d3.tests[t3].units, units, "stored in the base unit");
+    assert_ne!(d3.tests[t3].res_scal, 0);
+    let tl = api::run(&reg, "tests", &json!({"ds": 3})).unwrap();
+    let info = tl
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["num"] == num)
+        .unwrap()
+        .clone();
+    assert_eq!(info["disp_units"], units.as_str(), "{info}");
+    let mut v: Vec<f64> = bad_b
+        .iter()
+        .filter(|&&r| db.parts[r].fails.contains(&(tp as u32)))
+        .map(|&r| db.value(tp, r))
+        .collect();
+    v.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    assert!(v.len() >= 4, "{} fails on test {num}", v.len());
+    {
+        let i = v.len() / 2;
+        let j = (i..v.len()).find(|&j| v[j] > v[i]).unwrap_or(i);
+        let cut = (v[i] + v[j.max(i)]) / 2.0;
+        let run = |b: usize, name: &str| {
+            api::run(&reg, "candidate_sets", &json!({"a": 0, "b": b, "filter_a": "hbin = 1", "filter_b": format!("not pass and fail({num})"),
+                "test": num.to_string(), "range": format!("{cut}.."), "name": name, "marginal": format!("{name}_m"), "confirmed": format!("{name}_c")})).unwrap()
+        };
+        let (shown, based) = (run(1, "rs_shown"), run(3, "rs_based"));
+        assert_eq!(based["range"]["units"], units.as_str());
+        assert_eq!(shown["n_cand"], based["n_cand"], "{shown:?} vs {based:?}");
+        assert_eq!(shown["n_marginal"], based["n_marginal"]);
+    }
+}
+
+#[test]
+fn retest_trace_follows_rejects_through_runs() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    // run 1, and two further measurements of the same parts with fresh noise
+    let r1 = gen(d.path(), "r1.stdf", SampleSpec::default());
+    let full = |name: &str, seed: u64| {
+        gen(
+            d.path(),
+            name,
+            SampleSpec {
+                meas_noise: 0.3,
+                meas_seed: seed,
+                ..SampleSpec::default()
+            },
+        )
+    };
+    let (f2, f3) = (full("f2.stdf", 1), full("f3.stdf", 2));
+    let reg = api::Registry::app();
+    let load = |p: &Path| {
+        api::run(&reg, "load", &json!({ "paths": [p.to_string_lossy()] })).unwrap();
+    };
+    for p in [&r1, &f2, &f3] {
+        load(p);
+    }
+    // run 2 = the rejects of run 1, retested; run 3 = the rejects of run 2
+    let retest = |from: usize, full: usize, name: &str| -> PathBuf {
+        api::run(
+            &reg,
+            "match",
+            &json!({"a": from, "b": full, "filter_a": "not pass", "name": name}),
+        )
+        .unwrap();
+        let out = d.path().join(format!("{name}.stdf"));
+        api::run(
+            &reg,
+            "export_stdf",
+            &json!({"ds": full, "filter": format!("${name}"), "path": out.to_string_lossy()}),
+        )
+        .unwrap();
+        out
+    };
+    let r2 = retest(0, 1, "rej1");
+    load(&r2);
+    let r3 = retest(3, 2, "rej2");
+    load(&r3);
+    let (d1, d2) = (reg.get(0).unwrap().0, reg.get(3).unwrap().0);
+    let n_rej = reg.rows(0, &d1, "not pass").unwrap().len();
+    assert_eq!(d2.n_parts(), n_rej, "run 2 holds exactly run 1's rejects");
+
+    let t = api::run(
+        &reg,
+        "retest_trace",
+        &json!({"runs": [0, 3, 4], "exclude": "500, 80100-80104"}),
+    )
+    .unwrap();
+    let s = t["summary"].as_array().unwrap();
+    let u = |v: &serde_json::Value, k: &str| v[k].as_u64().unwrap() as usize;
+    assert_eq!(u(&t, "n_parts"), n_rej);
+    assert_eq!((u(&s[0], "due"), u(&s[0], "fail")), (n_rej, n_rej));
+    // every reject is retested in run 2; run 2's fails in run 3
+    assert_eq!(u(&s[1], "due"), n_rej);
+    assert_eq!(u(&s[1], "retested"), n_rej);
+    assert_eq!(u(&s[1], "pass") + u(&s[1], "fail"), n_rej);
+    assert_eq!(
+        u(&s[1], "fail_test") + u(&s[1], "fail_other"),
+        u(&s[1], "fail")
+    );
+    assert_eq!(u(&s[2], "due"), u(&s[1], "fail"));
+    assert_eq!(u(&s[2], "retested"), u(&s[2], "due"));
+    let o = &t["outcomes"];
+    assert!(u(o, "recovered") > 0 && u(o, "still_bad") > 0, "{o}");
+    assert_eq!(u(o, "recovered"), u(&s[1], "pass") + u(&s[2], "pass"));
+    assert_eq!(u(o, "still_bad"), u(&s[2], "fail"));
+    assert_eq!(u(o, "not_retested"), 0);
+    assert_eq!(u(&s[2], "cum_recovered"), u(o, "recovered"));
+    // flows out of run 1's fails add up
+    let from1: usize = t["flows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["run"] == 0)
+        .map(|f| u(f, "n"))
+        .sum();
+    assert_eq!(from1, n_rej);
+    // the traced test is the most common first fail, and the values are the runs' own
+    let key = t["tests"][0]["key"].as_str().unwrap();
+    let tt = d1.find_test(key).unwrap();
+    let t2 = d2.find_test(key).unwrap();
+    for p in t["parts"].as_array().unwrap().iter().take(50) {
+        let r = &p["runs"];
+        let v1 = r[0]["values"][0].as_f64();
+        assert_eq!(
+            v1,
+            Some(d1.value(tt, u(&r[0], "row")) as f64).filter(|v| v.is_finite())
+        );
+        if let Some(row2) = r[1]["row"].as_u64() {
+            assert_eq!(
+                r[1]["values"][0].as_f64(),
+                Some(d2.value(t2, row2 as usize)).filter(|v| v.is_finite())
+            );
+            assert_eq!(
+                d2.parts[row2 as usize].part_txt,
+                d1.parts[u(&r[0], "row")].part_txt
+            );
+        }
+        if p["outcome"] == "recovered" {
+            let k = p["recovered_in"].as_u64().unwrap() as usize;
+            assert_eq!(r[k]["status"], "pass");
+        }
+    }
+    // part sets in run 1
+    assert_eq!(
+        reg.rows(0, &d1, "$retest_recovered").unwrap().len(),
+        u(o, "recovered")
+    );
+    assert_eq!(
+        reg.rows(0, &d1, "$retest_still_bad").unwrap().len(),
+        u(o, "still_bad")
+    );
+    // run 3 left out: run 2's fails were never retested
+    let t = api::run(&reg, "retest_trace", &json!({"runs": [0, 3]})).unwrap();
+    assert_eq!(u(&t["outcomes"], "still_bad"), u(&s[1], "fail"));
+    // straight from run 1 to run 3: only run 2's rejects were retested there
+    let t = api::run(&reg, "retest_trace", &json!({"runs": [0, 4], "tests": key})).unwrap();
+    let n3 = reg.get(4).unwrap().0.n_parts();
+    assert_eq!(n3, u(&s[1], "fail"));
+    assert_eq!(u(&t["outcomes"], "not_retested"), n_rej - n3);
+    assert!(api::run(&reg, "retest_trace", &json!({"runs": [0]})).is_err());
+    assert!(api::run(&reg, "retest_trace", &json!({"runs": [0, 0]})).is_err());
+}
+
+#[test]
+fn recovery_zones_and_loadboard_on_a_planted_retest_chain() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let band = |seed: u64, noise: f64, board: f64, missing: f64| SampleSpec {
+        meas_noise: noise,
+        meas_seed: seed,
+        band_tests: vec![1050],
+        loadboard: Some(board),
+        loadboard_missing: missing,
+        ..SampleSpec::default()
+    };
+    let r1 = gen(d.path(), "r1.stdf", band(0, 0.0, 1.0, 0.3));
+    let f2 = gen(d.path(), "f2.stdf", band(1, 0.3, 2.0, 0.0));
+    let f3 = gen(d.path(), "f3.stdf", band(2, 0.3, 1.0, 0.0));
+    let reg = api::Registry::app();
+    for p in [&r1, &f2, &f3] {
+        api::run(&reg, "load", &json!({ "paths": [p.to_string_lossy()] })).unwrap();
+    }
+    let retest = |from: usize, full: usize, name: &str| {
+        api::run(
+            &reg,
+            "match",
+            &json!({"a": from, "b": full, "filter_a": "not pass", "name": name}),
+        )
+        .unwrap();
+        let out = d.path().join(format!("{name}.stdf"));
+        api::run(
+            &reg,
+            "export_stdf",
+            &json!({"ds": full, "filter": format!("${name}"), "path": out.to_string_lossy()}),
+        )
+        .unwrap();
+        api::run(&reg, "load", &json!({ "paths": [out.to_string_lossy()] })).unwrap();
+    };
+    retest(0, 1, "rej1"); // dataset 3 = run 2
+    retest(3, 2, "rej2"); // dataset 4 = run 3
+
+    // loadboard: a file-level value, filled in for parts missing it
+    let d1 = reg.get(0).unwrap().0;
+    assert!(d1.parts.len() > 1000);
+    let missing = (0..d1.n_parts())
+        .filter(|&r| d1.field(r, "test:5100") == data::FieldValue::Missing)
+        .count();
+    assert!(
+        missing > 300 && missing < 600,
+        "{missing} parts without test 5100"
+    );
+    assert_eq!(
+        reg.rows(0, &d1, "loadboard = 1").unwrap().len(),
+        d1.n_parts()
+    );
+    assert_eq!(d1.file_values(5100)[0].missing, missing);
+    assert_eq!(d1.file_values(5100)[0].distinct, 1);
+    let t = api::run(
+        &reg,
+        "retest_trace",
+        &json!({"runs": [0, 3, 4], "filter": "fail(1050)", "tests": "1050"}),
+    )
+    .unwrap();
+    assert_eq!(t["runs"][0]["loadboard"], json!([1.0]));
+    assert_eq!(t["runs"][1]["loadboard"], json!([2.0]));
+    assert_eq!(
+        t["runs"][0]["loadboard_missing"].as_u64().unwrap() as usize,
+        missing
+    );
+    let boards: Vec<(u64, &str)> = t["by_board"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (b["run"].as_u64().unwrap(), b["board"].as_str().unwrap()))
+        .collect();
+    assert_eq!(boards, [(1, "2"), (2, "1")]);
+
+    // the planted bands: marginal and extreme mostly recover, the middle never
+    let ti = d1.find_test("1050").unwrap();
+    let (lo, hi) = (d1.tests[ti].lo.unwrap(), d1.tests[ti].hi.unwrap());
+    let w = hi - lo;
+    let rc = &t["recovery"][0];
+    let zones = rc["zones"].as_array().unwrap();
+    let kinds: Vec<&str> = zones.iter().map(|z| z["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["marginal", "hard_bad", "extreme"], "{zones:?}");
+    let z = |k: usize, f: &str| zones[k][f].as_f64().unwrap();
+    // the hard-bad zone covers every planted hard-bad part and little else
+    // (a marginal part that happened never to recover may sit at its edge)
+    let mid: Vec<f64> = rc["points"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["value"].as_f64().unwrap())
+        .filter(|v| *v > hi + 0.25 * w && *v < hi + 0.75 * w)
+        .collect();
+    let (mlo, mhi) = (
+        mid.iter().copied().fold(f64::INFINITY, f64::min),
+        mid.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    assert!(
+        z(1, "lo") <= mlo && z(1, "hi") >= mhi && z(1, "hi") < hi + 0.75 * w,
+        "{:?}",
+        zones[1]
+    );
+    assert!(
+        mid.len() as f64 >= 0.9 * z(1, "n"),
+        "{} of {}",
+        mid.len(),
+        z(1, "n")
+    );
+    assert_eq!(z(1, "recovered"), 0.0);
+    assert!(z(1, "n") >= 30.0 && z(1, "ci_hi") <= 0.10);
+    assert!(z(0, "hi") < hi + 0.15 * w && z(0, "recovered") / z(0, "n") > 0.6);
+    assert!(z(2, "lo") > hi + 2.0 * w && z(2, "recovered") / z(2, "n") > 0.6);
+    let n_pts = rc["points"].as_array().unwrap().len() as f64;
+    assert_eq!(z(0, "n") + z(1, "n") + z(2, "n"), n_pts);
+    // per-retest values: more points (a still-bad part counts at every retest)
+    let each = api::run(
+        &reg,
+        "retest_trace",
+        &json!({"runs": [0, 3, 4], "filter": "fail(1050)", "tests": "1050", "value_from": "each"}),
+    )
+    .unwrap();
+    assert!(each["recovery"][0]["points"].as_array().unwrap().len() as f64 > n_pts);
+
+    // a configurable loadboard test, and any test as a factor (merged lots)
+    api::run(
+        &reg,
+        "load",
+        &json!({"paths": [r1.to_string_lossy(), f2.to_string_lossy()], "merge": true}),
+    )
+    .unwrap();
+    let m = reg.get(5).unwrap().0;
+    let g = m.group_by(&m.all_rows(), "loadboard");
+    assert_eq!(
+        g.iter().map(|x| x.0.as_str()).collect::<Vec<_>>(),
+        ["1", "2"]
+    );
+    assert_eq!(g[0].1.len(), d1.n_parts());
+    let sl = m.group_by(&m.all_rows(), "site_loadboard");
+    assert_eq!(sl.len(), 8, "4 sites x 2 boards");
+    let an = api::run(&reg, "anova", &json!({"ds": 5, "factor": "loadboard"})).unwrap();
+    assert_eq!(an["groups"].as_array().unwrap().len(), 2);
+    let an = api::run(&reg, "anova", &json!({"ds": 5, "factor": "test:80100"})).unwrap();
+    assert_eq!(an["groups"].as_array().unwrap().len(), 3, "three wafers");
+    assert_eq!(
+        api::run(&reg, "loadboard", &json!({"test": 80100})).unwrap()["test"],
+        80100
+    );
+    assert_eq!(
+        reg.rows(5, &m, "loadboard = 1").unwrap().len(),
+        0,
+        "wafer 1..3, most common per file"
+    );
+    api::run(&reg, "loadboard", &json!({"test": 5100})).unwrap();
+}
+
+#[test]
+fn investigation_case_commonality_across_lots() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let spec = |lot: &str, seed: u64, ms: u64, band: bool, lb: f64| SampleSpec {
+        lot_id: lot.into(),
+        seed,
+        meas_noise: if ms > 0 { 0.3 } else { 0.0 },
+        meas_seed: ms,
+        band_tests: if band { vec![1050] } else { vec![] },
+        loadboard: Some(lb),
+        ..SampleSpec::default()
+    };
+    // lots A and C: run 1, a 100% retest where some good parts fail 1050,
+    // and retests of those rejects; lot B: clean, on another loadboard
+    let files = [
+        ("a1", spec("LOTA", 1, 0, false, 2.0)),
+        ("a2", spec("LOTA", 1, 1, true, 2.0)),
+        ("b1", spec("LOTB", 7, 0, false, 1.0)),
+        ("c1", spec("LOTC", 5, 0, false, 2.0)),
+        ("c2", spec("LOTC", 5, 1, true, 2.0)),
+        ("a3f", spec("LOTA", 1, 2, true, 2.0)),
+        ("c3f", spec("LOTC", 5, 2, true, 2.0)),
+    ];
+    let reg = api::Registry::app();
+    for (name, s) in &files {
+        let p = gen(d.path(), &format!("{name}.stdf"), s.clone());
+        api::run(&reg, "load", &json!({ "paths": [p.to_string_lossy()] })).unwrap();
+    }
+    // the reject retests: 7 = lot A's, 8 = lot C's
+    for (from, full, name) in [(1, 5, "ra"), (4, 6, "rc")] {
+        api::run(
+            &reg,
+            "match",
+            &json!({"a": from, "b": full, "filter_a": "not pass", "name": name}),
+        )
+        .unwrap();
+        let out = d.path().join(format!("{name}.stdf"));
+        api::run(
+            &reg,
+            "export_stdf",
+            &json!({"ds": full, "filter": format!("${name}"), "path": out.to_string_lossy()}),
+        )
+        .unwrap();
+        api::run(&reg, "load", &json!({ "paths": [out.to_string_lossy()] })).unwrap();
+    }
+    let mut lots = vec![];
+    for (run1, retest, chain, name) in [(0, 1, 7, "lot A"), (3, 4, 8, "lot C")] {
+        // recovery window, outcome sets marked in run 1 too
+        let t = api::run(&reg, "retest_trace", &json!({"runs": [retest, chain], "filter": "fail(1050)", "tests": "1050", "also": [run1]})).unwrap();
+        let hb = t["recovery"][0]["zones"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|z| z["kind"] == "hard_bad")
+            .cloned()
+            .unwrap_or_else(|| panic!("{name}: no hard-bad zone {}", t["recovery"][0]["zones"]));
+        let r1 = reg.get(run1).unwrap().0;
+        assert_eq!(
+            reg.rows(run1, &r1, "$retest_still_bad").unwrap().len(),
+            t["outcomes"]["still_bad"].as_u64().unwrap() as usize,
+            "outcomes marked in run 1 by part text"
+        );
+        let range = format!("{}..{}", hb["lo"], hb["hi"]);
+        let cs = api::run(&reg, "candidate_sets", &json!({"a": run1, "b": retest, "filter_a": "pass", "filter_b": "not pass and fail(1050)",
+            "test": "1050", "range": range, "name": "case_bad", "marginal": "case_marginal", "confirmed": "case_good"})).unwrap();
+        assert!(cs["n_cand"].as_u64().unwrap() >= 20, "{name}: {cs}");
+        lots.push(json!({"name": name, "ds": run1, "kind": "issue", "bad": "$case_bad", "good": "$case_good",
+            "groups": [{"label": "marginal", "filter": "$case_marginal"}, {"label": "unrecoverable", "filter": "$retest_still_bad"},
+                       {"label": "recovered", "filter": "$retest_recovered"}, {"label": "nope", "filter": "$no_such_set"}]}));
+    }
+    lots.push(
+        json!({"name": "lot B", "ds": 2, "kind": "clean", "bad": "fail(1050)", "good": "pass"}),
+    );
+    let c = api::run(&reg, "commonality", &json!({"lots": lots, "exclude": "500, 80100-80104",
+        "x_test": "80101", "y_test": "80102", "wafer_test": "80100", "ox_test": "80103", "oy_test": "80104"})).unwrap();
+    let f = |k: &str| {
+        c["factors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["key"] == k)
+            .cloned()
+            .unwrap()
+    };
+    // the issue lots ran on loadboard 2, the clean lot on 1
+    let lb = f("loadboard");
+    assert_eq!(lb["flag_across"]["level"], "LB 2", "{lb}");
+    assert_eq!(lb["flag_across"]["issue_share"], 1.0);
+    assert_eq!(lb["flag_across"]["clean_share"], 0.0);
+    assert!(
+        lb["lots"][0]["test"].is_null(),
+        "one board per lot: no within-lot test"
+    );
+    // within-lot factors are tested per issue lot, with profiles for every group
+    let site = f("site");
+    assert!(site["lots"][0]["test"]["q"].is_number());
+    let groups: Vec<&str> = site["lots"][0]["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        groups,
+        ["bad", "good", "marginal", "unrecoverable", "recovered"],
+        "missing sets are skipped"
+    );
+    for k in ["zone", "reticle", "test_time", "site_loadboard", "wafer"] {
+        assert!(f(k)["levels"].as_array().unwrap().len() >= 2, "{k}");
+    }
+    let mk = c["markers"].as_array().unwrap();
+    assert!(!mk.is_empty() && mk[0]["lots"].as_array().unwrap().len() == 3);
+    assert_eq!(c["marker_lots"], json!([true, true, false]));
+
+    // the signature screens lot C's unrecoverable parts under their own label
+    let s = api::run(&reg, "signature", &json!({"a": 0, "name": "case_bad", "filter": "pass", "exclude": "500, 80100-80104", "confirmed": "case_good",
+        "clean": [{"ds": 2, "filter": "pass"}], "stayed": [{"a": 3, "b": 4}],
+        "screen": [{"ds": 3, "filter": "$retest_still_bad", "label": "lot C unrecoverable"}]})).unwrap();
+    assert_eq!(s["screen"][0]["name"], "lot C unrecoverable");
+    let kinds: Vec<&str> = s["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["clean", "stayed_good", "confirmed"]);
+
+    // cases are saved as JSON in the settings folder and load back
+    let case = json!({"name": "probe case", "test": "1050", "lots": [{"name": "lot A", "run1": "a1.stdf"}]});
+    let sv = api::run(&reg, "case_save", &json!({"case": case})).unwrap();
+    assert!(sv["path"].as_str().unwrap().ends_with("probecase.json"));
+    let ls = api::run(&reg, "case_list", &json!({})).unwrap();
+    assert!(ls
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["path"] == sv["path"]));
+    let ld = api::run(&reg, "case_load", &json!({"path": sv["path"]})).unwrap();
+    assert_eq!(ld["case"], case);
 }

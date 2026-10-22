@@ -84,6 +84,7 @@ p.lead { color: var(--text-2); margin: 0 0 14px; max-width: 900px; }
 .kpi .v { font-size: 22px; font-weight: 650; font-variant-numeric: tabular-nums; margin-top: 2px; }
 .kpi .s { font-size: 12px; color: var(--text-2); }
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.grid1 { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px; box-shadow: var(--shadow); min-width: 0; }
 .card.pad { padding: 12px 14px; }

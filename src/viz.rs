@@ -31,7 +31,9 @@ pub fn series_color(name: &str, i: usize) -> String {
         "alarm" => "@warn".into(),
         "no alarm" => "@s1".into(),
         "reference" => "@s1".into(),
-        "affected" => "@fail".into(),
+        "affected" | "bad candidates" => "@fail".into(),
+        "lot A normal" => "@s1".into(),
+        "confirmed good" => "@s3".into(),
         // part sets: "$name" and "not $name"
         n if n.starts_with("not $") => "@s1".into(),
         n if n.starts_with('$') => "@fail".into(),
