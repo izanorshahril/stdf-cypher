@@ -1612,3 +1612,201 @@ fn investigation_case_commonality_across_lots() {
     let ld = api::run(&reg, "case_load", &json!({"path": sv["path"]})).unwrap();
     assert_eq!(ld["case"], case);
 }
+
+#[test]
+fn merge_pieces_of_one_lot() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let full = gen(d.path(), "lot.stdf", SampleSpec::default());
+    let ds = load(&full);
+    // the lot's wafers tested in two sessions: split by wafer, then merge back
+    let w0 = ds.wafers[0].clone();
+    let g = split::SplitBy::Groups {
+        groups: vec![("first".into(), format!("wafer = \"{w0}\""))],
+        rest: Some("rest".into()),
+    };
+    let parts = split::split_file(&full, &ds, &g, d.path(), Some("piece")).unwrap();
+    assert_eq!(parts.len(), 2);
+    let reg = api::Registry::app();
+    // a retest of the same lot shares every part: not a piece
+    let retest = gen(
+        d.path(),
+        "retest.stdf",
+        SampleSpec {
+            meas_noise: 0.3,
+            meas_seed: 1,
+            ..SampleSpec::default()
+        },
+    );
+    let paths: Vec<String> = parts
+        .iter()
+        .map(|p| p.path.clone())
+        .chain([retest.to_string_lossy().to_string()])
+        .collect();
+    api::run(&reg, "load", &json!({ "paths": paths, "sort": "name" })).unwrap();
+    // one group for the lot, in test-time order; the retest's shared parts
+    // are reported but do not block the merge
+    let c = api::run(&reg, "merge_candidates", &json!({})).unwrap();
+    let c = c.as_array().unwrap();
+    assert_eq!(c.len(), 1);
+    let g = &c[0];
+    assert!(g["mergeable"].as_bool().unwrap());
+    assert_eq!(g["by"], "wafer + X/Y");
+    assert_eq!(g["files"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        g["pairs"].as_array().unwrap().len(),
+        2,
+        "the retest shares parts with both pieces"
+    );
+    assert_eq!(g["shared"].as_u64().unwrap() as usize, ds.n_parts());
+    let out = d.path().join("merged.stdf");
+    let r = api::run(
+        &reg,
+        "merge_files",
+        &json!({"ds": [0, 1], "path": out.to_string_lossy()}),
+    )
+    .unwrap();
+    assert_eq!(r["parts"].as_u64().unwrap() as usize, ds.n_parts());
+    let m = load(&out);
+    assert_eq!(m.n_parts(), ds.n_parts());
+    assert_eq!(m.wafers.len(), ds.wafers.len());
+    assert_eq!(m.yield_pct(&m.all_rows()), ds.yield_pct(&ds.all_rows()));
+    // one header, recounted summaries
+    let mut rdr = StdfReader::open(&out).unwrap();
+    let (mut mir, mut pcr_all) = (0, None);
+    while let Some((_, rec)) = rdr.next_record().unwrap() {
+        match rec {
+            Record::MIR(_) => mir += 1,
+            Record::PCR(p) if p.head_num == 255 => pcr_all = Some(p.part_cnt),
+            _ => {}
+        }
+    }
+    assert_eq!(mir, 1);
+    assert_eq!(pcr_all, Some(ds.n_parts() as u32));
+    // renumbered, in reverse order: the second file continues after the first's last ID
+    let out2 = d.path().join("merged_renumbered.stdf");
+    api::run(
+        &reg,
+        "merge_files",
+        &json!({"ds": [1, 0], "path": out2.to_string_lossy(), "renumber": true}),
+    )
+    .unwrap();
+    let m2 = load(&out2);
+    let ids: Vec<u64> = m2
+        .parts
+        .iter()
+        .map(|p| p.part_id.parse().unwrap())
+        .collect();
+    let n1 = parts[1].parts as usize;
+    let last1 = *ids[..n1].iter().max().unwrap();
+    assert!(
+        ids[n1..].iter().all(|&i| i > last1),
+        "file 2 continues after file 1"
+    );
+    assert_eq!(
+        ids.iter().collect::<std::collections::HashSet<_>>().len(),
+        ids.len()
+    );
+}
+
+#[test]
+fn part_datalog_text_and_csv() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let p = gen(
+        d.path(),
+        "lot.stdf",
+        SampleSpec {
+            extra_tests: vec![1013, 2000],
+            ..SampleSpec::default()
+        },
+    );
+    let reg = api::Registry::app();
+    api::run(&reg, "load", &json!({ "paths": [p.to_string_lossy()] })).unwrap();
+    let ds = load(&p);
+    let p0 = &ds.parts[0];
+    // by part ID, by X/Y, and a pasted list with one unknown line
+    let r = api::run(
+        &reg,
+        "find_parts",
+        &json!({"ds": 0, "q": p0.part_id, "by": "part_id"}),
+    )
+    .unwrap();
+    assert_eq!(r["rows"][0]["index"], 0);
+    let r = api::run(
+        &reg,
+        "find_parts",
+        &json!({"ds": 0, "q": format!("{},{}", p0.x, p0.y), "by": "xy"}),
+    )
+    .unwrap();
+    assert!(r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|x| x["index"] == 0));
+    let q = format!("{}\n{}\nnope", ds.parts[1].part_txt, ds.parts[2].part_txt);
+    let r = api::run(
+        &reg,
+        "find_parts",
+        &json!({"ds": 0, "q": q, "by": "part_txt"}),
+    )
+    .unwrap();
+    assert_eq!(r["missing"], json!(["nope"]));
+    let rows: Vec<u64> = r["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x["index"].as_u64().unwrap())
+        .collect();
+    assert!(rows.contains(&1) && rows.contains(&2));
+    let txt = api::run(
+        &reg,
+        "part_datalog",
+        &json!({"ds": 0, "rows": [0, 1], "tests": "1013, 2000", "format": "txt"}),
+    )
+    .unwrap();
+    let t = txt["text"].as_str().unwrap();
+    assert_eq!(txt["n_tests"], 2);
+    assert_eq!(t.matches("DUMMY_1013").count(), 2, "one line per part");
+    assert!(t.contains(&format!("Part {}", p0.part_id)));
+    let csv = api::run(
+        &reg,
+        "part_datalog",
+        &json!({"ds": 0, "rows": [0, 1, 2], "tests": "1013,2000", "format": "csv"}),
+    )
+    .unwrap();
+    // header, LO and HI limit lines, one row per part
+    assert_eq!(csv["text"].as_str().unwrap().lines().count(), 1 + 2 + 3);
+    let long = api::run(
+        &reg,
+        "part_datalog",
+        &json!({"ds": 0, "rows": [0, 1, 2], "tests": "1013,2000", "format": "csv_long"}),
+    )
+    .unwrap();
+    assert_eq!(long["text"].as_str().unwrap().lines().count(), 1 + 3 * 2);
+    // a test the file lacks prints as N/A; marks label the parts
+    let r = api::run(
+        &reg,
+        "part_datalog",
+        &json!({"ds": 0, "rows": [0, 1], "marks": ["A1", ""], "tests": "1013, 424242", "format": "txt"}),
+    )
+    .unwrap();
+    assert_eq!(r["missing"], json!(["424242"]));
+    let t = r["text"].as_str().unwrap();
+    assert!(t.contains("Mark A1  |  Part") && t.contains("N/A"));
+    assert_eq!(t.matches("Mark ").count(), 1, "blank marks are not printed");
+    let c = api::run(
+        &reg,
+        "part_datalog",
+        &json!({"ds": 0, "rows": [0], "marks": ["7"], "tests": "1013", "format": "csv"}),
+    )
+    .unwrap();
+    // header, LO and HI limit lines, then the part
+    assert!(c["text"]
+        .as_str()
+        .unwrap()
+        .lines()
+        .nth(3)
+        .unwrap()
+        .starts_with("7,"));
+}

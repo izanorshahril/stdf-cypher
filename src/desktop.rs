@@ -73,8 +73,15 @@ impl Settings {
     }
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(config_dir());
+        // write a temp file and rename it, so another instance reading at the
+        // same moment never sees a half-written (empty) list
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::file(), s);
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = config_dir().join(format!("settings.{}.{n}.tmp", std::process::id()));
+            if std::fs::write(&tmp, s).is_ok() && std::fs::rename(&tmp, Self::file()).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
         }
     }
     pub fn add_recent(&mut self, paths: &[String]) {

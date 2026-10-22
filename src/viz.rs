@@ -225,6 +225,33 @@ pub fn histogram_r(
     density: bool,
     mode: RangeMode,
 ) -> Value {
+    histogram_rf(info, groups, nbins, density, mode, 1)
+}
+
+/// Bins per default bin the dashboard gets, so its bin-size slider can
+/// merge them back (coarser) or show them (finer) without a round trip.
+pub const FINE_BINS: usize = 4;
+
+/// [`histogram_r`] for the dashboard: with automatic binning, each bin is
+/// cut into `FINE_BINS` and the traces carry `_fine` for the slider.
+pub fn histogram_fine(
+    info: &TestInfo,
+    groups: &[(String, Vec<f64>)],
+    nbins: Option<usize>,
+    density: bool,
+    mode: RangeMode,
+) -> Value {
+    histogram_rf(info, groups, nbins, density, mode, FINE_BINS)
+}
+
+fn histogram_rf(
+    info: &TestInfo,
+    groups: &[(String, Vec<f64>)],
+    nbins: Option<usize>,
+    density: bool,
+    mode: RangeMode,
+    fine: usize,
+) -> Value {
     let all: Vec<f64> = groups.iter().flat_map(|(_, v)| v.iter().copied()).collect();
     let s = stats::sorted(&all);
     if s.is_empty() {
@@ -241,9 +268,15 @@ pub fn histogram_r(
         nbins,
         Some((lo, hi)),
     );
-    let nb = edges.len().saturating_sub(1).max(1);
+    let nb0 = edges.len().saturating_sub(1).max(1);
+    let fine = if nbins.is_none() && edges.len() > 1 {
+        fine.max(1)
+    } else {
+        1
+    };
+    let nb = nb0 * fine;
     let w = if edges.len() > 1 {
-        edges[1] - edges[0]
+        (edges[nb0] - edges[0]) / nb as f64
     } else {
         1.0
     };
@@ -261,7 +294,7 @@ pub fn histogram_r(
                 }
             })
             .collect();
-        let xs: Vec<f64> = (0..nb).map(|k| edges[k] + w / 2.0).collect();
+        let xs: Vec<f64> = (0..nb).map(|k| edges[0] + w * (k as f64 + 0.5)).collect();
         let d = stats::describe(v, info.lo, info.hi);
         let stat = format!(
             "mean {} σ {} Cpk {}<extra></extra>",
@@ -273,7 +306,7 @@ pub fn histogram_r(
         // normalized histogram back to counts without a round trip
         data.push(json!({
             "type":"bar","name": format!("{name} (n={})", v.len()),"x": xs,"y": ys,"width": w * 0.98,
-            "customdata": c, "meta": if density { "pct" } else { "count" },
+            "customdata": c, "meta": if density { "pct" } else { "count" }, "_fine": fine,
             "marker":{"color": series_color(name, i), "line":{"width":0}},
             "opacity": if groups.len() > 1 { 0.55 } else { 0.9 },
             "hovertemplate": if density {

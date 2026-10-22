@@ -37,8 +37,8 @@ const SC = (() => {
   }
   const plotted = new Set();
   // optional hook that rewrites every figure before drawing (opacity, 3D…)
-  let transform = null;
-  function setTransform(fn) { transform = fn; replotAll(); }
+  let transform = null, afterPlot = null;
+  function setTransform(fn, after) { transform = fn; afterPlot = after || null; replotAll(); }
   function plot(el, fig) {
     if (!el) return;
     if (typeof el === "string") el = document.getElementById(el);
@@ -46,11 +46,12 @@ const SC = (() => {
     plotted.add(el);
     const tk = tokens();
     let f = resolve(fig, tk);
-    if (transform && !el.dataset.raw) f = transform(f) || f;
+    if (transform && !el.dataset.raw) f = transform(f, el) || f;
     const layout = themeLayout(f.layout || {});
     const cfg = { responsive: true, displaylogo: false, modeBarButtonsToRemove: ["lasso2d", "select2d"], toImageButtonOptions: { format: "png", scale: 2 } };
     if (window.Plotly) { if (el._dim !== f._dim) { Plotly.purge(el); el._dim = f._dim; } Plotly.react(el, f.data || [], layout, cfg); }
     else el.innerHTML = '<div class="err">Plotly failed to load (offline?). Re-generate the report with --offline.</div>';
+    if (afterPlot && !el.dataset.raw) afterPlot(el, f);
   }
   function replotAll() {
     for (const el of [...plotted]) { if (!document.body.contains(el)) { plotted.delete(el); continue; } plot(el, el._fig); }
@@ -64,8 +65,18 @@ const SC = (() => {
     let t = "";
     try { t = localStorage.getItem("sc-theme") || ""; } catch (e) {}
     if (t) document.documentElement.setAttribute("data-theme", t);
+    let s = "";
+    try { s = localStorage.getItem("sc-skin") || ""; } catch (e) {}
+    if (s) document.documentElement.setAttribute("data-skin", s);
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", replotAll);
   }
+  /** Colour theme ("" = default, industry, office, work): data-skin on <html>. */
+  function setSkin(s) {
+    if (s) document.documentElement.setAttribute("data-skin", s); else document.documentElement.removeAttribute("data-skin");
+    try { localStorage.setItem("sc-skin", s || ""); } catch (e) {}
+    replotAll();
+  }
+  function getSkin() { return document.documentElement.getAttribute("data-skin") || ""; }
   function toggleTheme() {
     const cur = document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     setTheme(cur === "dark" ? "light" : "dark");
@@ -155,5 +166,5 @@ const SC = (() => {
     document.body.append(a); a.click(); a.remove();
   }
 
-  return { tokens, plot, replotAll, setTransform, setTheme, initTheme, toggleTheme, fmt, fmtP, pct, h, kpi, chartBox, badge, table, toCSV, download };
+  return { tokens, plot, replotAll, setTransform, setTheme, setSkin, getSkin, initTheme, toggleTheme, fmt, fmtP, pct, h, kpi, chartBox, badge, table, toCSV, download };
 })();

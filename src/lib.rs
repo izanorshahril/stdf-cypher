@@ -10,7 +10,9 @@
 pub mod analysis;
 pub mod api;
 pub mod data;
+pub mod datalog;
 pub mod desktop;
+pub mod merge;
 pub mod ml;
 pub mod report;
 pub mod sample;

@@ -86,12 +86,15 @@ p.lead { color: var(--text-2); margin: 0 0 14px; max-width: 900px; }
 .grid2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .grid1 { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
 .grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.grid4 { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+.bin-slider { gap: 6px; padding: 2px 8px 0; align-items: center; margin: 0; }
+.bin-slider input { width: 120px; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 8px; box-shadow: var(--shadow); min-width: 0; }
 .card.pad { padding: 12px 14px; }
 .chart { width: 100%; height: 360px; }
 .chart.tall { height: 520px; }
 .chart.short { height: 280px; }
-.split { display: grid; grid-template-columns: minmax(280px, 380px) minmax(0, 1fr); gap: 12px; align-items: start; }
+.split { display: grid; grid-template-columns: minmax(300px, 430px) minmax(0, 1fr); gap: 12px; align-items: start; }
 .tbl-wrap { overflow: auto; max-height: 520px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .tbl-tools { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
 .tbl-tools .count { color: var(--muted); font-size: 12px; }
@@ -132,6 +135,7 @@ tr.sel td { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 .toc a { text-decoration: none; padding: 4px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface); color: var(--text-2); font-size: 13px; }
 @media (max-width: 1000px) {
   .grid2, .grid3, .split { grid-template-columns: minmax(0, 1fr); }
+  .grid4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
   .layout { grid-template-columns: minmax(0, 1fr); }
@@ -228,3 +232,81 @@ details.help li { margin: 2px 0; }
 details.help p { margin: 6px 0; }
 .findings { margin: 4px 0 16px; padding-left: 20px; line-height: 1.6; }
 .findings li { margin: 2px 0; }
+/* typeahead: live matches under a search box */
+.ta { position: relative; display: inline-block; }
+.ta-list { position: absolute; left: 0; right: 0; top: 100%; z-index: 30; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); margin-top: 2px; overflow: hidden; }
+.ta-item { display: flex; gap: 10px; width: 100%; text-align: left; border: 0; border-radius: 0; background: transparent; padding: 7px 10px; cursor: pointer; }
+.ta-item:hover { background: var(--hover, rgba(127,127,127,0.12)); }
+.ta-add { color: var(--pass); font-weight: 600; white-space: nowrap; }
+.dl-parts td { padding: 3px 8px 3px 0; }
+.merge-order li { margin: 2px 0; }
+
+/* ---------- colour themes (data-skin), each with a light and a dark variant ----------
+   Industry: steel blue and charcoal with serif headings; Office: navy, sky blue and
+   yellow (st.com); Work: burgundy and magenta on warm greys (advantest.com). */
+:root { --brand-bar: transparent; --head-font: var(--sans); }
+:root[data-skin="industry"] {
+  --bg: #eef0f3; --surface: #ffffff; --surface-2: #e6e9ee; --border: #d3d9e1;
+  --text: #1d232b; --text-2: #4a5563; --muted: #7b8796; --grid: #e3e7ed;
+  --accent: #5a7da6; --accent-ink: #ffffff; --brand-bar: #5a7da6;
+  --s1: #5a7da6; --s2: #c08a3e; --s3: #5e9a80; --s4: #a65a5a; --s5: #8d7bb5; --s6: #3e5772; --s7: #b8a27a; --s8: #7f8c99;
+  --seq: #eef3f9,#d5e3f0,#a9c4e0,#7fa2c8,#5a7da6,#466489,#344c69,#22334a;
+  --div: #a65a5a,#d9aeae,#e6e9ee,#a9c4e0,#5a7da6;
+  --head-font: Georgia, "Times New Roman", serif;
+}
+:root[data-skin="office"] {
+  --bg: #f7f8fa; --surface: #ffffff; --surface-2: #eef0f3; --border: #dbdee2;
+  --text: #03234b; --text-2: #525a63; --muted: #6a7077; --grid: #e7e9ec;
+  --accent: #0047b2; --accent-ink: #ffffff; --brand-bar: #ffd200;
+  --s1: #03234b; --s2: #3cb4e6; --s3: #e6007e; --s4: #ffd200; --s5: #0047b2; --s6: #49b170; --s7: #90989f; --s8: #ea6a30;
+  --seq: #eef7fc,#c8e8f7,#8fd1ef,#3cb4e6,#0a85c2,#0047b2,#05306f,#03234b;
+  --div: #e6007e,#f3a0cf,#eef0f3,#8fd1ef,#0047b2;
+  --sans: Arial, Helvetica, sans-serif; --head-font: Arial, Helvetica, sans-serif;
+}
+:root[data-skin="work"] {
+  --bg: #f2f2f2; --surface: #ffffff; --surface-2: #f0efee; --border: #dfe0de;
+  --text: #222222; --text-2: #474c59; --muted: #747572; --grid: #e6e6e4;
+  --accent: #91003c; --accent-ink: #ffffff; --brand-bar: #c31f66;
+  --s1: #91003c; --s2: #3860be; --s3: #c31f66; --s4: #27455c; --s5: #e08a00; --s6: #2e8b57; --s7: #8a8b88; --s8: #6b4c9a;
+  --seq: #fbeef3,#f3c9da,#e494b6,#d05a8c,#c31f66,#91003c,#6b002c,#45001c;
+  --div: #3860be,#a9bce6,#f0efee,#e494b6,#91003c;
+  --sans: Roboto, "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; --head-font: Roboto, "Segoe UI", system-ui, sans-serif;
+}
+:root[data-skin="industry"][data-theme="dark"] {
+  --bg: #17191c; --surface: #202328; --surface-2: #2a2e34; --border: #3a4049; --text: #eceef1; --text-2: #b9c1cc; --muted: #8a94a1; --grid: #2d3239;
+  --accent: #7c9cc2; --accent-ink: #10161e; --s1: #7c9cc2; --s6: #9fb7d3; --seq: #1d2633,#22334a,#344c69,#466489,#5a7da6,#7fa2c8,#a9c4e0,#d5e3f0; --div: #c27a7a,#6b4040,#2a2e34,#3e5772,#7c9cc2;
+}
+:root[data-skin="office"][data-theme="dark"] {
+  --bg: #04111f; --surface: #0a1d33; --surface-2: #10284a; --border: #1f3b62; --text: #eef2f7; --text-2: #b8c3d1; --muted: #8394a8; --grid: #142c4d;
+  --accent: #3cb4e6; --accent-ink: #03234b; --s1: #3cb4e6; --s5: #6f9be0; --seq: #0a1d33,#05306f,#0047b2,#0a85c2,#3cb4e6,#8fd1ef,#c8e8f7,#eef7fc; --div: #e6007e,#6b1a4a,#10284a,#0a85c2,#3cb4e6;
+}
+:root[data-skin="work"][data-theme="dark"] {
+  --bg: #171517; --surface: #211e21; --surface-2: #2b272b; --border: #3d373c; --text: #f0eeef; --text-2: #c7c2c6; --muted: #948d92; --grid: #2e2a2e;
+  --accent: #d2477f; --s1: #d2477f; --s4: #5d86a8; --seq: #2b1520,#45001c,#6b002c,#91003c,#c31f66,#d05a8c,#e494b6,#f3c9da; --div: #6f8fd6,#2c3a5c,#2b272b,#7a2a4c,#d2477f;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-skin="industry"]:not([data-theme="light"]) {
+    --bg: #17191c; --surface: #202328; --surface-2: #2a2e34; --border: #3a4049; --text: #eceef1; --text-2: #b9c1cc; --muted: #8a94a1; --grid: #2d3239;
+    --accent: #7c9cc2; --accent-ink: #10161e; --s1: #7c9cc2; --s6: #9fb7d3; --seq: #1d2633,#22334a,#344c69,#466489,#5a7da6,#7fa2c8,#a9c4e0,#d5e3f0; --div: #c27a7a,#6b4040,#2a2e34,#3e5772,#7c9cc2;
+  }
+  :root[data-skin="office"]:not([data-theme="light"]) {
+    --bg: #04111f; --surface: #0a1d33; --surface-2: #10284a; --border: #1f3b62; --text: #eef2f7; --text-2: #b8c3d1; --muted: #8394a8; --grid: #142c4d;
+    --accent: #3cb4e6; --accent-ink: #03234b; --s1: #3cb4e6; --s5: #6f9be0; --seq: #0a1d33,#05306f,#0047b2,#0a85c2,#3cb4e6,#8fd1ef,#c8e8f7,#eef7fc; --div: #e6007e,#6b1a4a,#10284a,#0a85c2,#3cb4e6;
+  }
+  :root[data-skin="work"]:not([data-theme="light"]) {
+    --bg: #171517; --surface: #211e21; --surface-2: #2b272b; --border: #3d373c; --text: #f0eeef; --text-2: #c7c2c6; --muted: #948d92; --grid: #2e2a2e;
+    --accent: #d2477f; --s1: #d2477f; --s4: #5d86a8; --seq: #2b1520,#45001c,#6b002c,#91003c,#c31f66,#d05a8c,#e494b6,#f3c9da; --div: #6f8fd6,#2c3a5c,#2b272b,#7a2a4c,#d2477f;
+  }
+}
+.topbar { border-top: 3px solid var(--brand-bar); }
+h1, h2, .brand, .dz-title, .kpi .v { font-family: var(--head-font); }
+:root[data-skin="industry"] h1 { font-weight: 500; letter-spacing: .01em; }
+:root[data-skin="office"] nav.side button.active { box-shadow: inset 3px 0 0 #ffd200; }
+nav.side .nav-group { font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); padding: 12px 10px 4px; font-weight: 600; }
+nav.side button:hover:not(.active) { background: color-mix(in srgb, var(--surface-2) 70%, transparent); color: var(--text); }
+.ta-item:hover { background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.tips .tip b { font-family: var(--head-font); }
+@media (max-width: 760px) { nav.side .nav-group { display: none; } }
+.kpi .v, h1 { font-variant-numeric: lining-nums tabular-nums; }
+nav.side { scrollbar-width: thin; }
+input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(--accent); }

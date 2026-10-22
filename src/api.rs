@@ -832,6 +832,125 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "candidates" => candidates_op(reg, &pp),
         "signature" => signature_op(reg, &pp),
         "retest_trace" => retest_op(reg, &pp),
+        "merge_candidates" => merge_candidates_op(reg),
+        // part datalog: search parts, then write the chosen tests' results
+        "find_parts" => {
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            let limit = pp.usize("limit", 200);
+            // ticked modes: part_id, xy, part_txt, test_xy (die X/Y from tests)
+            let by = pp.str_or("by", "part_id,xy,part_txt");
+            let modes: Vec<&str> = by
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            let txy = if modes.contains(&"test_xy") {
+                match TestXy::parse(&ds, &pp) {
+                    Ok(t) => Some(t),
+                    Err(e) if modes == ["test_xy"] => {
+                        return Err(
+                            e.context("die X/Y from tests (set the tests on the Settings page)")
+                        )
+                    }
+                    Err(_) => None,
+                }
+            } else {
+                None
+            };
+            let custom = |r: usize| -> Option<(String, i16, i16)> {
+                let t = txy.as_ref()?;
+                let (x, y) = t.xy(&ds, r)?;
+                Some((t.wafer(&ds, r).unwrap_or_default(), x, y))
+            };
+            let custom_ref: Option<crate::datalog::CustomXy> =
+                if txy.is_some() { Some(&custom) } else { None };
+            let mut rows = vec![];
+            // one query per line (a pasted list); every hit of each
+            let mut missing = vec![];
+            for q in pp.str("q").lines().map(str::trim).filter(|q| !q.is_empty()) {
+                let hits = crate::datalog::find_parts(&ds, q, &modes, custom_ref, limit);
+                if hits.is_empty() {
+                    missing.push(q.to_string());
+                }
+                rows.extend(hits);
+            }
+            let mut seen = std::collections::HashSet::new();
+            rows.retain(|r| seen.insert(*r));
+            Ok(json!({
+                "rows": rows.iter().take(limit).map(|&i| {
+                    let mut v = part_json(&ds, i);
+                    if let Some((w, x, y)) = custom(i) {
+                        v["test_xy"] = json!({"wafer": w, "x": x, "y": y});
+                    }
+                    v
+                }).collect::<Vec<_>>(),
+                "total": rows.len(), "missing": missing,
+            }))
+        }
+        "part_datalog" => {
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            // rows and their marks, dropping rows outside the dataset
+            let marks_in: Vec<String> =
+                pp.0.get("marks")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|x| x.as_str().unwrap_or("").to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+            let (rows, marks): (Vec<usize>, Vec<String>) = id_list(pp.0.get("rows"))
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, r)| r < ds.n_parts())
+                .map(|(i, r)| (r, marks_in.get(i).cloned().unwrap_or_default()))
+                .unzip();
+            if rows.is_empty() {
+                bail!("add parts to the list first");
+            }
+            let cols = crate::datalog::resolve_tests(&ds, &pp.str("tests"));
+            let text =
+                crate::datalog::build(&ds, &rows, &marks, &cols, &pp.str_or("format", "txt"));
+            let path = pp.str("path");
+            if !path.is_empty() {
+                std::fs::write(&path, &text).with_context(|| format!("write {path}"))?;
+            }
+            let missing: Vec<&str> = cols
+                .iter()
+                .filter_map(|c| match c {
+                    crate::datalog::Col::Missing(q) => Some(q.as_str()),
+                    _ => None,
+                })
+                .collect();
+            Ok(
+                json!({"text": text, "path": path, "n_parts": rows.len(), "n_tests": cols.len(), "missing": missing}),
+            )
+        }
+        "merge_files" => {
+            let ids = id_list(pp.0.get("ds"));
+            let out = pp.str("path");
+            if out.is_empty() {
+                bail!("choose where to save the merged file");
+            }
+            let mut paths = vec![];
+            for id in ids {
+                let (_, p) = reg.get(id)?;
+                if p.len() != 1 {
+                    bail!(
+                        "{} is not a single file: merge files as they were opened",
+                        reg.name(id)
+                    );
+                }
+                paths.extend(p);
+            }
+            Ok(json!(crate::merge::merge_files(
+                &paths,
+                std::path::Path::new(&out),
+                pp.bool("renumber", false)
+            )?))
+        }
         "commonality" => commonality_op(reg, &pp),
         "case_save" | "case_load" | "case_list" => case_op(&pp, op),
         "loadboard" => {
@@ -1165,7 +1284,7 @@ fn chart(reg: &Registry, pp: &P) -> Result<Value> {
             viz::set_range(&mut cdf, "xaxis", info, &vals, range);
             viz::set_range(&mut trend, "yaxis", info, &vals, range);
             json!({
-                "hist": viz::histogram_r(info, &viz::values_groups(&ds, t, &g), pp.opt_usize("bins"), pp.bool("density", g.len() > 1), range),
+                "hist": viz::histogram_fine(info, &viz::values_groups(&ds, t, &g), pp.opt_usize("bins"), pp.bool("density", g.len() > 1), range),
                 "box": bx,
                 "cdf": cdf,
                 "trend": trend,
@@ -1340,7 +1459,7 @@ fn chart(reg: &Registry, pp: &P) -> Result<Value> {
             let mut bx = viz::boxplot_v(info, &g);
             viz::set_range(&mut cdf, "xaxis", info, &all, range);
             viz::set_range(&mut bx, "yaxis", info, &all, range);
-            json!({"hist": viz::histogram_r(info, &g, None, true, range), "cdf": cdf, "box": bx})
+            json!({"hist": viz::histogram_fine(info, &g, None, true, range), "cdf": cdf, "box": bx})
         }
         "unitcorr" => {
             let b_id = pp.usize("b", 1);
@@ -1776,8 +1895,8 @@ fn match_dual_op(reg: &Registry, pp: &P) -> Result<Value> {
             })
             .collect()
     };
-    let mut hist_a = viz::histogram_r(ia, &vals(&da, ta, true), None, groups.len() > 1, mode);
-    let mut hist_b = viz::histogram_r(ib, &vals(&db, tb, false), None, groups.len() > 1, mode);
+    let mut hist_a = viz::histogram_fine(ia, &vals(&da, ta, true), None, groups.len() > 1, mode);
+    let mut hist_b = viz::histogram_fine(ib, &vals(&db, tb, false), None, groups.len() > 1, mode);
     hist_a["layout"]["title"]["text"] = json!(format!("A: {na} – {}", ia.label()));
     hist_b["layout"]["title"]["text"] = json!(format!("B: {nb} – {}", ib.label()));
     let pts: Vec<(String, Vec<(f64, f64, String)>)> = groups
@@ -1817,7 +1936,8 @@ fn match_dual_op(reg: &Registry, pp: &P) -> Result<Value> {
         exec_count: 0,
         fail_count: 0,
     };
-    let mut delta = viz::histogram_r(&dinfo, &diffs, None, groups.len() > 1, viz::RangeMode::Data);
+    let mut delta =
+        viz::histogram_fine(&dinfo, &diffs, None, groups.len() > 1, viz::RangeMode::Data);
     delta["layout"]["title"]["text"] = json!(format!(
         "Difference per unit: B {} − A {}{}",
         ib.num,
@@ -2045,7 +2165,7 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
                 ("reference".to_string(), da.values_of(ta, Some(&ra))),
                 ("affected".to_string(), db.values_of(tb, Some(&rb))),
             ];
-            let mut f = viz::histogram_r(&da.tests[ta], &g, None, true, range);
+            let mut f = viz::histogram_fine(&da.tests[ta], &g, None, true, range);
             f["layout"]["title"]["text"] = json!(format!(
                 "{} · {} (score {:.2})",
                 da.tests[ta].label(),
@@ -2094,7 +2214,7 @@ fn markers_op(reg: &Registry, pp: &P) -> Result<Value> {
         fail_count: 0,
     };
     let f = |v: &[usize]| v.iter().map(|&x| x as f64).collect::<Vec<_>>();
-    let mut sdc = viz::histogram_r(
+    let mut sdc = viz::histogram_fine(
         &cinfo,
         &[
             ("reference".into(), f(&rep.sdc.counts_ref)),
@@ -3604,7 +3724,7 @@ fn signature_op(reg: &Registry, pp: &P) -> Result<Value> {
                     g.push((p.name.clone(), p.ds.values_of(t2, Some(&p.rows))));
                 }
             }
-            let mut f = viz::histogram_r(&ds.tests[t], &g, None, true, range);
+            let mut f = viz::histogram_fine(&ds.tests[t], &g, None, true, range);
             let cut = |x: f64| json!({"type": "line", "xref": "x", "yref": "paper", "x0": x, "x1": x, "y0": 0, "y1": 1, "line": {"color": "@warn", "width": 2, "dash": "dot"}});
             if let Some(sh) = f["layout"]["shapes"].as_array_mut() {
                 sh.push(cut(r.rule.a));
@@ -3626,4 +3746,98 @@ fn signature_op(reg: &Registry, pp: &P) -> Result<Value> {
         "rate_a": n(a_k as f64 / a_n.max(1) as f64), "rate_ref": n(ref_k as f64 / ref_n.max(1) as f64),
         "screen": screen, "figures": figures,
     }))
+}
+
+/// Dataset ids from a JSON array of numbers (or numeric strings).
+fn id_list(v: Option<&Value>) -> Vec<usize> {
+    v.and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_u64().or_else(|| x.as_str()?.trim().parse().ok()))
+                .map(|x| x as usize)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Open files of one lot and test step: the same lot (MIR LOT_ID), test
+/// code and flow (TEST_COD, FLOW_ID), loaded from single files, in test-time
+/// order, with the physical parts any two of them share (by wafer + X/Y when
+/// every file has die coordinates, else by part text). Pieces of one test
+/// share none; files that do (retests) can still be merged.
+fn merge_candidates_op(reg: &Registry) -> Result<Value> {
+    use data::matching::KeySpec;
+    use std::collections::HashSet;
+    struct F {
+        id: usize,
+        name: String,
+        ds: Arc<Dataset>,
+    }
+    let mut groups: IndexMap<(String, String, String), Vec<F>> = IndexMap::new();
+    {
+        let v = reg.items.read().unwrap();
+        for (id, e) in v.iter().enumerate() {
+            let Some(e) = e else { continue };
+            if e.paths.len() != 1 || e.ds.sources.len() != 1 {
+                continue;
+            }
+            let s = &e.ds.sources[0];
+            let k = (
+                s.lot_id.trim().to_string(),
+                s.test_cod.trim().to_string(),
+                s.flow_id.trim().to_string(),
+            );
+            groups.entry(k).or_default().push(F {
+                id,
+                name: e.name.clone(),
+                ds: e.ds.clone(),
+            });
+        }
+    }
+    // the identity every file of the group has for most parts
+    let keys = |ds: &Dataset, spec: &KeySpec| -> Option<HashSet<String>> {
+        let k: HashSet<String> = (0..ds.n_parts()).filter_map(|r| spec.key(ds, r)).collect();
+        (k.len() * 2 >= ds.n_parts().max(1)).then_some(k)
+    };
+    let mut out = vec![];
+    for ((lot, step, flow), fs) in groups.into_iter().filter(|(_, f)| f.len() > 1) {
+        let mut by = "";
+        let mut sets = vec![];
+        for (name, spec) in [
+            ("wafer + X/Y", KeySpec::WaferXy),
+            ("part text", KeySpec::PartTxt),
+        ] {
+            let s: Option<Vec<HashSet<String>>> = fs.iter().map(|f| keys(&f.ds, &spec)).collect();
+            if let Some(s) = s {
+                by = name;
+                sets = s;
+                break;
+            }
+        }
+        let file_json = |f: &F| {
+            let s = &f.ds.sources[0];
+            json!({"id": f.id, "name": f.name, "n_parts": f.ds.n_parts(), "wafers": f.ds.wafers, "start_t": s.start_t,
+                "job": s.job_nam, "tester": s.node_nam, "sublot": s.sublot_id})
+        };
+        let mut order: Vec<usize> = (0..fs.len()).collect();
+        order.sort_by_key(|&i| fs[i].ds.sources[0].start_t);
+        // files sharing parts (e.g. a retest) are still offered: the page
+        // says so and the user decides
+        let mut pairs = vec![];
+        let mut shared = 0usize;
+        if !by.is_empty() {
+            for (k, &i) in order.iter().enumerate() {
+                for &j in &order[k + 1..] {
+                    let n = sets[i].intersection(&sets[j]).count();
+                    if n > 0 {
+                        shared += n;
+                        pairs.push(json!({"a": fs[i].id, "b": fs[j].id, "shared": n}));
+                    }
+                }
+            }
+        }
+        out.push(json!({"lot": lot, "step": step, "flow": flow, "by": by, "shared": shared, "mergeable": true, "pairs": pairs,
+            "files": order.iter().map(|&i| file_json(&fs[i])).collect::<Vec<_>>()}));
+    }
+    Ok(json!(out))
 }

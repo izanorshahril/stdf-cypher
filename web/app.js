@@ -4,15 +4,32 @@ const { h, plot, fmt, fmtP, pct, kpi, chartBox, badge, table } = SC;
 
 const S = { datasets: [], ds: 0, filter: "", view: "overview", testsCache: {}, scope: "all", co: { range: "both", dim: "2d", opacity: 0.6, hist: "pct" } };
 try { Object.assign(S.co, JSON.parse(localStorage.getItem("sc-chart") || "{}")); S.scope = localStorage.getItem("sc-scope") || "all"; } catch (e) {}
+// settings kept in this browser profile (Settings page); `sc-sort` predates it
+const CFG_DEFAULT = { sort: "time", dedup: "", merge: false, key: "part_txt", exclude: "500, 80100-80104", lbTest: "5100" };
+const WCAL_DEFAULT = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false };
+S.cfg = Object.assign({}, CFG_DEFAULT);
+try {
+  const old = localStorage.getItem("sc-sort");
+  if (old) S.cfg.sort = old;
+  Object.assign(S.cfg, JSON.parse(localStorage.getItem("sc-settings") || "{}"));
+  const w = JSON.parse(localStorage.getItem("sc-wcal") || "null");
+  if (w) S.wcal = Object.assign({}, WCAL_DEFAULT, w);
+} catch (e) {}
 // order of opened files (dataset order, e.g. retest runs): time | name | none
-S.optSort = "time";
-try { S.optSort = localStorage.getItem("sc-sort") || "time"; } catch (e) {}
+S.optSort = S.cfg.sort;
+S.optDedup = S.cfg.dedup;
+S.optMerge = S.cfg.merge;
+S.lbTest = S.cfg.lbTest;
+function saveCfg() {
+  Object.assign(S.cfg, { sort: S.optSort, dedup: S.optDedup || "", merge: !!S.optMerge, lbTest: S.lbTest || "5100" });
+  try { localStorage.setItem("sc-settings", JSON.stringify(S.cfg)); localStorage.setItem("sc-sort", S.cfg.sort); if (S.wcal) localStorage.setItem("sc-wcal", JSON.stringify(S.wcal)); } catch (e) {}
+}
 const main = document.getElementById("main");
 const GROUPS = [["", "none"], ["pass", "good / bad"], ["alarm", "alarm"], ["site", "test site"], ["head", "head"], ["hbin", "hard bin"], ["sbin", "soft bin"], ["wafer", "wafer"], ["file", "file / lot"], ["loadboard", "loadboard"], ["site_loadboard", "site × loadboard"]];
 /** Loadboard test number input (a session setting: the `loadboard` field reads this test's most common value per file). */
 function loadboardField() {
   const i = h("input", { type: "text", value: S.lbTest || "5100", style: { width: "80px" }, title: "Test number holding the loadboard (DIB) ID. Read per file (its most common value), so parts missing it still get the file's board. Usable as the field `loadboard` in filters, color-by, ANOVA and commonality, and `site_loadboard` for site × board.",
-    onchange: async (e) => { const v = e.target.value.trim(); try { const r = await api("loadboard", { test: v }); S.lbTest = String(r.test); S.testsCache = {}; toast(`Loadboard = test ${r.test}`, "good"); } catch (err) { toast(err.message, "bad"); } } });
+    onchange: async (e) => { const v = e.target.value.trim(); try { const r = await api("loadboard", { test: v }); S.lbTest = String(r.test); saveCfg(); S.testsCache = {}; toast(`Loadboard = test ${r.test}`, "good"); } catch (err) { toast(err.message, "bad"); } } });
   return field("Loadboard test", i);
 }
 
@@ -46,8 +63,76 @@ function chartOpts(onRange, opts) {
     opts.extra || null);
 }
 
+/** Histogram bins: the server cuts every automatic bin into `_fine` parts;
+ *  a chart's slider (scale ×¼ … ×4 the default count) merges them back. */
+const BIN_SCALES = [0.25, 0.5, 1, 2, 4];
+function rebin(f, scale) {
+  for (const t of f.data || []) {
+    if (t.type === "histogram") { t.nbinsx = Math.max(2, Math.round((t.nbinsx || 30) * scale)); continue; }
+    if (t.type !== "bar" || !t._fine || !Array.isArray(t.x) || t.x.length < 2) continue;
+    const m = Math.max(1, Math.round(t._fine / scale));
+    const w = (t.x[t.x.length - 1] - t.x[0]) / (t.x.length - 1);
+    if (m > 1) {
+      const xs = [], ys = [], cs = [];
+      for (let i = 0; i < t.x.length; i += m) {
+        const n = Math.min(m, t.x.length - i);
+        let y = 0, c = 0;
+        for (let j = i; j < i + n; j++) { y += t.y[j] || 0; c += (t.customdata && t.customdata[j]) || 0; }
+        xs.push(t.x[i] - w / 2 + (w * n) / 2); ys.push(y); cs.push(c);
+      }
+      t.x = xs; t.y = ys; if (t.customdata) t.customdata = cs;
+    }
+    t.width = w * m * 0.98;
+  }
+  return f;
+}
+const hasHist = (f) => (f.data || []).some((t) => t.type === "histogram" || (t.type === "bar" && t._fine));
+/** A bin-size slider above every histogram chart (once per chart element). */
+function histSlider(el, f) {
+  const prev = el.previousElementSibling;
+  const has = prev && prev.classList && prev.classList.contains("bin-slider");
+  if (!hasHist(f) || f._dim === "3d") { if (has) prev.remove(); return; }
+  if (has) return;
+  const i0 = BIN_SCALES.indexOf(el._binScale || 1);
+  const lab = h("span", { class: "muted small" });
+  const show = (k) => { const s = BIN_SCALES[k]; lab.textContent = s === 1 ? "(default)" : s < 1 ? `(${1 / s}× wider bins)` : `(${s}× finer bins)`; };
+  const r = h("input", { type: "range", min: 0, max: BIN_SCALES.length - 1, step: 1, value: i0 < 0 ? 2 : i0, title: "Bin size: wider bins smooth the shape, narrower bins show detail",
+    oninput: (e) => { el._binScale = BIN_SCALES[+e.target.value]; show(+e.target.value); plot(el, el._fig); } });
+  show(i0 < 0 ? 2 : i0);
+  el.before(h("div", { class: "bin-slider row tight small" }, h("span", { class: "muted" }, "Bins: wide"), r, h("span", { class: "muted" }, "fine"), lab));
+}
+
+/** Box plot with its groups shown as "A" / "B" (the part before ":") so
+ *  small charts keep their room; the hover keeps the full name. */
+function shortBoxes(fig) {
+  const short = (s) => String(s).split(":")[0];
+  return Object.assign({}, fig, {
+    data: (fig.data || []).map((t) => Object.assign({}, t, { x: (t.x || []).map(short) })),
+    layout: Object.assign({}, fig.layout, { margin: Object.assign({}, (fig.layout || {}).margin, { b: 30 }) }),
+  });
+}
+/** A histogram with the box plot of the same groups underneath, horizontal,
+ *  sharing the value axis. */
+function histWithBox(hist, box) {
+  if (!hist || !box || !(box.data || []).length) return hist;
+  const bx = box.data.map((t) => {
+    const c = Object.assign({}, t, { xaxis: "x", yaxis: "y2" });
+    if (t.type === "box") { c.orientation = "h"; c.y = t.x; delete c.x; c.hovertemplate = t.hovertemplate; }
+    else { c.x = t.y; c.y = t.x; c.hovertemplate = "%{x:.4g}<extra>outlier</extra>"; }
+    return c;
+  });
+  const nb = box.data.filter((t) => t.type === "box").length;
+  const hb = Math.min(0.4, 0.1 + 0.05 * nb);
+  const l = Object.assign({}, hist.layout);
+  l.yaxis = Object.assign({}, l.yaxis, { domain: [hb + 0.06, 1] });
+  l.yaxis2 = { domain: [0, hb], type: "category", automargin: true, showgrid: false, autorange: "reversed" };
+  l.xaxis = Object.assign({}, l.xaxis, { anchor: "y2" });
+  return { data: [...hist.data, ...bx], layout: l };
+}
+
 /** Applies the chart options to a resolved Plotly figure. */
-function chartTransform(f) {
+function chartTransform(f, el) {
+  rebin(f, (el && el._binScale) || 1);
   const op = S.co.opacity;
   // figures marked _normable (compare views) follow the % / counts switch
   if (f._normable && S.co.hist === "count") {
@@ -122,7 +207,7 @@ function to3D(f) {
   return out(traces.concat(limitFrames(zmin, zmax, series.length, xr).filter((tr) => tr.z.every((v) => isFinite(v)) && (!xr || tr.x.every((v) => v >= xr[0] && v <= xr[1])) && tr.z.every((v) => v >= zmin && v <= zmax))), scene(title(L.yaxis), lanesOf(series)));
 }
 const op3 = () => Math.max(0.15, S.co.opacity);
-SC.setTransform(chartTransform);
+SC.setTransform(chartTransform, histSlider);
 
 /** Modal text prompt; resolves to the text or null. */
 function askText(title, value, hint) {
@@ -184,7 +269,7 @@ const VIEWS = {
   explorer: { label: "Test explorer", fn: viewExplorer },
   wafer: { label: "Wafer maps", fn: viewWafer },
   compare: { label: "Compare", fn: viewCompare },
-  match: { label: "Match & trace", fn: viewMatch },
+  match: { label: "Match, merge & trace", fn: viewMatch },
   investigation: { label: "Failure investigation", fn: viewInvestigation },
   candidates: { label: "Bad candidates", fn: viewCandidates },
   signature: { label: "Signature check", fn: viewSignature },
@@ -194,14 +279,18 @@ const VIEWS = {
   anomaly: { label: "Abnormal parts", fn: viewAnomaly },
   ml: { label: "Machine learning", fn: viewML },
   records: { label: "Records", fn: viewRecords },
-  export: { label: "Split & export", fn: viewExport },
+  datalog: { label: "Part datalog", fn: viewDatalog },
+  export: { label: "Merge, split & export", fn: viewExport },
+  settings: { label: "Settings", fn: viewSettings, always: true },
 };
 
+// a heading above the first view of each group ("" = a plain separator)
+const NAV_GROUPS = { overview: "Explore", match: "Investigate", correlation: "Statistics", records: "Data & files", settings: "" };
 function renderNav() {
   const nav = document.getElementById("nav");
   nav.replaceChildren();
   for (const [k, v] of Object.entries(VIEWS)) {
-    if (k === "overview" || k === "export") nav.append(h("div", { class: "sep" }));
+    if (NAV_GROUPS[k] !== undefined) nav.append(NAV_GROUPS[k] ? h("div", { class: "nav-group" }, NAV_GROUPS[k]) : h("div", { class: "sep" }));
     const disabled = !v.always && !S.datasets.length;
     nav.append(h("button", { class: (S.view === k ? "active" : "") + (disabled ? " dim" : ""), onclick: () => go(k), title: disabled ? "Open an STDF file first" : "" }, v.label));
   }
@@ -322,13 +411,18 @@ async function viewExplorer(el) {
       const hidKey = S.explorerGroup || "";
       const hidden = (S.explorerHidden ||= {})[hidKey] ||= new Set();
       const isOf = (tr, name) => tr.name === name || (tr.name || "").startsWith(`${name} (n=`) || tr.name === `${name} outliers`;
+      const shown = (k) => (multi && hidden.size ? Object.assign({}, d[k], { data: d[k].data.filter((tr) => !d.stats.some((x) => hidden.has(x.group) && isOf(tr, x.group))) }) : d[k]);
       const plotAll = () => {
         g.replaceChildren();
-        for (const k of ["hist", "box", "cdf", "trend"]) {
+        // histogram with its box plot underneath on one value axis, then CDF and trend
+        const [hc, c0] = chartBox("tall");
+        hc.style.gridColumn = "1 / -1";
+        g.append(hc);
+        plot(c0, histWithBox(shown("hist"), shown("box")));
+        for (const k of ["cdf", "trend"]) {
           const [card, c] = chartBox();
           g.append(card);
-          const fig = multi && hidden.size ? Object.assign({}, d[k], { data: d[k].data.filter((tr) => !d.stats.some((x) => hidden.has(x.group) && isOf(tr, x.group))) }) : d[k];
-          plot(c, fig);
+          plot(c, shown(k));
         }
       };
       plotAll();
@@ -373,7 +467,7 @@ async function viewWafer(el) {
   const omode = select([["add", "X + offset"], ["sub", "X − offset"]], wc.mode, () => cal());
   const fx = h("input", { type: "checkbox", checked: wc.fx, onchange: () => cal() });
   const fy = h("input", { type: "checkbox", checked: wc.fy, onchange: () => cal() });
-  function cal() { Object.assign(wc, { w: wt.value, x: xt.value, y: yt.value, ox: oxt.value, oy: oyt.value, mode: omode.value, fx: fx.checked, fy: fy.checked }); S.wafer = "all"; draw(); }
+  function cal() { Object.assign(wc, { w: wt.value, x: xt.value, y: yt.value, ox: oxt.value, oy: oyt.value, mode: omode.value, fx: fx.checked, fy: fy.checked }); saveCfg(); S.wafer = "all"; draw(); }
   for (const i of [wt, xt, yt, oxt, oyt]) i.addEventListener("change", cal);
   const wafer = select([["all", "all wafers (gallery)"]], "all", (v) => { S.wafer = v; draw(); });
   const ctl = h("div", { class: "controls" });
@@ -447,7 +541,25 @@ async function runCompare(out, params) {
     mkBox.replaceChildren(h("h2", {}, "Marker candidates"), h("div", { class: "loading" }, "Ranking every test (statistics + random forest)…"));
     const fetchTop = (key) => api("chart", Object.assign({}, params, { kind: "compare_test", ds: params.a, test: key, range: S.co.range })).then((c) => c.hist);
     mkP.then((mk) => (mk instanceof Error ? showErr(mkBox, mk) : renderMarkers(mkBox, mk, (row) => pick && pick(row), { fetchTop })));
-    out.replaceChildren(chartOpts(() => runCompare(out, params), { hist: true }), mkBox, h("h2", {}, "Full comparison"), h("div", { class: "kpis" },
+    // box plots of the top tests, A and B side by side per test
+    const boxes = h("div");
+    const boxKeys = mkP.then((mk) => (mk instanceof Error || !mk.rows ? r.tests.map((t) => t.key) : mk.rows.map((x) => x.key)));
+    let shownBoxes = 0;
+    const moreBoxes = async (n) => {
+      const keys = (await boxKeys).slice(shownBoxes, shownBoxes + n);
+      shownBoxes += keys.length;
+      const grid = boxes.querySelector(".grid4");
+      for (const key of keys) {
+        const [card, c] = chartBox();
+        grid.append(card);
+        api("chart", Object.assign({}, params, { kind: "compare_test", ds: params.a, test: key, range: S.co.range })).then((x) => plot(c, shortBoxes(x.box))).catch((e) => showErr(c, e));
+      }
+      more.hidden = shownBoxes >= (await boxKeys).length;
+    };
+    const more = h("button", { onclick: () => moreBoxes(8) }, "Show 8 more");
+    boxes.append(h("h2", {}, "Box plots"), h("p", { class: "lead" }, "The top marker tests (or the most severe tests), each with A and B side by side on one value axis. Dashed lines are the limits."), h("div", { class: "grid4" }), more);
+    moreBoxes(8);
+    out.replaceChildren(chartOpts(() => runCompare(out, params), { hist: true }), mkBox, boxes, h("h2", {}, "Full comparison"), h("div", { class: "kpis" },
       kpi(r.label_a, pct(r.yield_a), `${r.n_a.toLocaleString()} parts`),
       kpi(r.label_b, pct(r.yield_b), `${r.n_b.toLocaleString()} parts`),
       kpi("Yield delta", (r.yield_b - r.yield_a >= 0 ? "+" : "") + (r.yield_b - r.yield_a).toFixed(2) + " pt"),
@@ -1060,7 +1172,7 @@ function recRaw(el) {
 const KEYS = [["part_txt", "PRR part text (PART_TXT)"], ["part_id", "PRR part ID"], ["wafer_xy", "PRR wafer + X/Y"], ["xy", "PRR X/Y only"], ["tests", "PTR test result(s)…"]];
 function keyPicker(side, ds) {
   S.mk = S.mk || {};
-  const cur = S.mk[side] || "part_txt";
+  const cur = S.mk[side] || S.cfg.key;
   const isTests = !KEYS.some(([k]) => k === cur);
   const sel = select(KEYS, isTests ? "tests" : cur, () => sync());
   const tests = h("input", { type: "text", value: isTests ? cur.replace(/^tests:/, "") : "500", placeholder: "e.g. 500  or  501,502,503", title: "One test with a unique per-part value, or several tests whose values together identify the part (e.g. wafer, X, Y)", style: { width: "190px" }, oninput: () => sync() });
@@ -1070,7 +1182,7 @@ function keyPicker(side, ds) {
   return { el: h("div", { class: "row tight" }, sel, tests), value };
 }
 function viewMatch(el) {
-  el.append(h("h1", {}, "Match & trace"), h("p", { class: "lead" }, "Find the same physical parts in two files and follow them across: by PRR part text or part ID, by die X/Y, or by datalogged PTR results (one test holding a unique wafer + X/Y code, or wafer, X and Y in separate tests). Matched parts become a part set you can filter on, compare, split out and chart side by side."));
+  el.append(h("h1", {}, "Match, merge & trace"), mergeCard(), h("p", { class: "lead" }, "Find the same physical parts in two files and follow them across: by PRR part text or part ID, by die X/Y, or by datalogged PTR results (one test holding a unique wafer + X/Y code, or wafer, X and Y in separate tests). Matched parts become a part set you can filter on, compare, split out and chart side by side."));
   const ids = S.datasets.map((d) => d.id);
   const st = S.m || (S.m = { a: S.ds, b: otherDs(S.ds), name: "match", fa: "", fb: "" });
   if (!ids.includes(st.a)) st.a = S.ds;
@@ -1251,7 +1363,7 @@ const SCREEN_VERDICT = { "resembles lot A": "bad", elevated: "warn", "like the r
 /** Signature check settings, seeded from Bad candidates. */
 function sigState() {
   const bc = S.bc || {};
-  return S.sg || (S.sg = { a: bc.a ?? S.ds, name: bc.name || "bad_candidate", filter: bc.good || "hbin = 1", exclude: bc.exclude ?? "500, 80100-80104", max: 5, clean: [], screen: [], stayed: [], useClean: true, useConf: true, useStayed: true, confirmed: "confirmed_good", noMarginal: false });
+  return S.sg || (S.sg = { a: bc.a ?? S.ds, name: bc.name || "bad_candidate", filter: bc.good || "hbin = 1", exclude: bc.exclude ?? S.cfg.exclude, max: 5, clean: [], screen: [], stayed: [], useClean: true, useConf: true, useStayed: true, confirmed: "confirmed_good", noMarginal: false });
 }
 function viewSignature(el) {
   el.append(h("h1", {}, "Signature check"), h("p", { class: "lead" }, "Learn a failure signature from the bad candidates of the lot with the issue (lot A), throw out what known-good parts also show, and screen other files with what is left. Run Bad candidates first: it creates the part sets the signature is learned from ($bad_candidate) and checked against ($confirmed_good)."));
@@ -1426,11 +1538,11 @@ function signatureHelp() {
 
 // ---- Bad candidates
 /** Wafer-coordinate settings shared with the wafer view (tests 80100–80104 by default). */
-function waferCal() { return S.wcal || (S.wcal = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false }); }
+function waferCal() { return S.wcal || (S.wcal = Object.assign({}, WCAL_DEFAULT)); }
 function viewCandidates(el) {
   el.append(h("h1", {}, "Bad candidates"), h("p", { class: "lead" }, "Parts that were good in file 1 but are bad in file 2 (e.g. failing one test, optionally only with its file-2 value in a range), found by matching the two files by part text. Instead of splitting anything, the matched good parts of file 1 are marked as bad candidates and compared with every other good part of file 1: which tests, outlier scores, sites, wafer zones or field positions set them apart, and which tests to focus on. Good parts that pass file 2 are marked as confirmed good."));
   if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open both files (without 'combine'): file 1 with most parts, file 2 with the parts that became bad.")); return; }
-  const st = S.bc || (S.bc = { a: S.ds, b: otherDs(S.ds), good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: "500, 80100-80104", coords: "auto" });
+  const st = S.bc || (S.bc = { a: S.ds, b: otherDs(S.ds), good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: S.cfg.exclude, coords: "auto" });
   const ids = S.datasets.map((d) => d.id);
   if (!ids.includes(st.a)) st.a = S.ds;
   if (!ids.includes(st.b) || st.b === st.a) st.b = otherDs(st.a);
@@ -1700,7 +1812,7 @@ async function trace(el, params) {
 // ---- Failure investigation (a case: files with roles, settings, steps)
 function invCase() {
   const ids = S.datasets.map((d) => d.id);
-  return S.inv || (S.inv = { name: "case 1", test: "", loadboard: S.lbTest || "5100", exclude: "500, 80100-80104", key: "part_txt", good: "pass",
+  return S.inv || (S.inv = { name: "case 1", test: "", loadboard: S.lbTest || "5100", exclude: S.cfg.exclude, key: "part_txt", good: "pass",
     lots: [{ name: "Lot A", kind: "issue", run1: ids[0], retest: ids[1] ?? ids[0], chain: [] }, { name: "Lot B", kind: "clean", run1: ids[2] ?? ids[0] }],
     screen: [], window: { from: "auto", mode: "strict", tol: 5, unit: "pct" }, maxRate: 10, minZone: 10 });
 }
@@ -1983,7 +2095,7 @@ function viewRetest(el) {
   el.append(h("h1", {}, "Retest trace"), h("p", { class: "lead" }, "Follow parts through a chain of runs: run 1, then a retest of its rejects, then a retest of those rejects, and so on; a run may also retest good parts (e.g. the good parts of runs 1 and 2), and their rejects are followed on. Pick the starting parts in run 1 (e.g. the ones failing test 1013); each later run is searched for the same physical part, so you see per run whether it passed or failed, its bin and the traced test's value, and how the population shrinks."));
   if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open run 1 and at least one retest file (without 'combine').")); return; }
   const ids = S.datasets.map((d) => d.id);
-  const st = S.rt || (S.rt = { runs: ids.slice(0, 3), mode: "reject", custom: "", tests: "", exclude: "500, 80100-80104", valueFrom: "first", maxRate: 10, minZone: 10 });
+  const st = S.rt || (S.rt = { runs: ids.slice(0, 3), mode: "reject", custom: "", tests: "", exclude: S.cfg.exclude, valueFrom: "first", maxRate: 10, minZone: 10 });
   st.runs = st.runs.filter((x) => ids.includes(x));
   while (st.runs.length < 2) { const o = ids.find((x) => !st.runs.includes(x)); if (o === undefined) break; st.runs.push(o); }
   const runsBox = h("div");
@@ -2192,7 +2304,7 @@ function renderRetest(out, traceBox, d) {
     const useRange = (z0) => {
       const z = sendRange(z0), how = rangeHow();
       const bId = d.runs[runOf()].id;
-      const bc = S.bc || (S.bc = { a: S.ds, b: bId, good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: "500, 80100-80104", coords: "auto" });
+      const bc = S.bc || (S.bc = { a: S.ds, b: bId, good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: S.cfg.exclude, coords: "auto" });
       Object.assign(bc, { b: bId, test: String(t.num), how: "fail", range: `${g4(z.lo)}..${g4(z.hi)}`, rangeNote: `from Retest trace, ${how}: ${rc.zones.find((x) => x.kind === "hard_bad").recovered} of ${rc.zones.find((x) => x.kind === "hard_bad").n} recovered in ${d.runs.map((r) => r.name).join(" → ")}` });
       if (bc.a === bId) bc.a = otherDs(bId);
       S.bcLast = null;
@@ -2318,7 +2430,7 @@ function renderRetestCandidates(out, d) {
     h("button", { class: "primary", onclick: find }, "Find candidate tests"),
     h("button", { onclick: () => useFilter(a, "$rt_bad_candidate") }, "Analyse the candidates ($rt_bad_candidate)"),
     h("button", { title: "Profile run 1 against the first retest of good parts on the Bad candidates page (outlier scores, sites, wafer zones, focus tests)", onclick: () => {
-      S.bc = Object.assign(S.bc || {}, { a, b: later, good: "pass", test: String(t0.num), how: "fail", range: "", rangeNote: `from Retest trace: ${rl(c.good_runs[0])} retested good parts`, incMarg: false, extra: "", name: "bad_candidate", exclude: S.rt.exclude || "500, 80100-80104", coords: "auto" });
+      S.bc = Object.assign(S.bc || {}, { a, b: later, good: "pass", test: String(t0.num), how: "fail", range: "", rangeNote: `from Retest trace: ${rl(c.good_runs[0])} retested good parts`, incMarg: false, extra: "", name: "bad_candidate", exclude: S.rt.exclude || S.cfg.exclude, coords: "auto" });
       S.bcLast = null; go("candidates");
     } }, "Full profile in Bad candidates →")));
 }
@@ -2386,11 +2498,11 @@ function retestHelp() {
 const FILE_HINT = "STDF v4 files: .stdf, .std or gzip-compressed .gz";
 async function viewHome(el) {
   const has = S.datasets.length > 0;
-  const merge = h("input", { type: "checkbox", checked: !!S.optMerge, onchange: (e) => (S.optMerge = e.target.checked) });
-  const dedup = select([["", "keep every test (incl. retests)"], ["last", "keep the last test of each part"], ["first", "keep the first test of each part"]], S.optDedup || "", (v) => (S.optDedup = v));
+  const merge = h("input", { type: "checkbox", checked: !!S.optMerge, onchange: (e) => { S.optMerge = e.target.checked; saveCfg(); } });
+  const dedup = select([["", "keep every test (incl. retests)"], ["last", "keep the last test of each part"], ["first", "keep the first test of each part"]], S.optDedup || "", (v) => { S.optDedup = v; saveCfg(); });
   const browse = h("button", { class: "primary big", onclick: openFiles }, "Open STDF files…");
   const folder = S.info && S.info.native_dialogs ? h("button", { onclick: (e) => { e.stopPropagation(); openFolder(); } }, "Open folder…") : null;
-  const sortSel = select([["time", "by test start time (MIR), else file time"], ["name", "by file name (run2 before run10)"], ["none", "as given"]], S.optSort, (v) => { S.optSort = v; try { localStorage.setItem("sc-sort", v); } catch (e) {} });
+  const sortSel = select([["time", "by test start time (MIR), else file time"], ["name", "by file name (run2 before run10)"], ["none", "as given"]], S.optSort, (v) => { S.optSort = v; saveCfg(); });
   const drop = h("div", { class: "dropzone", onclick: openFiles },
     h("img", { src: "/static/icon.png", alt: "", width: 64, height: 64 }),
     h("div", { class: "dz-title" }, has ? "Add more files" : "Drop STDF files or folders here"),
@@ -2447,13 +2559,18 @@ async function viewHome(el) {
     ["explorer", "Test explorer", "Histogram, box, CDF and trend of any test vs limits"],
     ["wafer", "Wafer maps", "Bin or test-value maps per wafer"],
     ["compare", "Compare", "Lot vs lot, or a group of parts vs the rest"],
-    ["match", "Match & trace", "Same parts in two files by part text, X/Y or logged tests"],
+    ["match", "Match, merge & trace", "Same parts in two files; merge pieces of one lot"],
+    ["investigation", "Failure investigation", "One case: recovery window, bad candidates, signature, screening"],
+    ["candidates", "Bad candidates", "Good parts that went bad, and which tests set them apart"],
+    ["signature", "Signature check", "Learn rules from bad candidates, check them on good parts"],
+    ["retest", "Retest trace", "Follow parts through up to 8 runs, by site and value"],
     ["correlation", "Correlation", "Tester-to-tester correlation, test-to-test matrix"],
     ["anova", "ANOVA", "Which tests differ by site, wafer or lot"],
     ["anomaly", "Abnormal parts", "PAT, robust z, wafer NNR, Isolation Forest"],
     ["ml", "Machine learning", "What drives fails? PCA & clustering"],
     ["records", "Records", "Part table and every raw STDF record"],
-    ["export", "Split & export", "Split STDF by part/bin, CSV, HTML report"],
+    ["datalog", "Part datalog", "Chosen tests of chosen parts as text or CSV"],
+    ["export", "Merge, split & export", "Merge or split STDF, CSV, HTML report"],
   ];
   right.append(h("div", { class: "tips" }, tips.map(([k, t, d]) => h("button", { class: "tip", disabled: !has, onclick: () => go(k) }, h("b", {}, t), h("span", {}, d)))));
 }
@@ -2600,6 +2717,234 @@ function pathField(kind, value, opts) {
 function resultLine(msg, path) {
   return h("div", { class: "result-line" }, badge("done", "good"), h("span", {}, msg), path && S.info && S.info.app_mode ? h("button", { class: "ghost", onclick: () => api("reveal", { path }) }, "Show in folder") : null);
 }
+// files of one lot and test step (same lot, test code and flow): combine them
+// in the app or write one STDF file, in the order and with the part IDs chosen
+function mergeCard() {
+  const box = h("div");
+  const card = h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "Merge"),
+    h("p", { class: "muted" }, "Open files of the same lot and test step (MIR lot, test code and flow) are offered for merging, e.g. wafers tested on two testers. Merge them into one dataset here, or into one STDF file in the order you set. Files that share parts (a retest) can be merged too: the page says how many parts they share."), box);
+  const files = () => S.datasets.filter((d) => d.files === 1 && !d.derived);
+  const dsPaths = (ids) => ids.map((id) => S.datasets.find((d) => d.id === id).paths[0]);
+  const combine = async (ids) => {
+    busy("Combining…");
+    try { const r = await api("load", { paths: dsPaths(ids), merge: true, sort: "none" }); await refreshDatasets(r.ids[0]); toast("Combined into one dataset", "good"); go("overview"); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+  };
+  const fileLine = (f) => [f.n_parts != null ? `${f.n_parts.toLocaleString()} parts` : "", f.wafers && f.wafers.length ? `${f.wafers.length} wafer(s): ${f.wafers.slice(0, 6).join(", ")}${f.wafers.length > 6 ? "…" : ""}` : "", f.tester || ""].filter(Boolean).join(" · ");
+  // `list`: [{id, name, …}] in merge order; ↑ ↓ change it
+  const writer = (list, label) => {
+    list = list.slice();
+    const first = S.datasets.find((d) => d.id === list[0].id);
+    const dir = dirname(first.paths[0]), sep = dir.includes("\\") ? "\\" : "/";
+    const base = (label || first.name).replace(/\.(stdf|std)(\.gz)?$/i, "").replace(/[^\w.-]+/g, "_");
+    const [path, pf] = pathField("save", dir + sep + base + "_merged.stdf", { title: "Save merged STDF", name: base + "_merged.stdf", ext: "stdf" });
+    const renumber = h("input", { type: "checkbox" });
+    const order = h("ol", { class: "small merge-order" });
+    const drawOrder = () => order.replaceChildren(...list.map((f, i) => h("li", {}, h("b", {}, f.name), fileLine(f) ? ` · ${fileLine(f)}` : "", " ",
+      h("button", { class: "ghost", title: "Move up", disabled: i === 0, onclick: () => { [list[i - 1], list[i]] = [list[i], list[i - 1]]; drawOrder(); } }, "↑"),
+      h("button", { class: "ghost", title: "Move down", disabled: i === list.length - 1, onclick: () => { [list[i + 1], list[i]] = [list[i], list[i + 1]]; drawOrder(); } }, "↓"))));
+    drawOrder();
+    const res = h("div");
+    return h("div", {}, h("div", { class: "muted small" }, "Merge order (the first file's header opens the merged file):"), order,
+      h("label", { class: "chk", title: "Each later file's part IDs are raised by the highest part ID written before it (e.g. file 1 ends at 481: file 2's part 1 becomes 482). Part IDs that are not numbers are counted up instead." }, renumber, "Renumber part IDs: each file continues from the previous file's last part ID"),
+      h("div", { class: "row" }, pf,
+        h("button", { class: "primary", onclick: async () => {
+          if (!path.value) return toast("Choose where to save the merged file", "bad");
+          busy("Writing merged STDF…");
+          try {
+            const r = await api("merge_files", { ds: list.map((f) => f.id), path: path.value, renumber: renumber.checked });
+            res.replaceChildren(resultLine(`Saved ${r.path}: ${r.parts.toLocaleString()} parts (${r.good.toLocaleString()} good) from ${r.files} files`, r.path), h("button", { onclick: () => loadPaths([r.path]) }, "Open it"));
+          } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+        } }, "Save merged STDF"),
+        h("button", { onclick: () => combine(list.map((f) => f.id)) }, "Combine in the app")), res);
+  };
+  const draw = (groups) => {
+    const rows = groups.map((g) => {
+      const label = [g.lot && `lot ${g.lot}`, g.step && `step ${g.step}`, g.flow && `flow ${g.flow}`].filter(Boolean).join(" · ") || "no lot or step in the files";
+      const verdict = !g.by ? badge("no wafer + X/Y or part text to compare parts", "neutral")
+        : g.shared ? badge(`${g.shared.toLocaleString()} shared parts (by ${g.by})`, "warn")
+        : badge(`no shared parts (by ${g.by}): pieces of one test`, "good");
+      const pairs = g.pairs && g.pairs.length ? h("ul", { class: "small" }, g.pairs.map((x) => h("li", {}, `${dsName(x.a)} and ${dsName(x.b)} share ${x.shared.toLocaleString()} parts (a retest?): merging keeps both results of those parts`))) : null;
+      return h("div", { class: "card pad", style: { marginBottom: "8px" } }, h("div", { class: "row tight" }, h("b", {}, label), verdict), pairs, writer(g.files, `${g.lot || "lot"}${g.step ? "_" + g.step : ""}`));
+    });
+    // any other selection, for files the check does not group
+    const pick = files().map((d) => [d.id, h("input", { type: "checkbox" })]);
+    const sel = h("div");
+    const manual = h("details", { class: "adv" }, h("summary", {}, "Merge other files"),
+      h("div", { class: "row" }, ...pick.map(([id, c]) => h("label", { class: "chk" }, c, dsName(id)))),
+      h("button", { onclick: () => { const ids = pick.filter(([, c]) => c.checked).map(([id]) => id); if (ids.length < 2) return toast("Tick at least two files", "bad"); sel.replaceChildren(writer(ids.map((id) => ({ id, name: dsName(id) })))); } }, "Merge the ticked files…"), sel);
+    box.replaceChildren(...(rows.length ? rows : [h("p", { class: "muted small" }, files().length > 1 ? "No two open files share a lot and test step." : "Open the files of a lot to merge them.")]), files().length > 1 ? manual : "");
+  };
+  if (files().length > 1) api("merge_candidates").then(draw).catch((e) => showErr(box, e));
+  else draw([]);
+  return card;
+}
+// ---- Part datalog: pick parts, pick tests, write their results
+const DL_MODES = [["part_id", "Part ID"], ["xy", "X/Y"], ["part_txt", "Part text"], ["test_xy", "Die X/Y from tests"]];
+/** A search box that shows the top matches while typing; clicking one (or
+ *  Enter for the first) hands it to `pick`. `find(q)` resolves to
+ *  [{label, value}]. */
+function typeahead(input, find, pick) {
+  const list = h("div", { class: "ta-list", hidden: true });
+  let items = [], seq = 0, timer = null;
+  const render = () => {
+    list.hidden = !items.length;
+    list.replaceChildren(...items.map((it) => h("button", { class: "ta-item", onmousedown: (e) => { e.preventDefault(); choose(it); } }, h("span", { class: "ta-add" }, "＋ Add"), h("span", {}, it.label))));
+  };
+  const choose = (it) => { pick(it.value); input.value = ""; items = []; render(); input.focus(); };
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const q = input.value.trim(), my = ++seq;
+    if (!q) { items = []; render(); return; }
+    timer = setTimeout(async () => { try { const r = await find(q); if (my === seq) { items = r; render(); } } catch (e) { items = []; render(); } }, 150);
+  });
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter" && items.length) { e.preventDefault(); choose(items[0]); } });
+  input.addEventListener("blur", () => setTimeout(() => { list.hidden = true; }, 150));
+  input.addEventListener("focus", () => { if (items.length) list.hidden = false; });
+  return h("div", { class: "ta" }, input, list);
+}
+function viewDatalog(el) {
+  const ds = S.datasets.find((d) => d.id === S.ds);
+  if (!S.dl || S.dl.ds !== S.ds) S.dl = { ds: S.ds, parts: [], tests: S.dl ? S.dl.tests : [], modes: S.dl ? S.dl.modes : ["part_id", "xy", "part_txt"], format: S.dl ? S.dl.format : "txt" };
+  const st = S.dl;
+  if (typeof st.tests === "string") st.tests = st.tests.split(",").map((x) => x.trim()).filter(Boolean);
+  el.append(h("h1", {}, "Part datalog"), h("p", { class: "lead" }, `Pick parts of ${ds ? ds.name : "the dataset"} and the tests you want, then get every result with its limits as easy-to-read text or CSV. Switch the dataset at the top to use another file.`));
+  const wc = waferCal();
+  const calParams = () => ({ wafer_test: wc.w, x_test: wc.x, y_test: wc.y, ox_test: wc.ox, oy_test: wc.oy, offset_mode: wc.mode, flip_x: wc.fx, flip_y: wc.fy });
+  const findParts = (q, limit) => api("find_parts", Object.assign({ ds: S.ds, q, by: st.modes.join(","), limit }, calParams()));
+  const label = (r) => [`part ${r.part_id}`, r.part_txt, r.x != null ? `${r.wafer ? r.wafer + " " : ""}X${r.x} Y${r.y}` : "", r.test_xy ? `tests: ${r.test_xy.wafer} X${r.test_xy.x} Y${r.test_xy.y}` : "", `site ${r.site}`, `bin ${r.hbin}`].filter(Boolean).join(" · ");
+  const has = (r) => st.parts.some((p) => p.index === r.index);
+  const add = (rows) => { let n = 0; for (const r of rows) if (!has(r)) { st.parts.push(Object.assign({ mark: "" }, r)); n++; } drawList(); return n; };
+  // 1 · find parts: ticked ways to match, live top 3, full list, pasted list
+  const modes = h("div", { class: "row tight" }, DL_MODES.map(([k, l]) => h("label", { class: "chk", title: k === "test_xy" ? `Wafer, X and Y from tests ${[wc.w, wc.x, wc.y].filter(Boolean).join(" / ")}${wc.ox ? `, offsets ${wc.ox} / ${wc.oy}` : ""} (change them on the Settings page)` : "" },
+    h("input", { type: "checkbox", checked: st.modes.includes(k), onchange: (e) => { st.modes = DL_MODES.map(([m]) => m).filter((m) => (m === k ? e.target.checked : st.modes.includes(m))); } }), l)),
+    h("button", { class: "ghost small", onclick: () => go("settings"), title: "Tests for die X/Y" }, "Settings…"));
+  const q = h("input", { type: "text", class: "filter-input", placeholder: "type a part ID (233), X/Y (3,-2  ·  W01 3,-2  ·  X3Y-2) or part text", style: { minWidth: "460px" } });
+  const hits = h("div"), listBox = h("div"), out = h("div");
+  const partSearch = typeahead(q, async (text) => {
+    if (!st.modes.length) return [];
+    const r = await findParts(text, 3);
+    return r.rows.map((x) => ({ label: label(x) + (has(x) ? "  (in the list)" : ""), value: x }));
+  }, (row) => { if (add([row])) toast(`Added part ${row.part_id}`, "good", 1500); });
+  const showAll = async () => {
+    if (!q.value.trim()) return;
+    try {
+      const r = await findParts(q.value, 500);
+      if (!r.rows.length) { hits.replaceChildren(h("p", { class: "muted small" }, "No part matches.")); return; }
+      const tb = h("div");
+      hits.replaceChildren(h("div", { class: "row tight" }, h("span", { class: "muted small" }, `${r.total.toLocaleString()} match(es)${r.total > r.rows.length ? `, first ${r.rows.length} shown` : ""}`),
+        h("button", { onclick: () => { toast(`Added ${add(r.rows)} part(s)`, "good"); } }, "＋ Add all shown")), tb);
+      table(tb, [
+        { key: "add", label: "", render: (v, row) => h("button", { class: "ghost", onclick: (e) => { e.stopPropagation(); add([row]); e.target.textContent = "added"; e.target.disabled = true; } }, has(row) ? "added" : "＋ Add") },
+        { key: "part_id", label: "Part ID" }, { key: "part_txt", label: "Part text" }, { key: "wafer", label: "Wafer" }, { key: "x", label: "X", num: true }, { key: "y", label: "Y", num: true },
+        { key: "site", label: "Site", num: true }, { key: "hbin", label: "HBin", num: true }, { key: "sbin", label: "SBin", num: true }, { key: "first_fail", label: "First fail" },
+      ], r.rows, { search: false, limit: 50 });
+    } catch (e) { showErr(hits, e); }
+  };
+  const paste = h("textarea", { rows: 4, class: "paths", placeholder: "one part per line: part IDs, X/Y or part text", style: { minWidth: "460px" } });
+  const addPasted = async () => {
+    try {
+      const r = await findParts(paste.value, 5000);
+      const n = add(r.rows);
+      hits.replaceChildren(h("p", { class: "muted small" }, `Added ${n} part(s)` + (r.missing.length ? `; not found: ${r.missing.slice(0, 20).join(", ")}${r.missing.length > 20 ? "…" : ""}` : "")));
+    } catch (e) { showErr(hits, e); }
+  };
+  // 2 · the list, each part with an optional mark (the label on the physical unit)
+  function drawList() {
+    if (!st.parts.length) { listBox.replaceChildren(h("p", { class: "muted small" }, "No parts yet: type above and click a match to add it.")); return; }
+    listBox.replaceChildren(h("div", { class: "row tight" }, h("b", {}, `${st.parts.length} part(s)`), h("span", { class: "muted small" }, "Printed in this order (↑ ↓ to move). Mark: the label on the physical unit (1, 2, A, B1…), printed with the part"), h("button", { class: "ghost", onclick: () => { st.parts = []; drawList(); } }, "Clear")),
+      h("table", { class: "dl-parts" }, h("tbody", {}, st.parts.map((p, i) => h("tr", {},
+        h("td", {}, h("input", { type: "text", value: p.mark || "", placeholder: "mark", style: { width: "80px" }, oninput: (e) => (p.mark = e.target.value) })),
+        h("td", {}, label(p)),
+        // the datalog prints the parts in this order
+        h("td", { style: { whiteSpace: "nowrap" } },
+          h("button", { class: "ghost", title: "Move up", disabled: i === 0, onclick: () => { [st.parts[i - 1], st.parts[i]] = [st.parts[i], st.parts[i - 1]]; drawList(); } }, "↑"),
+          h("button", { class: "ghost", title: "Move down", disabled: i === st.parts.length - 1, onclick: () => { [st.parts[i + 1], st.parts[i]] = [st.parts[i], st.parts[i + 1]]; drawList(); } }, "↓"),
+          h("button", { class: "ghost x", title: "Remove", onclick: () => { st.parts.splice(i, 1); drawList(); } }, "×")))))));
+  }
+  // 3 · tests: live top 3 from the file's tests, chips, any number typed (N/A when missing)
+  const testsBox = h("div", { class: "row tight", style: { flexWrap: "wrap" } });
+  const drawTests = () => testsBox.replaceChildren(...(st.tests.length ? st.tests.map((t, i) => h("span", { class: "badge neutral", style: { display: "inline-flex", gap: "6px", alignItems: "center" } }, t,
+    h("button", { class: "ghost x", title: "Remove", onclick: () => { st.tests.splice(i, 1); drawTests(); } }, "×"))) : [h("span", { class: "muted small" }, "No tests picked: every test is written.")]),
+    st.tests.length ? h("button", { class: "ghost", onclick: () => { st.tests = []; drawTests(); } }, "Clear") : "");
+  const addTests = (s) => { for (const t of String(s).split(/[,;]/).map((x) => x.trim()).filter(Boolean)) if (!st.tests.includes(t)) st.tests.push(t); drawTests(); };
+  const tq = h("input", { type: "text", placeholder: "type a test number or name (1013, DUMMY…); Enter adds what you typed", style: { minWidth: "360px" } });
+  const testSearch = typeahead(tq, async (text) => {
+    const ts = await testsFor(S.ds, "");
+    const l = text.toLowerCase().replace(/:.*/, "");
+    // numbers starting with what was typed first, then names containing it
+    const rank = (t) => (String(t.num) === l ? 0 : String(t.num).startsWith(l) ? 1 : t.key.toLowerCase().includes(l) ? 2 : 9);
+    const m = ts.filter((t) => rank(t) < 9).sort((a, b) => rank(a) - rank(b)).slice(0, 3);
+    return m.map((t) => ({ label: `${t.key}${t.units ? ` [${t.disp_units || t.units}]` : ""}${st.tests.includes(t.key) ? "  (picked)" : ""}`, value: t.key }));
+  }, addTests);
+  tq.addEventListener("keydown", (e) => { if (e.key === "Enter" && tq.value.trim()) { e.preventDefault(); addTests(tq.value); tq.value = ""; } });
+  const format = select([["txt", "easy-to-read text (one block per part)"], ["csv", "CSV, one row per part"], ["csv_long", "CSV, one row per result"]], st.format, (v) => (st.format = v));
+  const ext = () => (st.format === "txt" ? "txt" : "csv");
+  const base = () => `${(ds ? ds.name : "datalog").replace(/\.(stdf|std)(\.gz)?$/i, "")}_datalog`;
+  const make = (path) => api("part_datalog", { ds: S.ds, rows: st.parts.map((p) => p.index), marks: st.parts.map((p) => p.mark || ""), tests: st.tests.join(", "), format: format.value, path: path || "" });
+  const note = (r) => `${r.n_parts} part(s) × ${r.n_tests} test(s)` + (r.missing && r.missing.length ? ` · not in this file, written as N/A: ${r.missing.join(", ")}` : "");
+  const preview = async () => {
+    try {
+      const r = await make();
+      const lines = r.text.split("\n");
+      out.replaceChildren(h("p", { class: "muted small" }, note(r) + (lines.length > 400 ? ` · first 400 of ${lines.length} lines shown` : "")),
+        h("pre", { class: "card pad", style: { overflow: "auto", maxHeight: "560px", fontSize: "12px" } }, lines.slice(0, 400).join("\n")));
+    } catch (e) { showErr(out, e); }
+  };
+  const download = async () => { try { const r = await make(); SC.download(`${base()}.${ext()}`, r.text, ext() === "csv" ? "text/csv" : "text/plain"); } catch (e) { toast(e.message, "bad"); } };
+  const native = S.info && S.info.native_dialogs;
+  const saveAs = async () => {
+    try {
+      const p = await api("pick_save", { title: "Save datalog", name: `${base()}.${ext()}`, ext: ext() });
+      if (!p.path) return;
+      const r = await make(p.path);
+      out.replaceChildren(resultLine(`Saved ${r.path}`, r.path), h("p", { class: "muted small" }, note(r)));
+    } catch (e) { toast(e.message, "bad"); }
+  };
+  el.append(h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "1 · Find parts"),
+      h("div", { class: "row tight" }, h("span", { class: "muted small" }, "Match by"), modes),
+      h("div", { class: "row tight" }, partSearch, h("button", { onclick: showAll }, "Show all matches")),
+      h("details", { class: "adv" }, h("summary", {}, "Paste a list of parts"), paste, h("button", { onclick: addPasted }, "＋ Add the list")), hits),
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "2 · Parts in the datalog"), listBox),
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "3 · Tests and output"),
+      h("div", { class: "row tight" }, testSearch), testsBox,
+      h("div", { class: "controls" }, field("Format", format),
+        h("button", { onclick: preview }, "Preview"), native ? h("button", { class: "primary", onclick: saveAs }, "Save as…") : null, h("button", { class: native ? "" : "primary", onclick: download }, "Download")), out));
+  drawList();
+  drawTests();
+}
+// ---- Settings: defaults used across the views, kept in this browser profile
+function viewSettings(el) {
+  el.append(h("h1", {}, "Settings"), h("p", { class: "lead" }, "Defaults used across the views, saved on this PC. A view's own fields still override them for that analysis."));
+  const sec = (title, note, ...kids) => h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, title), note ? h("p", { class: "muted small" }, note) : null, ...kids);
+  const saved = () => { saveCfg(); toast("Saved", "good", 1500); };
+  const sort = select([["time", "by test start time (MIR), else file time"], ["name", "by file name (run2 before run10)"], ["none", "as given"]], S.optSort, (v) => { S.optSort = v; saved(); });
+  const dedup = select([["", "keep every test (incl. retests)"], ["last", "keep the last test of each part"], ["first", "keep the first test of each part"]], S.optDedup || "", (v) => { S.optDedup = v; saved(); });
+  const merge = h("input", { type: "checkbox", checked: !!S.optMerge, onchange: (e) => { S.optMerge = e.target.checked; saved(); } });
+  const key = select(KEYS.filter(([k]) => k !== "tests"), S.cfg.key, (v) => { S.cfg.key = v; S.mk = {}; saved(); });
+  const excl = h("input", { type: "text", value: S.cfg.exclude, style: { width: "220px" }, onchange: (e) => { S.cfg.exclude = e.target.value; saved(); } });
+  const lb = h("input", { type: "text", value: S.lbTest || "5100", style: { width: "90px" }, onchange: async (e) => { try { const r = await api("loadboard", { test: e.target.value.trim() }); S.lbTest = String(r.test); S.testsCache = {}; saved(); } catch (err) { toast(err.message, "bad"); } } });
+  const wc = waferCal();
+  const inp = (k, ph) => h("input", { type: "text", value: wc[k], placeholder: ph, style: { width: "110px" }, onchange: (e) => { wc[k] = e.target.value.trim(); saved(); } });
+  const omode = select([["add", "X + offset"], ["sub", "X − offset"]], wc.mode, (v) => { wc.mode = v; saved(); });
+  const flip = (k, l) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: !!wc[k], onchange: (e) => { wc[k] = e.target.checked; saved(); } }), l);
+  const range = select([["limits", "within limits"], ["data", "results"], ["both", "both (adaptive)"]], S.co.range, (v) => { S.co.range = v; saveChartOpts(); toast("Saved", "good", 1500); });
+  const hist = select([["pct", "% of group"], ["count", "counts"]], S.co.hist, (v) => { S.co.hist = v; saveChartOpts(); toast("Saved", "good", 1500); });
+  const skin = select([["", "Default"], ["industry", "Industry (steel blue, serif headings)"], ["office", "Office (navy, sky blue, yellow)"], ["work", "Work (burgundy, magenta)"]], SC.getSkin(), (v) => { SC.setSkin(v); document.getElementById("skin").value = v; toast("Saved", "good", 1500); });
+  const reset = () => {
+    S.cfg = Object.assign({}, CFG_DEFAULT); S.wcal = Object.assign({}, WCAL_DEFAULT);
+    S.optSort = S.cfg.sort; S.optDedup = ""; S.optMerge = false; S.mk = {};
+    if (S.lbTest !== "5100") api("loadboard", { test: "5100" }).catch(() => {});
+    S.lbTest = "5100"; saveCfg(); go("settings");
+  };
+  el.append(
+    sec("Opening files", null, h("div", { class: "controls" }, field("Order of opened files", sort), field("Retested parts", dedup), h("label", { class: "chk" }, merge, "Combine the files I open into one dataset"))),
+    sec("Parts and tests", "How parts are identified when files are matched (Match & trace, Bad candidates, Retest trace…), the identity tests left out of rankings (wafer, X/Y, die ID…; ranges allowed), and the test holding the loadboard ID.",
+      h("div", { class: "controls" }, field("Identify parts by", key), field("Leave out tests", excl), field("Loadboard test", lb))),
+    sec("Die X/Y from tests", "For files whose PRR has no die X/Y: the tests holding the wafer, X and Y (and optional X/Y offsets, e.g. a reticle origin). Used by Wafer maps, Bad candidates and the Part datalog's custom wafer X/Y search.",
+      h("div", { class: "controls" }, field("Wafer test", inp("w", "none")), field("X test", inp("x", "X")), field("Y test", inp("y", "Y")), field("X offset test", inp("ox", "none")), field("Y offset test", inp("oy", "none")), field("Offset", omode), flip("fx", "flip X"), flip("fy", "flip Y"))),
+    sec("Look", "Colour theme for the whole app; ◐ at the top switches light and dark. Each histogram also has its own bin-size slider above the chart.", h("div", { class: "controls" }, field("Theme", skin), field("Axis range", range), field("Histogram", hist))),
+    h("div", { class: "row" }, h("button", { onclick: reset }, "Reset to defaults")));
+}
 function viewExport(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
   const base = (ds ? ds.name : "export").replace(/\.(stdf|std)(\.gz)?$/i, "").replace(/\.gz$/i, "");
@@ -2607,7 +2952,7 @@ function viewExport(el) {
   const srcDir = ds && ds.paths.length ? dirname(ds.paths[0]) : "";
   const sep = srcDir.includes("\\") ? "\\" : "/";
   const near = (name) => (srcDir ? srcDir + sep + name : "");
-  el.append(h("h1", {}, "Split & export"), h("p", { class: "lead" }, `Dataset: ${ds ? ds.name : "–"}` + (S.filter ? ` · filter: ${S.filter}` : " · all parts (set a part filter at the top to export a subset)")));
+  el.append(h("h1", {}, "Merge, split & export"), mergeCard(), h("p", { class: "lead" }, `Dataset: ${ds ? ds.name : "–"}` + (S.filter ? ` · filter: ${S.filter}` : " · all parts (set a part filter at the top to export a subset)")));
 
   // report
   const [repPath, repField] = pathField("save", near(base + "_report.html"), { title: "Save HTML report", name: base + "_report.html", ext: "html" });
@@ -2716,6 +3061,11 @@ document.getElementById("apply").addEventListener("click", applyFilter);
 document.getElementById("clear").addEventListener("click", () => { document.getElementById("filter").value = ""; applyFilter(); });
 document.getElementById("filter").addEventListener("keydown", (e) => { if (e.key === "Enter") applyFilter(); });
 document.getElementById("theme").addEventListener("click", SC.toggleTheme);
+{
+  const sk = document.getElementById("skin");
+  sk.value = SC.getSkin();
+  sk.addEventListener("change", () => SC.setSkin(sk.value));
+}
 document.getElementById("rename").addEventListener("click", () => S.datasets.length && renameDs(S.ds));
 {
   const sc = document.getElementById("scope");
@@ -2749,6 +3099,8 @@ SC.initTheme();
   const v = (location.hash || "").slice(1);
   try { S.info = await api("info"); } catch (e) { S.info = {}; }
   if (S.info.version) document.getElementById("ver").textContent = "v" + S.info.version;
+  // a saved loadboard test other than the default is set again on the server
+  if (S.lbTest && S.lbTest !== "5100") api("loadboard", { test: S.lbTest }).catch(() => {});
   try { await refreshDatasets(); } catch (e) { main.append(h("div", { class: "err" }, String(e))); }
   S.view = VIEWS[v] && (S.datasets.length || VIEWS[v].always) ? v : S.datasets.length ? "overview" : "home";
   go(S.view);
