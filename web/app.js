@@ -147,7 +147,8 @@ function chartTransform(f, el) {
   }
   for (const t of f.data || []) {
     if (t.type === "bar" && !t.orientation) t.opacity = op;
-    else if ((t.type === "scatter" || t.type === "scattergl") && t.mode && t.mode.includes("markers") && t.hoverinfo !== "skip") t.marker = Object.assign({}, t.marker, { opacity: op });
+    // `_dim` scales a trace back (e.g. the parts not highlighted)
+    else if ((t.type === "scatter" || t.type === "scattergl") && t.mode && t.mode.includes("markers") && t.hoverinfo !== "skip") t.marker = Object.assign({}, t.marker, { opacity: op * (t._dim ?? 1) });
   }
   return S.co.dim === "3d" ? to3D(f) : f;
 }
@@ -602,6 +603,7 @@ async function runCompare(out, params) {
     pick = (row) => showTest(row, true);
     table(tb, cols, rows, {
       onClick: (row) => showTest(row, true),
+      onClear: () => detail.replaceChildren(),
       tools: h("button", { onclick: () => SC.download("compare.csv", SC.toCSV(cols, rows)) }, "Download CSV"),
     });
     out.append(h("h2", {}, "Site yield"));
@@ -871,6 +873,7 @@ function corrMatrix(el) {
       out.append(h("h2", {}, `Strong pairs (|r| ≥ ${thr.value})`), tb, sc);
       table(tb, [{ key: "a", label: "Test A" }, { key: "b", label: "Test B" }, { key: "r", label: "r", num: true, fmt: (v) => fmt(v, 4) }, { key: "n", label: "N", num: true }], d.pairs, {
         onClick: async (row) => { const s = await api("chart", P({ kind: "scatter", test: row.a, test2: row.b, group_by: "site" })); const [cd, cc] = chartBox("tall"); sc.replaceChildren(cd); plot(cc, s.scatter); },
+        onClear: () => sc.replaceChildren(),
       });
     } catch (e) { showErr(out, e); }
   }
@@ -970,6 +973,7 @@ async function viewAnomaly(el) {
       const rows = d.parts.map((p) => Object.assign({ top: p.top_tests[0] ? `${p.top_tests[0][0]} (z=${p.top_tests[0][1].toFixed(1)})` : "" }, p));
       table(tb, cols, rows, {
         onClick: (row) => partDetail(detail, S.ds, row.row, `Part ${row.part_id} — all tests`),
+        onClear: () => detail.replaceChildren(),
         tools: [h("button", { onclick: () => SC.download("anomalies.csv", SC.toCSV(cols, rows)) }, "Download CSV"), h("button", { onclick: () => { document.getElementById("filter").value = rows.length ? `index in (${rows.map((r) => r.row).join(",")})` : ""; } }, "Use as filter")],
       });
       if (d.pat.length) {
@@ -1062,13 +1066,17 @@ function partSummary(p, wafer) {
 }
 const TEST_COLS = [{ key: "key", label: "Test" }, { key: "value", label: "Value", num: true }, { key: "units", label: "Units" }, { key: "lo", label: "Lo", num: true }, { key: "hi", label: "Hi", num: true }, { key: "robust_z", label: "Robust z", num: true, fmt: (v) => fmt(v, 2) }, { key: "pass", label: "", render: (v) => (v ? badge("in", "good") : badge("out", "bad")) }];
 /** All test results of one part, with its raw records on demand. */
+/** "× Close" that empties a detail box (and runs `after`, e.g. clearing a highlight). */
+function closeBtn(box, after) {
+  return h("button", { class: "ghost small", title: "Close", onclick: () => { box.replaceChildren(); if (after) after(); } }, "× Close");
+}
 async function partDetail(detail, ds, index, title) {
   loading(detail);
   try {
     const pd = await api("part_detail", { ds, index });
     const raw = h("div");
     const t = h("div");
-    detail.replaceChildren(h("h2", {}, title || `Part ${pd.part.part_id}`), h("p", { class: "muted" }, partSummary(pd.part, pd.wafer)),
+    detail.replaceChildren(h("div", { class: "row tight", style: { justifyContent: "space-between" } }, h("h2", {}, title || `Part ${pd.part.part_id}`), closeBtn(detail)), h("p", { class: "muted" }, partSummary(pd.part, pd.wafer)),
       h("div", { class: "row" }, h("button", { onclick: () => partRaw(raw, ds, index) }, "Show raw records (PIR … PRR)")), t, raw);
     table(t, TEST_COLS, pd.tests);
     detail.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1110,6 +1118,7 @@ async function recParts(el) {
     const hasTxt = d.rows.some((r) => r.part_txt);
     table(tb, [{ key: "index", label: "#", num: true }, { key: "part_id", label: "Part ID" }, hasTxt ? { key: "part_txt", label: "Part text" } : null, { key: "wafer", label: "Wafer" }, { key: "x", label: "X", num: true }, { key: "y", label: "Y", num: true }, { key: "head", label: "Head", num: true }, { key: "site", label: "Site", num: true }, { key: "hbin", label: "HBin", num: true }, { key: "sbin", label: "SBin", num: true }, { key: "pass", label: "Result", render: (v) => (v === null ? badge("n/a", "neutral") : v ? badge("good", "good") : badge("bad", "bad")) }, { key: "alarm", label: "Alarm", render: (v) => (v ? badge("alarm", "warn") : "") }, { key: "first_fail", label: "First fail" }, { key: "test_t", label: "Test time ms", num: true }].filter(Boolean), d.rows, {
       onClick: (row) => partDetail(detail, S.ds, row.index),
+      onClear: () => detail.replaceChildren(),
     });
   } catch (e) { showErr(out, e); }
 }
@@ -1340,6 +1349,7 @@ function renderMatch(out, m, traceBox) {
   const rows = m.rows.map((r) => Object.assign({ same: r.a_hbin === r.b_hbin }, r));
   table(tbl, cols, rows, {
     onClick: (r) => trace(traceBox, { a: m.a, b: m.b, key_a: S.m.ka, key_b: S.m.kb, row_a: r.a_row, row_b: r.b_row }),
+    onClear: () => traceBox.replaceChildren(),
     tools: h("button", { onclick: () => SC.download(`matched_${m.name}.csv`, SC.toCSV(cols.filter((c) => c.key !== "same"), rows)) }, "Download CSV"),
   });
 }
@@ -1781,6 +1791,7 @@ function renderCandidates(out, traceBox, R) {
   table(tb, cols, cd.parts, {
     sort: "anomaly_pct",
     onClick: (r) => trace(traceBox, Object.assign({ a: st.a, b: st.b, row_a: r.row }, R.keys, { value: r.key })),
+    onClear: () => traceBox.replaceChildren(),
     tools: h("button", { onclick: () => SC.download(`${st.name}.csv`, SC.toCSV(cols, cd.parts)) }, "Download CSV"),
   });
   if (!(mk instanceof Error) && mk.rows.length) showFocus(S.bcFocus && mk.rows.some((r) => r.key === S.bcFocus) ? S.bcFocus : (R.ranked || mk.rows)[0].key).then(() => window.scrollTo(0, 0));
@@ -1799,7 +1810,7 @@ async function trace(el, params) {
         h("div", { class: "row" }, h("button", { onclick: () => partRaw(raw, id, p.index) }, "Raw records")), raw);
     };
     const tb = h("div");
-    el.replaceChildren(h("h2", {}, `Trace: ${t.key || "–"}`), h("p", { class: "muted" }, `Identity in A: ${t.key_a}`),
+    el.replaceChildren(h("div", { class: "row tight", style: { justifyContent: "space-between" } }, h("h2", {}, `Trace: ${t.key || "–"}`), closeBtn(el)), h("p", { class: "muted" }, `Identity in A: ${t.key_a}`),
       h("div", { class: twoSided ? "grid2" : "" }, card("A", params.a, t.a, t.a_hits), twoSided ? card("B", params.b, t.b, t.b_hits) : null), tb);
     const pb = (v) => (v === null || v === undefined ? "" : v ? badge("in", "good") : badge("out", "bad"));
     const cols = [{ key: "key", label: "Test" }, { key: "units", label: "Units" }, { key: "lo", label: "Lo", num: true }, { key: "hi", label: "Hi", num: true }, { key: "a", label: "A", num: true }, { key: "a_pass", label: "", render: pb }];
@@ -2214,6 +2225,25 @@ function renderRetest(out, traceBox, d) {
   // trajectory: one line per part over the runs, box per run behind
   const trajBox = h("div", { class: "card" });
   g.append(trajBox);
+  // one highlighted part across the charts and the parts table; click its
+  // line or a point again (or "× clear") to drop it, Reset view for all
+  let tblApi = null;
+  const focusPart = (key) => {
+    S.rtHi = key && key !== S.rtHi ? key : null;
+    drawTraj(); drawDelta();
+    if (tblApi) { if (S.rtHi) tblApi.select((r) => r.key === S.rtHi); else tblApi.clear(); }
+    if (!S.rtHi) { traceBox.replaceChildren(); return; }
+    const p = d.parts.find((x) => x.key === S.rtHi);
+    const last = p.runs.map((x) => x.row != null).lastIndexOf(true);
+    const kb = last > 0 ? last : 1;
+    trace(traceBox, Object.assign({ a: d.runs[0].id, b: d.runs[kb].id, row_a: p.runs[0].row }, p.runs[kb].row != null ? { row_b: p.runs[kb].row } : {}, { key_a: d.key, key_b: d.key, value: S.rtHi }));
+  };
+  const resetView = () => { S.rtHi = null; traceBox.replaceChildren(); renderRetest(out, traceBox, d); };
+  const focusBar = () => h("div", { class: "row tight", style: { padding: "8px 12px 0", justifyContent: "space-between" } },
+    S.rtHi ? h("span", { class: "row tight" }, h("span", { class: "muted small" }, "Highlighted:"), h("b", {}, S.rtHi), h("button", { class: "ghost small", title: "Clear the highlight", onclick: () => focusPart(null) }, "× clear"))
+      : h("span", { class: "muted small" }, "Click a line or point to highlight that part (click it again to clear). Drag to zoom, double-click to zoom out."),
+    h("button", { class: "small", title: "Clear the highlighted part, the parts table search and every chart zoom", onclick: resetView }, "↺ Reset view"));
+  const onPick = (el) => el.on && el.on("plotly_click", (ev) => { const k = ev.points && ev.points[0] && ev.points[0].customdata; if (typeof k === "string") focusPart(k); });
   let ti = Math.min(S.rtTest || 0, d.tests.length - 1);
   const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
   const jit = (key) => { let x = 0; for (const c of key) x = (x * 31 + c.charCodeAt(0)) | 0; return ((x >>> 0) % 1000) / 1000 * 0.24 - 0.12; };
@@ -2221,33 +2251,36 @@ function renderRetest(out, traceBox, d) {
     const t = d.tests[ti];
     const sel = d.tests.length > 1 ? select(d.tests.map((x, i) => [String(i), x.key]), String(ti), (v) => { ti = S.rtTest = +v; drawTraj(); drawRec(); drawDelta(); }) : null;
     const [card, c] = chartBox("tall");
-    trajBox.replaceChildren(...(sel ? [h("div", { class: "controls", style: { padding: "8px 12px 0" } }, field("Test", sel))] : []), card.firstChild);
+    trajBox.replaceChildren(focusBar(), ...(sel ? [h("div", { class: "controls", style: { padding: "8px 12px 0" } }, field("Test", sel))] : []), card.firstChild);
     const bx = [], by = [];
-    const lines = {}, pts = { pass: [[], [], []], fail: [[], [], []], other: [[], [], []] };
+    const lines = {}, pts = { pass: [[], [], [], []], fail: [[], [], [], []], other: [[], [], [], []] };
     for (const p of d.parts) {
       const j = jit(p.key);
-      const L = lines[p.outcome] || (lines[p.outcome] = [[], []]);
+      const L = lines[p.outcome] || (lines[p.outcome] = [[], [], []]);
       p.runs.forEach((r, k) => {
         const v = r.values ? r.values[ti] : null;
         if (v == null) return;
         bx.push(k + 1); by.push(v);
-        L[0].push(k + 1 + j); L[1].push(v);
+        L[0].push(k + 1 + j); L[1].push(v); L[2].push(p.key);
         const c = rtClass(r, ti);
         const P = pts[c];
+        P[3].push(p.key);
         P[0].push(k + 1 + j); P[1].push(v); P[2].push(`${p.key}<br>${rl(k)}: ${RT_STATUS[r.status]}${r.retest_good ? " (retest of good)" : ""}, site ${r.site}, bin ${r.hbin}${c === "other" ? `<br>passes ${t.key}; ${rtOther(r)}` : ""}`);
       });
-      L[0].push(null); L[1].push(null);
+      L[0].push(null); L[1].push(null); L[2].push(null);
     }
+    // with a part highlighted, the others fade back
+    const dim = S.rtHi ? 0.3 : 1;
     const data = [{ type: "box", x: bx, y: by, name: "distribution", boxpoints: false, width: 0.55, fillcolor: tokA("muted", 0.12), line: { color: tokA("muted", 0.6), width: 1 }, hoverinfo: "y", showlegend: false }];
-    for (const [k, [label, col]] of Object.entries(RT_OUTCOME)) if (lines[k]) data.push({ type: "scatter", mode: "lines", x: lines[k][0], y: lines[k][1], name: label, line: { color: col, width: 1 }, opacity: 0.35, hoverinfo: "skip", connectgaps: false });
-    data.push({ type: "scatter", mode: "markers", x: pts.fail[0], y: pts.fail[1], text: pts.fail[2], name: "fail in that run", marker: { color: "@fail", size: 6 }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>" });
-    data.push({ type: "scatter", mode: "markers", x: pts.pass[0], y: pts.pass[1], text: pts.pass[2], name: "pass in that run", marker: { color: "@pass", size: 6, symbol: "circle-open", line: { width: 2 } }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>" });
-    if (pts.other[0].length) data.push({ type: "scatter", mode: "markers", x: pts.other[0], y: pts.other[1], text: pts.other[2], name: `passes ${t.key}, fails another test or alarm`, marker: { color: "@warn", size: 7, symbol: "diamond" }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>" });
+    for (const [k, [label, col]] of Object.entries(RT_OUTCOME)) if (lines[k]) data.push({ type: "scatter", mode: "lines", x: lines[k][0], y: lines[k][1], customdata: lines[k][2], name: label, line: { color: col, width: 1 }, opacity: S.rtHi ? 0.12 : 0.35, hoverinfo: "none", connectgaps: false });
+    data.push({ type: "scatter", mode: "markers", x: pts.fail[0], y: pts.fail[1], text: pts.fail[2], customdata: pts.fail[3], name: "fail in that run", marker: { color: "@fail", size: 6 }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>", _dim: dim });
+    data.push({ type: "scatter", mode: "markers", x: pts.pass[0], y: pts.pass[1], text: pts.pass[2], customdata: pts.pass[3], name: "pass in that run", marker: { color: "@pass", size: 6, symbol: "circle-open", line: { width: 2 } }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>", _dim: dim });
+    if (pts.other[0].length) data.push({ type: "scatter", mode: "markers", x: pts.other[0], y: pts.other[1], text: pts.other[2], customdata: pts.other[3], name: `passes ${t.key}, fails another test or alarm`, marker: { color: "@warn", size: 7, symbol: "diamond" }, hovertemplate: "%{text}<br>%{y:.4g}<extra></extra>", _dim: dim });
     const hi = S.rtHi && d.parts.find((p) => p.key === S.rtHi);
     if (hi) {
       const xs = [], ys = [];
       hi.runs.forEach((r, k) => { const v = r.values ? r.values[ti] : null; if (v != null) { xs.push(k + 1 + jit(hi.key)); ys.push(v); } });
-      data.push({ type: "scatter", mode: "lines+markers", x: xs, y: ys, name: hi.key, line: { color: "@text", width: 3 }, marker: { color: "@text", size: 9 } });
+      data.push({ type: "scatter", mode: "lines+markers", x: xs, y: ys, customdata: xs.map(() => hi.key), name: hi.key, line: { color: "@text", width: 5 }, marker: { color: "@text", size: 11 }, hovertemplate: `${hi.key}<br>%{y:.4g}<br>click to clear<extra></extra>` });
     }
     const shapes = [];
     t.limits.forEach((l, k) => { if (!l) return; for (const y of [l.lo, l.hi]) if (y != null) shapes.push({ type: "line", x0: k + 0.55, x1: k + 1.45, y0: y, y1: y, line: { color: "@limit", width: 1.5, dash: "dash" } }); });
@@ -2255,6 +2288,7 @@ function renderRetest(out, traceBox, d) {
       xaxis: { tickvals: d.runs.map((_, k) => k + 1), ticktext: d.runs.map((r, k) => `${rl(k)}<br>${clip(r.name, N > 4 ? 16 : 28)}`), range: [0.4, N + 0.6], zeroline: false },
       yaxis: { title: { text: t.units || "" } }, shapes, margin: { l: 60, r: 20, t: 56, b: 60 },
       legend: { orientation: "h", x: 1, xanchor: "right", y: 1.0, yanchor: "bottom" } } });
+    onPick(c);
   };
   // recovery by failing value
   const recBox = h("div");
@@ -2329,7 +2363,8 @@ function renderRetest(out, traceBox, d) {
   const drawDelta = () => {
     const t = d.tests[ti];
     const pairSel = select(d.runs.slice(0, -1).map((_, k) => [String(k), `${rl(k)} → ${rl(k + 1)}`]), String(pk), (v) => { pk = +v; drawDelta(); });
-    const P = { pass: [[], [], []], fail: [[], [], []], other: [[], [], []] };
+    const P = { pass: [[], [], [], []], fail: [[], [], [], []], other: [[], [], [], []] };
+    let hiPt = null;
     for (const p of d.parts) {
       const a = p.runs[pk], b = p.runs[pk + 1];
       const x = a.values ? a.values[ti] : null, y = b.values ? b.values[ti] : null;
@@ -2337,7 +2372,10 @@ function renderRetest(out, traceBox, d) {
       const c = rtClass(b, ti);
       const Q = P[c];
       Q[0].push(x); Q[1].push(y); Q[2].push(`${p.key}<br>site ${a.site} → ${b.site}${c === "other" ? `<br>passes ${t.key}; ${rtOther(b)}` : ""}`);
+      Q[3].push(p.key);
+      if (p.key === S.rtHi) hiPt = [x, y];
     }
+    const dimD = S.rtHi ? 0.3 : 1;
     const all = [...P.pass[0], ...P.fail[0], ...P.other[0]], allY = [...P.pass[1], ...P.fail[1], ...P.other[1]];
     const n = all.length;
     const dl = allY.map((y, i) => y - all[i]).sort((a, b) => a - b);
@@ -2352,11 +2390,13 @@ function renderRetest(out, traceBox, d) {
     const [card, c] = chartBox("tall");
     deltaBox.replaceChildren(h("div", { class: "controls" }, field("Runs", pairSel), h("span", { class: "muted small", style: { paddingBottom: "8px" } }, n ? `${n} parts in both · median change ${fmt(dl[Math.floor(n / 2)], 4)} ${t.units || ""} · r ${fmt(r, 3)}` : "no part has values in both runs")), card);
     plot(c, { data: [
-      { type: "scatter", mode: "markers", x: P.fail[0], y: P.fail[1], text: P.fail[2], name: `fail in ${rl(pk + 1)}`, marker: { color: "@fail", size: 7, opacity: 0.8 }, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" },
-      { type: "scatter", mode: "markers", x: P.pass[0], y: P.pass[1], text: P.pass[2], name: `pass in ${rl(pk + 1)}`, marker: { color: "@pass", size: 7, opacity: 0.8 }, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" },
-      { type: "scatter", mode: "markers", x: P.other[0], y: P.other[1], text: P.other[2], name: `passes ${t.key}, fails another test or alarm`, marker: { color: "@warn", size: 8, symbol: "diamond", opacity: 0.9 }, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" }],
+      { type: "scatter", mode: "markers", x: P.fail[0], y: P.fail[1], text: P.fail[2], customdata: P.fail[3], name: `fail in ${rl(pk + 1)}`, marker: { color: "@fail", size: 7 }, _dim: dimD, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" },
+      { type: "scatter", mode: "markers", x: P.pass[0], y: P.pass[1], text: P.pass[2], customdata: P.pass[3], name: `pass in ${rl(pk + 1)}`, marker: { color: "@pass", size: 7 }, _dim: dimD, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" },
+      { type: "scatter", mode: "markers", x: P.other[0], y: P.other[1], text: P.other[2], customdata: P.other[3], name: `passes ${t.key}, fails another test or alarm`, marker: { color: "@warn", size: 8, symbol: "diamond" }, _dim: dimD, hovertemplate: "%{text}<br>%{x:.4g} → %{y:.4g}<extra></extra>" },
+      ...(hiPt ? [{ type: "scatter", mode: "markers", x: [hiPt[0]], y: [hiPt[1]], customdata: [S.rtHi], name: S.rtHi, marker: { color: "rgba(0,0,0,0)", size: 18, line: { color: "@text", width: 3 } }, hovertemplate: `${S.rtHi}<br>click to clear<extra></extra>` }] : [])],
       layout: { title: { text: `${t.key}: ${rl(pk)} vs ${rl(pk + 1)}`, x: 0.01, xanchor: "left", font: { size: 15 } }, xaxis: { title: { text: `${rl(pk)} ${t.units || ""}` } }, yaxis: { title: { text: `${rl(pk + 1)} ${t.units || ""}` } }, shapes, margin: { l: 60, r: 20, t: 56, b: 50 },
         legend: { orientation: "h", x: 1, xanchor: "right", y: 1.0, yanchor: "bottom" } } });
+    onPick(c);
   };
   drawTraj();
   drawRec();
@@ -2382,20 +2422,15 @@ function renderRetest(out, traceBox, d) {
     cols.push({ key: `f${k}`, label: `R${k + 1} 1st fail` });
   });
   const tb = h("div");
-  out.append(h("h2", {}, "Parts"), h("p", { class: "muted" }, "Click a part to highlight its line in the trajectory chart and trace it (all its results in run 1 and the last run it was found in)."), tb);
+  out.append(h("h2", {}, "Parts"), h("p", { class: "muted" }, "Click a part to highlight it on the trajectory and run-to-run charts and trace it (all its results in run 1 and the last run it was found in); click it again to clear."), tb);
   const keys = { key_a: d.key, key_b: d.key };
-  table(tb, cols, flat, {
+  tblApi = table(tb, cols, flat, {
     placeholder: "Search parts…",
-    onClick: (r) => {
-      S.rtHi = r.key;
-      drawTraj();
-      const p = d.parts.find((x) => x.key === r.key);
-      const last = p.runs.map((x) => x.row != null).lastIndexOf(true);
-      const kb = last > 0 ? last : 1;
-      trace(traceBox, Object.assign({ a: d.runs[0].id, b: d.runs[kb].id, row_a: p.runs[0].row }, p.runs[kb].row != null ? { row_b: p.runs[kb].row } : {}, keys, { value: r.key }));
-    },
+    onClick: (r) => { if (S.rtHi !== r.key) focusPart(r.key); },
+    onClear: () => focusPart(null),
     tools: h("button", { onclick: () => SC.download("retest_trace.csv", SC.toCSV(cols.map((c) => (c.key === "outcome" ? { key: "outcome", label: "Outcome" } : c.render ? { key: c.key, label: c.label } : c)), flat)) }, "Download CSV"),
   });
+  if (S.rtHi) tblApi.select((r) => r.key === S.rtHi);
   if (d.truncated) out.append(h("p", { class: "muted small" }, "Only the first 20,000 parts are listed."));
   renderRetestSites(out, d, pctS);
 }

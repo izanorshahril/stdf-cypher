@@ -1,6 +1,6 @@
 [package]
 name = "stdf-cypher"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2021"
 license = "MIT"
 description = "Open STDF v4 analytics: parse, compare, split, correlate, ANOVA, anomaly detection, ML and interactive visualization"

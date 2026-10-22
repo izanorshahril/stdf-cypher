@@ -115,14 +115,23 @@ const SC = (() => {
   function chartBox(cls) { const c = h("div", { class: "chart " + (cls || "") }); return [h("div", { class: "card" }, c), c]; }
   function badge(text, kind) { return h("span", { class: "badge " + kind }, h("span", {}, text)); }
 
-  /** Sortable, searchable table. cols: [{key,label,num,fmt,render}] */
+  /** Sortable, searchable table. cols: [{key,label,num,fmt,render}]. With
+   *  `onClear`, clicking the selected row again (or "Clear selection")
+   *  deselects it and calls onClear. */
   function table(container, cols, rows, opts) {
     opts = opts || {};
     let sortKey = opts.sort || null, asc = opts.asc ?? false, q = "", limit = opts.limit || 300, selected = null;
     const wrap = h("div", { class: "tbl-wrap", style: opts.maxHeight ? { maxHeight: opts.maxHeight } : null });
     const count = h("span", { class: "count" });
     const search = h("input", { type: "text", placeholder: opts.placeholder || "Search…", oninput: (e) => { q = e.target.value.toLowerCase(); render(); } });
-    const tools = h("div", { class: "tbl-tools" }, opts.search === false ? null : search, count, opts.tools || null);
+    const clearBtn = opts.onClear ? h("button", { class: "ghost small", hidden: true, title: "Deselect the row and close what it opened", onclick: () => clear(true) }, "× Clear selection") : null;
+    const tools = h("div", { class: "tbl-tools" }, opts.search === false ? null : search, count, clearBtn, opts.tools || null);
+    function clear(notify) {
+      selected = null;
+      wrap.querySelectorAll("tr.sel").forEach((x) => x.classList.remove("sel"));
+      if (clearBtn) clearBtn.hidden = true;
+      if (notify && opts.onClear) opts.onClear();
+    }
     container.replaceChildren(tools, wrap);
     function render() {
       let r = rows;
@@ -147,14 +156,19 @@ const SC = (() => {
           const content = c.render ? c.render(v, row) : c.fmt ? c.fmt(v, row) : c.num ? fmt(v) : v ?? "";
           tr.append(h("td", { class: c.num ? "num" : "" }, content));
         }
-        if (opts.onClick) tr.addEventListener("click", () => { selected = row; [...tbody.children].forEach((x) => x.classList.remove("sel")); tr.classList.add("sel"); opts.onClick(row); });
+        if (opts.onClick) tr.addEventListener("click", () => {
+          if (selected === row && opts.onClear) return clear(true);
+          selected = row; [...tbody.children].forEach((x) => x.classList.remove("sel")); tr.classList.add("sel");
+          if (clearBtn) clearBtn.hidden = false;
+          opts.onClick(row);
+        });
         tbody.append(tr);
       }
       const more = r.length > limit ? h("div", { style: { padding: "8px" } }, h("button", { onclick: () => { limit += 1000; render(); } }, "Show more")) : null;
       wrap.replaceChildren(h("table", {}, thead, tbody), more || "");
     }
     render();
-    return { setRows: (r) => { rows = r; render(); } };
+    return { setRows: (r) => { rows = r; render(); }, clear: () => clear(false), select: (pred) => { selected = rows.find(pred) || null; if (clearBtn) clearBtn.hidden = !selected; render(); } };
   }
 
   function toCSV(cols, rows) {
