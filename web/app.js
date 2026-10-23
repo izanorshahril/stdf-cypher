@@ -2265,7 +2265,9 @@ function renderRetest(out, traceBox, d) {
   const linkCol = { pass: "pass", fail: "fail", not_retested: "warn", passed_earlier: "muted" };
   // stacked full width so up to 8 runs stay readable
   const g = h("div", { class: "grid1" });
-  out.append(h("h2", {}, "Flow and trajectories"), g);
+  // the highlighted part, its trace card and a part search, above the charts
+  const focusBox = h("div", { class: "card pad focus-box" });
+  out.append(h("h2", {}, "Flow and trajectories"), focusBox, g);
   {
     const [card, c] = chartBox("tall");
     g.append(card);
@@ -2305,11 +2307,29 @@ function renderRetest(out, traceBox, d) {
     tracePart();
   };
   const resetView = () => { S.rtHi = null; S.rtOnly = null; traceBox.replaceChildren(); renderRetest(out, traceBox, d); };
-  const focusBar = () => h("div", { style: { padding: "8px 12px 0" } }, h("div", { class: "row tight", style: { justifyContent: "space-between" } },
-    S.rtHi ? h("span", { class: "row tight" }, h("span", { class: "muted small" }, "Highlighted:"), h("b", {}, S.rtHi), h("button", { class: "ghost small", title: "Clear the highlight", onclick: () => focusPart(null) }, "× clear"), h("button", { class: "small", title: "All results of this part in run 1 and the last run it was found in", onclick: tracePart }, "Trace this part"))
-      : h("span", { class: "muted small" }, "Click a line or point to highlight that part and narrow the parts table to it (click it again to clear). Drag to zoom, double-click to zoom out."),
+  // typing a part works like clicking it on a chart: exact matches (key,
+  // any trace value, wafer|X|Y) first, else parts containing the text
+  const findIn = h("input", { type: "text", placeholder: "part, part text, WXY or 3|12|-4", style: { width: "240px" }, onkeydown: (e) => { if (e.key === "Enter") findPart(); } });
+  const hits = h("span", { class: "row tight" }), focusDyn = h("span", { class: "row tight" }), cardSlot = h("div");
+  const findPart = () => {
+    const q = findIn.value.trim().toLowerCase();
+    hits.replaceChildren();
+    if (!q) return;
+    const exact = flat.filter((r) => r.key.toLowerCase() === q || Object.values(r._trace).some((v) => String(v).toLowerCase() === q) || (!r._hay.includes(q) && rtSearch(r, q)));
+    const m = exact.length ? exact : flat.filter((r) => r.key.toLowerCase().includes(q) || rtSearch(r, q));
+    if (!m.length) { hits.append(h("span", { class: "muted small" }, "No traced part matches.")); return; }
+    if (m[0].key !== S.rtHi) focusPart(m[0].key, "chart");
+    if (m.length > 1) hits.append(h("span", { class: "muted small" }, `${m.length.toLocaleString()} parts match:`), ...m.slice(0, 8).map((r) => h("button", { class: "ghost small", onclick: () => { if (r.key !== S.rtHi) focusPart(r.key, "chart"); } }, r.key)), m.length > 8 ? h("span", { class: "muted small" }, "…") : null);
+  };
+  const drawFocus = () => {
+    focusDyn.replaceChildren(...(S.rtHi ? [h("span", { class: "muted small" }, "Highlighted:"), h("b", {}, S.rtHi), h("button", { class: "ghost small", title: "Clear the highlight", onclick: () => focusPart(null) }, "× clear"), h("button", { class: "small", title: "All results of this part in run 1 and the last run it was found in", onclick: tracePart }, "Trace this part")]
+      : [h("span", { class: "muted small" }, "Find a part, or click a line or point, to highlight it and narrow the parts table to it (click it again to clear). Drag to zoom, double-click to zoom out.")]));
+    cardSlot.replaceChildren(...(S.rtHi ? [partCard(d.parts.find((x) => x.key === S.rtHi), drawFocus)] : []));
+  };
+  focusBox.append(h("div", { class: "row tight", style: { justifyContent: "space-between" } },
+    h("span", { class: "row tight" }, field("Find part", h("div", { class: "row tight" }, findIn, h("button", { onclick: findPart }, "Find"))), hits),
     h("button", { class: "small", title: "Clear the highlighted part, the parts table search and every chart zoom", onclick: resetView }, "↺ Reset view")),
-    S.rtHi ? partCard(d.parts.find((x) => x.key === S.rtHi), () => drawTraj()) : null);
+    h("div", { class: "row tight", style: { marginTop: "6px" } }, focusDyn), cardSlot);
   const onPick = (el) => el.on && el.on("plotly_click", (ev) => { const k = ev.points && ev.points[0] && ev.points[0].customdata; if (typeof k === "string") focusPart(k, "chart"); });
   let ti = Math.min(S.rtTest || 0, d.tests.length - 1);
   const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
@@ -2318,7 +2338,8 @@ function renderRetest(out, traceBox, d) {
     const t = d.tests[ti];
     const sel = d.tests.length > 1 ? select(d.tests.map((x, i) => [String(i), x.key]), String(ti), (v) => { ti = S.rtTest = +v; drawTraj(); drawRec(); drawDelta(); }) : null;
     const [card, c] = chartBox("tall");
-    trajBox.replaceChildren(focusBar(), ...(sel ? [h("div", { class: "controls", style: { padding: "8px 12px 0" } }, field("Test", sel))] : []), card.firstChild);
+    drawFocus();
+    trajBox.replaceChildren(...(sel ? [h("div", { class: "controls", style: { padding: "8px 12px 0" } }, field("Test", sel))] : []), card.firstChild);
     const bx = [], by = [];
     const lines = {}, pts = { pass: [[], [], [], []], fail: [[], [], [], []], other: [[], [], [], []] };
     for (const p of d.parts) {
