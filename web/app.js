@@ -5,7 +5,7 @@ const { h, plot, fmt, fmtP, pct, kpi, chartBox, badge, table } = SC;
 const S = { datasets: [], ds: 0, filter: "", view: "overview", testsCache: {}, scope: "all", co: { range: "both", dim: "2d", opacity: 0.6, hist: "pct" } };
 try { Object.assign(S.co, JSON.parse(localStorage.getItem("sc-chart") || "{}")); S.scope = localStorage.getItem("sc-scope") || "all"; } catch (e) {}
 // settings kept in this browser profile (Settings page); `sc-sort` predates it
-const CFG_DEFAULT = { sort: "time", dedup: "", merge: false, key: "part_txt", exclude: "500, 80100-80104", lbTest: "5100" };
+const CFG_DEFAULT = { sort: "time", dedup: "", merge: false, key: "part_txt", lbTest: "5100", ignoreIds: true, wxy: "500", rev: "", others: [], card: ["part_txt", "wxy", "wxy_t"] };
 const WCAL_DEFAULT = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false };
 S.cfg = Object.assign({}, CFG_DEFAULT);
 try {
@@ -15,6 +15,14 @@ try {
   const w = JSON.parse(localStorage.getItem("sc-wcal") || "null");
   if (w) S.wcal = Object.assign({}, WCAL_DEFAULT, w);
 } catch (e) {}
+// before 0.3.5 the identity tests were a free "leave out tests" list: keep
+// the tests no trace field covers as other IDs
+if (typeof S.cfg.exclude === "string") {
+  const known = new Set([...Object.values(Object.assign({}, WCAL_DEFAULT, S.wcal || {})), S.cfg.wxy, S.cfg.rev, S.cfg.lbTest].map(String));
+  const left = S.cfg.exclude.split(/[,;\s]+/).map((x) => x.trim()).filter((x) => x && !known.has(x) && x !== "80100-80104");
+  S.cfg.others = (S.cfg.others || []).concat(left.map((t) => ({ name: `ID ${t}`, test: t })));
+  delete S.cfg.exclude;
+}
 // order of opened files (dataset order, e.g. retest runs): time | name | none
 S.optSort = S.cfg.sort;
 S.optDedup = S.cfg.dedup;
@@ -23,6 +31,35 @@ S.lbTest = S.cfg.lbTest;
 function saveCfg() {
   Object.assign(S.cfg, { sort: S.optSort, dedup: S.optDedup || "", merge: !!S.optMerge, lbTest: S.lbTest || "5100" });
   try { localStorage.setItem("sc-settings", JSON.stringify(S.cfg)); localStorage.setItem("sc-sort", S.cfg.sort); if (S.wcal) localStorage.setItem("sc-wcal", JSON.stringify(S.wcal)); } catch (e) {}
+}
+/** The identity / trace tests (Settings > Part identification and trace). */
+function idTests() {
+  const w = waferCal();
+  return { w: w.w, x_t: w.x, y_t: w.y, ox: w.ox, oy: w.oy, wxy: S.cfg.wxy, rev: S.cfg.rev, lb: S.lbTest || "", ...Object.fromEntries((S.cfg.others || []).map((o, i) => [`o${i}`, o.test])) };
+}
+/** Tests left out of rankings and first-fail picks: the identity tests, unless Settings keeps them in. */
+function idExclude() {
+  if (S.cfg.ignoreIds === false) return "";
+  return Object.values(idTests()).map((v) => String(v || "").trim()).filter((v) => /^\d+(\s*-\s*\d+)?$/.test(v)).join(", ");
+}
+/** Part trace fields a part can show (mini card, search): [key, label]. */
+function traceFields() {
+  const w = waferCal();
+  return [["part_txt", "Part text"], ["part_id", "Part ID"], ["prr_xy", "PRR X/Y"], ["wafer", "Wafer (WIR)"],
+    ...(S.cfg.wxy ? [["wxy", "WXY"]] : []), ...(w.w || w.x || w.y ? [["wxy_t", "Wafer, X, Y"]] : []),
+    ...(S.cfg.rev ? [["rev", "Program rev"]] : []), ...(S.lbTest ? [["lb", "Loadboard"]] : []),
+    ...(S.cfg.others || []).filter((o) => o.test).map((o, i) => [`o${i}`, o.name || `ID ${o.test}`])];
+}
+/** A part's trace field values as text, from the PRR fields and trace tests in `ids`. */
+function traceValues(ids) {
+  if (!ids) return {};
+  const w = waferCal(), num = (v) => (v == null ? "" : Number.isInteger(v) ? String(v) : fmt(v, 6));
+  const die = (v, o) => (v == null ? null : o == null ? v : w.mode === "sub" ? v - o : v + o);
+  const dx = die(ids.x_t, ids.ox), dy = die(ids.y_t, ids.oy);
+  const out = { part_txt: ids.part_txt || "", part_id: ids.part_id || "", prr_xy: ids.x != null && ids.x !== NO_XY ? `${ids.x}, ${ids.y}` : "", wafer: ids.wafer || "",
+    wxy: num(ids.wxy), wxy_t: [ids.w, dx, dy].some((v) => v != null) ? [ids.w, dx, dy].map(num).join("|") : "", rev: num(ids.rev), lb: num(ids.lb) };
+  for (const k of Object.keys(ids)) if (/^o\d+$/.test(k)) out[k] = num(ids[k]);
+  return out;
 }
 const main = document.getElementById("main");
 const GROUPS = [["", "none"], ["pass", "good / bad"], ["alarm", "alarm"], ["site", "test site"], ["head", "head"], ["hbin", "hard bin"], ["sbin", "soft bin"], ["wafer", "wafer"], ["file", "file / lot"], ["loadboard", "loadboard"], ["site_loadboard", "site × loadboard"]];
@@ -511,7 +548,6 @@ async function viewCompare(el) {
     const sel = h("input", { type: "text", class: "filter-input", placeholder: "group, e.g. site = 3  or  $match  or  part_id in @ids.txt", value: S.cmpSel || "", style: { minWidth: "300px" } });
     const vs = h("input", { type: "text", class: "filter-input", placeholder: "versus (blank = all other parts)", value: S.cmpVs || "" });
     const matchBy = select([["key", "number + name"], ["num", "test number"], ["name", "test name"]], S.cmpMatch || "key", (v) => (S.cmpMatch = v));
-    const excl = h("input", { type: "text", value: S.cmpExcl ?? "", placeholder: "e.g. 500, 80100-80104", style: { width: "170px" }, title: "Tests left out of the marker ranking, e.g. identity tests (wafer, X/Y, die ID) that differ between lots by position only", onchange: (e) => (S.cmpExcl = e.target.value) });
     const later = select([["", "none"], ...dsOptions().filter(([v]) => +v !== S.ds)], S.cmpLater ?? "", (v) => { S.cmpLater = v; keys.hidden = !v; });
     const ka = keyPicker("a"), kb = keyPicker("b");
     const keys = h("div", { class: "row tight", hidden: !S.cmpLater }, ka.el, h("span", { class: "muted small" }, "↔"), kb.el);
@@ -519,13 +555,13 @@ async function viewCompare(el) {
       S.cmpFA = fa.value; S.cmpFB = fb.value; S.cmpSel = sel.value; S.cmpVs = vs.value;
       const params = m === "group" ? { mode: "group", a: S.ds, select: sel.value, vs: vs.value, filter: scoped(S.filter), match_by: matchBy.value } : { mode: "datasets", a: +a.value, b: +b.value, filter_a: scoped(fa.value), filter_b: scoped(fb.value), match_by: matchBy.value };
       if (m === "group" && later.value) Object.assign(params, { later: +later.value, key_a: ka.value(), key_b: kb.value() });
-      if (excl.value.trim()) params.exclude = excl.value;
+      if (idExclude()) params.exclude = idExclude();
       runCompare(out, params);
     } }, "Compare");
     ctl.replaceChildren(field("Mode", mode));
     if (m === "group") ctl.append(field("Group (B)", sel), field("Versus (A)", vs), field("Same units in file (drift)", later), field("identified by", keys));
     else ctl.append(field("A", a), field("Filter A", fa), field("B", b), field("Filter B", fb));
-    ctl.append(field("Match tests by", matchBy), field("Leave out tests", excl), run);
+    ctl.append(field("Match tests by", matchBy), run);
     return run;
   }
   const runBtn = render();
@@ -1373,7 +1409,7 @@ const SCREEN_VERDICT = { "resembles lot A": "bad", elevated: "warn", "like the r
 /** Signature check settings, seeded from Bad candidates. */
 function sigState() {
   const bc = S.bc || {};
-  return S.sg || (S.sg = { a: bc.a ?? S.ds, name: bc.name || "bad_candidate", filter: bc.good || "hbin = 1", exclude: bc.exclude ?? S.cfg.exclude, max: 5, clean: [], screen: [], stayed: [], useClean: true, useConf: true, useStayed: true, confirmed: "confirmed_good", noMarginal: false });
+  return S.sg || (S.sg = { a: bc.a ?? S.ds, name: bc.name || "bad_candidate", filter: bc.good || "hbin = 1", max: 5, clean: [], screen: [], stayed: [], useClean: true, useConf: true, useStayed: true, confirmed: "confirmed_good", noMarginal: false });
 }
 function viewSignature(el) {
   el.append(h("h1", {}, "Signature check"), h("p", { class: "lead" }, "Learn a failure signature from the bad candidates of the lot with the issue (lot A), throw out what known-good parts also show, and screen other files with what is left. Run Bad candidates first: it creates the part sets the signature is learned from ($bad_candidate) and checked against ($confirmed_good)."));
@@ -1387,7 +1423,6 @@ function viewSignature(el) {
   const a = select(dsOptions(), String(st.a), (v) => (st.a = +v));
   const name = h("input", { type: "text", value: st.name, style: { width: "130px" }, oninput: (e) => (st.name = e.target.value) });
   const filter = h("input", { type: "text", class: "filter-input", value: st.filter, oninput: (e) => (st.filter = e.target.value) });
-  const excl = h("input", { type: "text", value: st.exclude, style: { width: "170px" }, oninput: (e) => (st.exclude = e.target.value) });
   const noMarg = h("input", { type: "checkbox", checked: !!st.noMarginal, onchange: (e) => (st.noMarginal = e.target.checked) });
   const max = h("input", { type: "number", min: 1, max: 20, value: st.max, style: { width: "70px" }, oninput: (e) => (st.max = +e.target.value || 5) });
   const useClean = h("input", { type: "checkbox", checked: st.useClean !== false, onchange: (e) => (st.useClean = e.target.checked) });
@@ -1410,7 +1445,7 @@ function viewSignature(el) {
     if (!clean.length && !stayed.length && st.useConf === false) return toast("Tick at least one reference source: a clean lot, a stayed-good lot or the confirmed good parts", "bad");
     loading(out, "Learning rules in lot A, checking them against the reference pool…");
     try {
-      const d = await api("signature", { a: st.a, name: st.name, filter: scoped(st.filter), exclude: st.exclude, max_rules: st.max, range: S.co.range, exclude_set: st.noMarginal ? "marginal" : "",
+      const d = await api("signature", { a: st.a, name: st.name, filter: scoped(st.filter), exclude: idExclude(), max_rules: st.max, range: S.co.range, exclude_set: st.noMarginal ? "marginal" : "",
         use_clean: st.useClean !== false, use_confirmed: st.useConf !== false, confirmed: st.confirmed || "confirmed_good",
         use_stayed: st.useStayed !== false, stayed: stayed.map((x) => ({ a: x.a, b: x.b, filter: scoped("pass") })),
         clean: clean.map((c) => ({ ds: c.ds, filter: scoped(c.filter) })), screen: st.screen.map((c) => ({ ds: c.ds, filter: scoped(c.filter) })) });
@@ -1419,7 +1454,7 @@ function viewSignature(el) {
     } catch (e) { showErr(out, e); }
   };
   el.append(
-    h("div", { class: "card pad" }, h("b", {}, "1 · Learn from lot A"), h("div", { class: "controls" }, field("File 1 of lot A", a), field("Bad candidates (part set)", h("div", { class: "row tight" }, h("span", {}, "$"), name)), field("Population", filter), field("Leave out tests", excl),
+    h("div", { class: "card pad" }, h("b", {}, "1 · Learn from lot A"), h("div", { class: "controls" }, field("File 1 of lot A", a), field("Bad candidates (part set)", h("div", { class: "row tight" }, h("span", {}, "$"), name)), field("Population", filter),
       h("label", { class: "chk", title: "Leave the $marginal parts (file-2 fails outside the Bad candidates value range) out of every group" }, noMarg, "Leave out $marginal"), h("button", { onclick: () => go("candidates") }, "Bad candidates…")),
       h("p", { class: "muted small" }, "Normal parts: without a clean lot, the confirmed good parts (if there are at least 30), else every other good part of lot A.")),
     h("div", { class: "grid2" },
@@ -1552,7 +1587,7 @@ function waferCal() { return S.wcal || (S.wcal = Object.assign({}, WCAL_DEFAULT)
 function viewCandidates(el) {
   el.append(h("h1", {}, "Bad candidates"), h("p", { class: "lead" }, "Parts that were good in file 1 but are bad in file 2 (e.g. failing one test, optionally only with its file-2 value in a range), found by matching the two files by part text. Instead of splitting anything, the matched good parts of file 1 are marked as bad candidates and compared with every other good part of file 1: which tests, outlier scores, sites, wafer zones or field positions set them apart, and which tests to focus on. Good parts that pass file 2 are marked as confirmed good."));
   if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open both files (without 'combine'): file 1 with most parts, file 2 with the parts that became bad.")); return; }
-  const st = S.bc || (S.bc = { a: S.ds, b: otherDs(S.ds), good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: S.cfg.exclude, coords: "auto" });
+  const st = S.bc || (S.bc = { a: S.ds, b: otherDs(S.ds), good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", coords: "auto" });
   const ids = S.datasets.map((d) => d.id);
   if (!ids.includes(st.a)) st.a = S.ds;
   if (!ids.includes(st.b) || st.b === st.a) st.b = otherDs(st.a);
@@ -1585,7 +1620,6 @@ function viewCandidates(el) {
   const extra = h("input", { type: "text", class: "filter-input", value: st.extra, placeholder: "optional extra filter on file 2" });
   const ka = keyPicker("ca"), kb = keyPicker("cb");
   const name = h("input", { type: "text", value: st.name, style: { width: "130px" }, title: "Part set name, usable as $name in every filter" });
-  const excl = h("input", { type: "text", value: st.exclude, style: { width: "190px" }, title: "Identity tests (wafer, X/Y, die ID…) differ by position only; leave them out of the ranking. Ranges allowed." });
   const coords = select([["auto", "auto (PRR X/Y, else tests)"], ["tests", "from tests (Wafer maps settings)"]], st.coords);
   const out = h("div"), traceBox = h("div");
   const badFilter = () => {
@@ -1594,7 +1628,7 @@ function viewCandidates(el) {
     return ["not pass", tc, extra.value.trim() ? `(${extra.value.trim()})` : ""].filter(Boolean).join(" and ");
   };
   const run = async () => {
-    Object.assign(st, { a: +a.value, b: +b.value, good: good.value.trim(), test: test.value.trim(), how: how.value, range: range.value.trim(), incMarg: incMarg.checked, extra: extra.value, name: name.value.trim() || "bad_candidate", exclude: excl.value, coords: coords.value });
+    Object.assign(st, { a: +a.value, b: +b.value, good: good.value.trim(), test: test.value.trim(), how: how.value, range: range.value.trim(), incMarg: incMarg.checked, extra: extra.value, name: name.value.trim() || "bad_candidate", coords: coords.value });
     if (st.a === st.b) return toast("Pick two different files", "bad");
     if (st.range && !st.test) return toast("A value range needs the failing test", "bad");
     const goodF = scoped(st.good), set = "$" + st.name;
@@ -1605,7 +1639,7 @@ function viewCandidates(el) {
       // marginal fails are left out of both groups unless they count as candidates
       const popF = m.n_marginal && !m.include_marginal ? (goodF ? `(${goodF}) and not $${m.marginal}` : `not $${m.marginal}`) : goodF;
       const w = waferCal();
-      const common = { a: st.a, filter: popF, exclude: st.exclude, range: S.co.range };
+      const common = { a: st.a, filter: popF, exclude: idExclude(), range: S.co.range };
       const cal = { coords: st.coords, wafer_test: w.w, x_test: w.x, y_test: w.y, ox_test: w.ox, oy_test: w.oy, offset_mode: w.mode, flip_x: w.fx, flip_y: w.fy };
       loading(out, `${m.n_cand.toLocaleString()} bad candidates found; ranking every test and outlier score…`);
       const [mk, cd] = await Promise.all([
@@ -1618,7 +1652,7 @@ function viewCandidates(el) {
   el.append(
     h("div", { class: "controls" }, field("File 1 (good parts)", a), field("Good parts are", good), field("Identify parts by", ka.el)),
     h("div", { class: "controls" }, field("File 2 (became bad)", b), field("Bad parts failing test", h("div", { class: "row tight" }, test, how)), field("with its file-2 value in", h("div", {}, h("div", { class: "row tight" }, range, unitHint), rangeNote)), h("label", { class: "chk", title: "Off: file-2 fails outside the range ($marginal) are left out of both the candidates and the reference. On: they count as candidates." }, incMarg, "Include marginal fails as candidates"), field("Extra filter", extra), field("Identify parts by", kb.el)),
-    h("div", { class: "controls" }, field("Mark them as", name), field("Leave out tests", excl), field("Die X/Y", coords), loadboardField(), h("button", { class: "primary", onclick: run }, "Find bad candidates")),
+    h("div", { class: "controls" }, field("Mark them as", name), field("Die X/Y", coords), loadboardField(), h("button", { class: "primary", onclick: run }, "Find bad candidates")),
     out, traceBox);
   if (S.bcLast && ids.includes(S.bcLast.st.a) && ids.includes(S.bcLast.st.b)) renderCandidates(out, traceBox, S.bcLast);
 }
@@ -1657,7 +1691,7 @@ function renderCandidates(out, traceBox, R) {
     h("button", { onclick: () => useFilter(st.a, set) }, "Analyse the candidates (filter " + set + ")"),
     h("button", { onclick: () => { S.cmpMode = "group"; S.cmpSel = set; S.cmpVs = ""; S.ds = st.a; S.filter = popF; go("compare"); } }, "Open in Compare"),
     h("button", { onclick: () => { S.wmode = "pass"; S.ds = st.a; go("wafer"); } }, "Wafer maps"),
-    h("button", { onclick: () => { Object.assign(sigState(), { a: st.a, name: st.name, filter: st.good, exclude: st.exclude, confirmed: m.confirmed || "confirmed_good", noMarginal: !!(m.n_marginal && !m.include_marginal) }); go("signature"); }, title: "Learn a signature from these candidates, check it against a reference pool of good parts (a clean lot and/or the confirmed good parts) and screen other files" }, "Signature check →")));
+    h("button", { onclick: () => { Object.assign(sigState(), { a: st.a, name: st.name, filter: st.good, confirmed: m.confirmed || "confirmed_good", noMarginal: !!(m.n_marginal && !m.include_marginal) }); go("signature"); }, title: "Learn a signature from these candidates, check it against a reference pool of good parts (a clean lot and/or the confirmed good parts) and screen other files" }, "Signature check →")));
   if (m.marginal_rows && m.marginal_rows.length) {
     const mt = h("div");
     const mcols = [{ key: "key", label: "Identity" }, { key: "a_wafer", label: "Wafer" }, { key: "a_x", label: "X", num: true }, { key: "a_y", label: "Y", num: true }, { key: "a_site", label: "Site", num: true }, { key: "b_hbin", label: "Hbin in 2", num: true }, { key: "b_value", label: `${m.range.test} in 2 (${m.range.units || "–"})`, num: true, fmt: (v) => fmt(v, 4) }];
@@ -1823,7 +1857,7 @@ async function trace(el, params) {
 // ---- Failure investigation (a case: files with roles, settings, steps)
 function invCase() {
   const ids = S.datasets.map((d) => d.id);
-  return S.inv || (S.inv = { name: "case 1", test: "", loadboard: S.lbTest || "5100", exclude: S.cfg.exclude, key: "part_txt", good: "pass",
+  return S.inv || (S.inv = { name: "case 1", test: "", loadboard: S.lbTest || "5100", key: "part_txt", good: "pass",
     lots: [{ name: "Lot A", kind: "issue", run1: ids[0], retest: ids[1] ?? ids[0], chain: [] }, { name: "Lot B", kind: "clean", run1: ids[2] ?? ids[0] }],
     screen: [], window: { from: "auto", mode: "strict", tol: 5, unit: "pct" }, maxRate: 10, minZone: 10 });
 }
@@ -1911,7 +1945,7 @@ function viewInvestigation(el) {
   const testIn = h("input", { type: "text", value: c.test, placeholder: "e.g. 1013", style: { width: "110px" }, oninput: (e) => (c.test = e.target.value.trim()) });
   const keySel = select(KEYS.filter(([k]) => k !== "tests"), c.key || "part_txt", (v) => (c.key = v));
   settings.append(h("h2", {}, "Settings"), h("div", { class: "controls" }, field("Failing test", testIn), field("Identify parts by", keySel), field("Good parts are", h("input", { type: "text", class: "filter-input", value: c.good, oninput: (e) => (c.good = e.target.value) })),
-    field("Leave out tests", h("input", { type: "text", value: c.exclude, style: { width: "170px" }, oninput: (e) => (c.exclude = e.target.value) })), loadboardField(),
+    loadboardField(),
     h("button", { class: "primary", onclick: () => runAll() }, "Run all steps")));
 
   // steps
@@ -1991,7 +2025,7 @@ function viewInvestigation(el) {
     const lots = c.lots.map((l) => l.kind === "issue"
       ? { name: l.name, ds: l.run1, kind: "issue", bad: "$case_bad", good: "$case_good", groups: [{ label: "marginal", filter: "$case_marginal" }, { label: "unrecoverable", filter: "$retest_still_bad" }, { label: "recovered", filter: "$retest_recovered" }] }
       : { name: l.name, ds: l.run1, kind: "clean", bad: `fail(${c.test})`, good: scoped(c.good) });
-    R.common = await api("commonality", { lots, exclude: c.exclude, wafer_test: w.w, x_test: w.x, y_test: w.y, ox_test: w.ox, oy_test: w.oy, offset_mode: w.mode, flip_x: w.fx, flip_y: w.fy });
+    R.common = await api("commonality", { lots, exclude: idExclude(), wafer_test: w.w, x_test: w.x, y_test: w.y, ox_test: w.ox, oy_test: w.oy, offset_mode: w.mode, flip_x: w.fx, flip_y: w.fy });
   }
   function drawCommon() {
     const b = boxes.common.body;
@@ -2038,7 +2072,7 @@ function viewInvestigation(el) {
     if (!iss.length) throw new Error("Add an issue lot");
     const first = iss[0], others = iss.slice(1);
     const screen = [...others.flatMap((l) => [{ ds: l.run1, filter: "$retest_still_bad", label: `${l.name} unrecoverable` }, { ds: l.run1, filter: "$retest_recovered", label: `${l.name} recovered` }]), ...c.screen.map((x) => ({ ds: x, filter: scoped(c.good) }))];
-    R.sig = await api("signature", { a: first.run1, name: "case_bad", filter: scoped(c.good), exclude: c.exclude, exclude_set: "case_marginal", confirmed: "case_good", use_confirmed: true, max_rules: 5, range: S.co.range,
+    R.sig = await api("signature", { a: first.run1, name: "case_bad", filter: scoped(c.good), exclude: idExclude(), exclude_set: "case_marginal", confirmed: "case_good", use_confirmed: true, max_rules: 5, range: S.co.range,
       clean: clean().map((l) => ({ ds: l.run1, filter: scoped(c.good) })), stayed: others.map((l) => ({ a: l.run1, b: l.retest, key: c.key, filter: scoped(c.good) })), screen });
     R.sigLot = first.name;
   }
@@ -2074,9 +2108,9 @@ function viewInvestigation(el) {
   async function runAll() { for (const k of ["recovery", "bad", "common", "signature"]) if (!(await run(k))) break; }
   function openFull(k) {
     const iss = issue(), l = iss[0];
-    if (k === "recovery" && l) { const x = (R.recovery || []).find((y) => y.d); const lot = iss.find((y) => x && y.name === x.lot) || l; S.rt = Object.assign(S.rt || {}, { runs: [lot.retest, ...lot.chain], mode: "test", tests: c.test, exclude: c.exclude }); S.rtLast = x ? x.d : null; go("retest"); }
-    else if (k === "bad" && l) { S.bc = Object.assign(S.bc || {}, { a: l.run1, b: l.retest, good: c.good, test: c.test, how: "fail", range: R.window ? `${g4(R.window.lo)}..${g4(R.window.hi)}` : "", rangeNote: R.window ? `from the case's recovery window (${R.window.how}, ${R.window.lot})` : "", incMarg: false, extra: "", name: "case_bad", exclude: c.exclude, coords: "auto" }); S.bcLast = null; go("candidates"); }
-    else if ((k === "signature" || k === "screen") && l) { Object.assign(sigState(), { a: l.run1, name: "case_bad", filter: c.good, exclude: c.exclude, confirmed: "case_good", noMarginal: true, clean: clean().map((x) => ({ ds: x.run1, filter: c.good })), stayed: iss.slice(1).map((x) => ({ a: x.run1, b: x.retest })) }); S.sgLast = R.sig || null; go("signature"); }
+    if (k === "recovery" && l) { const x = (R.recovery || []).find((y) => y.d); const lot = iss.find((y) => x && y.name === x.lot) || l; S.rt = Object.assign(S.rt || {}, { runs: [lot.retest, ...lot.chain], mode: "test", tests: c.test }); S.rtLast = x ? x.d : null; go("retest"); }
+    else if (k === "bad" && l) { S.bc = Object.assign(S.bc || {}, { a: l.run1, b: l.retest, good: c.good, test: c.test, how: "fail", range: R.window ? `${g4(R.window.lo)}..${g4(R.window.hi)}` : "", rangeNote: R.window ? `from the case's recovery window (${R.window.how}, ${R.window.lot})` : "", incMarg: false, extra: "", name: "case_bad", coords: "auto" }); S.bcLast = null; go("candidates"); }
+    else if ((k === "signature" || k === "screen") && l) { Object.assign(sigState(), { a: l.run1, name: "case_bad", filter: c.good, confirmed: "case_good", noMarginal: true, clean: clean().map((x) => ({ ds: x.run1, filter: c.good })), stayed: iss.slice(1).map((x) => ({ a: x.run1, b: x.retest })) }); S.sgLast = R.sig || null; go("signature"); }
     else if (k === "common") toast("Commonality is shown here; open a lot in Bad candidates for its own common factors", "neutral");
   }
   // redraw earlier results
@@ -2106,7 +2140,7 @@ function viewRetest(el) {
   el.append(h("h1", {}, "Retest trace"), h("p", { class: "lead" }, "Follow parts through a chain of runs: run 1, then a retest of its rejects, then a retest of those rejects, and so on; a run may also retest good parts (e.g. the good parts of runs 1 and 2), and their rejects are followed on. Pick the starting parts in run 1 (e.g. the ones failing test 1013); each later run is searched for the same physical part, so you see per run whether it passed or failed, its bin and the traced test's value, and how the population shrinks."));
   if (S.datasets.length < 2) { el.append(h("div", { class: "help" }, "Open run 1 and at least one retest file (without 'combine').")); return; }
   const ids = S.datasets.map((d) => d.id);
-  const st = S.rt || (S.rt = { runs: ids.slice(0, 3), mode: "reject", custom: "", tests: "", exclude: S.cfg.exclude, valueFrom: "first", maxRate: 10, minZone: 10 });
+  const st = S.rt || (S.rt = { runs: ids.slice(0, 3), mode: "reject", custom: "", tests: "", valueFrom: "first", maxRate: 10, minZone: 10 });
   st.runs = st.runs.filter((x) => ids.includes(x));
   while (st.runs.length < 2) { const o = ids.find((x) => !st.runs.includes(x)); if (o === undefined) break; st.runs.push(o); }
   const runsBox = h("div");
@@ -2125,7 +2159,6 @@ function viewRetest(el) {
   const custom = h("input", { type: "text", class: "filter-input", value: st.custom, placeholder: "e.g. fail(1013) and site = 2", hidden: st.mode !== "custom", oninput: (e) => (st.custom = e.target.value) });
   const tests = h("input", { type: "text", value: st.tests, placeholder: "blank = most common first fail", style: { width: "190px" }, title: "Test(s) to trace, e.g. 1013 or 1013, 1290. Values are shown in each test's display unit (logged UNITS scaled by RES_SCAL).", oninput: (e) => { st.tests = e.target.value; updHint(); } });
   const unitHint = h("b", { class: "small" });
-  const excl = h("input", { type: "text", value: st.exclude, style: { width: "170px" }, title: "Left out when picking the most common first fail (identity tests)", oninput: (e) => (st.exclude = e.target.value) });
   const out = h("div"), traceBox = h("div");
   async function updHint() {
     const q = tests.value.split(",")[0].trim().replace(/:.*/, "");
@@ -2139,7 +2172,7 @@ function viewRetest(el) {
     const filter = st.mode === "reject" ? "not pass" : st.mode === "all" ? "all" : st.mode === "test" ? `fail(${first})` : st.custom.trim() || "not pass";
     loading(out, "Following the parts through the runs…");
     try {
-      const d = await api("retest_trace", { runs: st.runs, key: kp.value(), filter: scoped(filter), tests: st.tests, exclude: st.exclude, value_from: st.valueFrom || "first", max_rate: (st.maxRate ?? 10) / 100, min_zone: st.minZone ?? 10 });
+      const d = await api("retest_trace", { runs: st.runs, key: kp.value(), filter: scoped(filter), tests: st.tests, exclude: idExclude(), id_tests: idTests(), value_from: st.valueFrom || "first", max_rate: (st.maxRate ?? 10) / 100, min_zone: st.minZone ?? 10 });
       S.rtLast = d;
       renderRetest(out, traceBox, d);
     } catch (e) { showErr(out, e); }
@@ -2154,9 +2187,27 @@ function viewRetest(el) {
         h("div", { class: "controls" }, field("Identify parts by", kp.el)),
         h("p", { class: "muted small" }, "Part text (or wafer + X/Y) is safest: part IDs often restart at 1 in every run."),
         h("div", { class: "controls" }, field("Start with", h("div", { class: "row tight" }, mode, custom))),
-        h("div", { class: "controls" }, field("Trace test(s)", h("div", { class: "row tight" }, tests, unitHint)), field("Leave out tests", excl), loadboardField(), h("button", { class: "primary", onclick: run }, "Trace")))),
+        h("div", { class: "controls" }, field("Trace test(s)", h("div", { class: "row tight" }, tests, unitHint)), loadboardField(), h("button", { class: "primary", onclick: run }, "Trace")))),
     out, traceBox);
   if (S.rtLast) renderRetest(out, traceBox, S.rtLast);
+}
+/** Parts table search: any trace value, and wafer X Y typed as 3|12|-4 (or with commas, spaces or slashes). */
+function rtSearch(r, q) {
+  if (r._hay.includes(q)) return true;
+  const m = /^\s*(-?\d+)[\s,;/|]+(-?\d+)[\s,;/|]+(-?\d+)\s*$/.exec(q);
+  return !!m && r._trace.wxy_t === `${m[1]}|${m[2]}|${m[3]}`;
+}
+/** The part trace card: the trace fields picked here (kept in Settings), for one part. */
+function partCard(p, redraw) {
+  if (!p) return null;
+  const tv = traceValues(p.ids), all = traceFields();
+  const pick = (S.cfg.card || []).filter((k) => all.some(([x]) => x === k));
+  const chips = all.filter(([k]) => pick.includes(k)).map(([k, l]) => h("span", { class: "trace-chip" }, h("span", { class: "muted small" }, l), h("b", {}, tv[k] || "–")));
+  const menu = h("details", { class: "trace-pick", open: !!S.tracePickOpen }, h("summary", { title: "Pick the trace fields to show", onclick: (e) => (S.tracePickOpen = !e.currentTarget.parentNode.open) }, "Fields"),
+    h("div", { class: "trace-menu" }, all.map(([k, l]) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: pick.includes(k), onchange: (e) => {
+      S.cfg.card = e.target.checked ? [...pick, k] : pick.filter((x) => x !== k); saveCfg(); redraw();
+    } }), l))));
+  return h("div", { class: "trace-card" }, chips.length ? chips : h("span", { class: "muted small" }, "No trace field picked."), menu);
 }
 function renderRetest(out, traceBox, d) {
   const pctS = (v, n) => (v == null || !isFinite(v) ? "–" : (v * 100).toFixed(n ?? 1) + "%");
@@ -2227,23 +2278,39 @@ function renderRetest(out, traceBox, d) {
   g.append(trajBox);
   // one highlighted part across the charts and the parts table; click its
   // line or a point again (or "× clear") to drop it, Reset view for all
-  let tblApi = null;
-  const focusPart = (key) => {
-    S.rtHi = key && key !== S.rtHi ? key : null;
-    drawTraj(); drawDelta();
-    if (tblApi) { if (S.rtHi) tblApi.select((r) => r.key === S.rtHi); else tblApi.clear(); }
-    if (!S.rtHi) { traceBox.replaceChildren(); return; }
+  // a chart click only highlights the part and narrows the parts table to
+  // it (the trend stays in view); a click in the table also traces it
+  let tblApi = null, flat = [], onlyNote = null;
+  const tracePart = () => {
     const p = d.parts.find((x) => x.key === S.rtHi);
+    if (!p) return;
     const last = p.runs.map((x) => x.row != null).lastIndexOf(true);
     const kb = last > 0 ? last : 1;
     trace(traceBox, Object.assign({ a: d.runs[0].id, b: d.runs[kb].id, row_a: p.runs[0].row }, p.runs[kb].row != null ? { row_b: p.runs[kb].row } : {}, { key_a: d.key, key_b: d.key, value: S.rtHi }));
   };
-  const resetView = () => { S.rtHi = null; traceBox.replaceChildren(); renderRetest(out, traceBox, d); };
-  const focusBar = () => h("div", { class: "row tight", style: { padding: "8px 12px 0", justifyContent: "space-between" } },
-    S.rtHi ? h("span", { class: "row tight" }, h("span", { class: "muted small" }, "Highlighted:"), h("b", {}, S.rtHi), h("button", { class: "ghost small", title: "Clear the highlight", onclick: () => focusPart(null) }, "× clear"))
-      : h("span", { class: "muted small" }, "Click a line or point to highlight that part (click it again to clear). Drag to zoom, double-click to zoom out."),
-    h("button", { class: "small", title: "Clear the highlighted part, the parts table search and every chart zoom", onclick: resetView }, "↺ Reset view"));
-  const onPick = (el) => el.on && el.on("plotly_click", (ev) => { const k = ev.points && ev.points[0] && ev.points[0].customdata; if (typeof k === "string") focusPart(k); });
+  const showOnly = (key) => {
+    S.rtOnly = key || null;
+    if (!tblApi) return;
+    tblApi.setRows(S.rtOnly ? flat.filter((r) => r.key === S.rtOnly) : flat);
+    if (S.rtHi) tblApi.select((r) => r.key === S.rtHi); else tblApi.clear();
+    onlyNote.replaceChildren(...(S.rtOnly ? [h("span", { class: "muted small" }, "Showing only the part clicked on the chart:"), h("b", {}, S.rtOnly), h("button", { class: "ghost small", onclick: () => showOnly(null) }, "Show all parts")] : []));
+    onlyNote.hidden = !S.rtOnly;
+  };
+  const focusPart = (key, from) => {
+    S.rtHi = key && key !== S.rtHi ? key : null;
+    drawTraj(); drawDelta();
+    if (from === "chart" || !S.rtHi) showOnly(from === "chart" ? S.rtHi : null);
+    else if (tblApi) tblApi.select((r) => r.key === S.rtHi);
+    if (!S.rtHi || from === "chart") { traceBox.replaceChildren(); return; }
+    tracePart();
+  };
+  const resetView = () => { S.rtHi = null; S.rtOnly = null; traceBox.replaceChildren(); renderRetest(out, traceBox, d); };
+  const focusBar = () => h("div", { style: { padding: "8px 12px 0" } }, h("div", { class: "row tight", style: { justifyContent: "space-between" } },
+    S.rtHi ? h("span", { class: "row tight" }, h("span", { class: "muted small" }, "Highlighted:"), h("b", {}, S.rtHi), h("button", { class: "ghost small", title: "Clear the highlight", onclick: () => focusPart(null) }, "× clear"), h("button", { class: "small", title: "All results of this part in run 1 and the last run it was found in", onclick: tracePart }, "Trace this part"))
+      : h("span", { class: "muted small" }, "Click a line or point to highlight that part and narrow the parts table to it (click it again to clear). Drag to zoom, double-click to zoom out."),
+    h("button", { class: "small", title: "Clear the highlighted part, the parts table search and every chart zoom", onclick: resetView }, "↺ Reset view")),
+    S.rtHi ? partCard(d.parts.find((x) => x.key === S.rtHi), () => drawTraj()) : null);
+  const onPick = (el) => el.on && el.on("plotly_click", (ev) => { const k = ev.points && ev.points[0] && ev.points[0].customdata; if (typeof k === "string") focusPart(k, "chart"); });
   let ti = Math.min(S.rtTest || 0, d.tests.length - 1);
   const clip = (s, n) => (s.length > n ? s.slice(0, n - 1) + "…" : s);
   const jit = (key) => { let x = 0; for (const c of key) x = (x * 31 + c.charCodeAt(0)) | 0; return ((x >>> 0) % 1000) / 1000 * 0.24 - 0.12; };
@@ -2338,7 +2405,7 @@ function renderRetest(out, traceBox, d) {
     const useRange = (z0) => {
       const z = sendRange(z0), how = rangeHow();
       const bId = d.runs[runOf()].id;
-      const bc = S.bc || (S.bc = { a: S.ds, b: bId, good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", exclude: S.cfg.exclude, coords: "auto" });
+      const bc = S.bc || (S.bc = { a: S.ds, b: bId, good: "hbin = 1", test: "", how: "fail", range: "", incMarg: false, extra: "", name: "bad_candidate", coords: "auto" });
       Object.assign(bc, { b: bId, test: String(t.num), how: "fail", range: `${g4(z.lo)}..${g4(z.hi)}`, rangeNote: `from Retest trace, ${how}: ${rc.zones.find((x) => x.kind === "hard_bad").recovered} of ${rc.zones.find((x) => x.kind === "hard_bad").n} recovered in ${d.runs.map((r) => r.name).join(" → ")}` });
       if (bc.a === bId) bc.a = otherDs(bId);
       S.bcLast = null;
@@ -2403,8 +2470,9 @@ function renderRetest(out, traceBox, d) {
   drawDelta();
 
   // one row per part
-  const flat = d.parts.map((p) => {
-    const o2 = { key: p.key, outcome: p.outcome };
+  flat = d.parts.map((p) => {
+    const tv = traceValues(p.ids);
+    const o2 = { key: p.key, outcome: p.outcome, _trace: tv, _hay: Object.values(tv).filter(Boolean).join(" ").toLowerCase() };
     p.runs.forEach((r, k) => {
       o2[`s${k}`] = r.row != null && rtClass(r, 0) === "other" ? (r.status === "pass" ? "pass, alarm" : `fail, not ${d.tests[0].key}`) : RT_STATUS[r.status];
       o2[`site${k}`] = r.site ?? null;
@@ -2422,15 +2490,16 @@ function renderRetest(out, traceBox, d) {
     cols.push({ key: `f${k}`, label: `R${k + 1} 1st fail` });
   });
   const tb = h("div");
-  out.append(h("h2", {}, "Parts"), h("p", { class: "muted" }, "Click a part to highlight it on the trajectory and run-to-run charts and trace it (all its results in run 1 and the last run it was found in); click it again to clear."), tb);
-  const keys = { key_a: d.key, key_b: d.key };
+  onlyNote = h("div", { class: "row tight", hidden: true });
+  out.append(h("h2", {}, "Parts"), h("p", { class: "muted" }, "Click a part to highlight it on the trajectory and run-to-run charts and trace it (all its results in run 1 and the last run it was found in); click it again to clear. Search matches the part key, part ID, part text, WXY (one test, or wafer|X|Y from the separate tests, e.g. 3|12|-4) and the other trace IDs."), onlyNote, tb);
   tblApi = table(tb, cols, flat, {
-    placeholder: "Search parts…",
-    onClick: (r) => { if (S.rtHi !== r.key) focusPart(r.key); },
+    placeholder: "Search part, part text, WXY…",
+    match: (r, q) => rtSearch(r, q),
+    onClick: (r) => { if (S.rtHi !== r.key) focusPart(r.key, "table"); },
     onClear: () => focusPart(null),
     tools: h("button", { onclick: () => SC.download("retest_trace.csv", SC.toCSV(cols.map((c) => (c.key === "outcome" ? { key: "outcome", label: "Outcome" } : c.render ? { key: c.key, label: c.label } : c)), flat)) }, "Download CSV"),
   });
-  if (S.rtHi) tblApi.select((r) => r.key === S.rtHi);
+  if (S.rtOnly) showOnly(S.rtOnly); else if (S.rtHi) tblApi.select((r) => r.key === S.rtHi);
   if (d.truncated) out.append(h("p", { class: "muted small" }, "Only the first 20,000 parts are listed."));
   renderRetestSites(out, d, pctS);
 }
@@ -2455,7 +2524,7 @@ function renderRetestCandidates(out, d) {
   const find = async () => {
     loading(mkBox, "Ranking every run-1 test…");
     try {
-      const mk = await api("markers", { mode: "group", a, select: "$rt_bad_candidate", vs: "", filter: popF, later, key_a: d.key, key_b: d.key, exclude: S.rt.exclude || "", range: S.co.range, methods: mkMethods() });
+      const mk = await api("markers", { mode: "group", a, select: "$rt_bad_candidate", vs: "", filter: popF, later, key_a: d.key, key_b: d.key, exclude: idExclude(), range: S.co.range, methods: mkMethods() });
       mkBox.replaceChildren();
       const fetchTop = (key) => api("chart", { kind: "compare_test", mode: "group", ds: a, select: "$rt_bad_candidate", vs: "", filter: popF, test: key, range: S.co.range }).then((x) => x.hist);
       renderMarkers(mkBox, mk, null, { fetchTop });
@@ -2465,7 +2534,7 @@ function renderRetestCandidates(out, d) {
     h("button", { class: "primary", onclick: find }, "Find candidate tests"),
     h("button", { onclick: () => useFilter(a, "$rt_bad_candidate") }, "Analyse the candidates ($rt_bad_candidate)"),
     h("button", { title: "Profile run 1 against the first retest of good parts on the Bad candidates page (outlier scores, sites, wafer zones, focus tests)", onclick: () => {
-      S.bc = Object.assign(S.bc || {}, { a, b: later, good: "pass", test: String(t0.num), how: "fail", range: "", rangeNote: `from Retest trace: ${rl(c.good_runs[0])} retested good parts`, incMarg: false, extra: "", name: "bad_candidate", exclude: S.rt.exclude || S.cfg.exclude, coords: "auto" });
+      S.bc = Object.assign(S.bc || {}, { a, b: later, good: "pass", test: String(t0.num), how: "fail", range: "", rangeNote: `from Retest trace: ${rl(c.good_runs[0])} retested good parts`, incMarg: false, extra: "", name: "bad_candidate", coords: "auto" });
       S.bcLast = null; go("candidates");
     } }, "Full profile in Bad candidates →")));
 }
@@ -2956,7 +3025,18 @@ function viewSettings(el) {
   const dedup = select([["", "keep every test (incl. retests)"], ["last", "keep the last test of each part"], ["first", "keep the first test of each part"]], S.optDedup || "", (v) => { S.optDedup = v; saved(); });
   const merge = h("input", { type: "checkbox", checked: !!S.optMerge, onchange: (e) => { S.optMerge = e.target.checked; saved(); } });
   const key = select(KEYS.filter(([k]) => k !== "tests"), S.cfg.key, (v) => { S.cfg.key = v; S.mk = {}; saved(); });
-  const excl = h("input", { type: "text", value: S.cfg.exclude, style: { width: "220px" }, onchange: (e) => { S.cfg.exclude = e.target.value; saved(); } });
+  const ignore = h("input", { type: "checkbox", checked: S.cfg.ignoreIds !== false, onchange: (e) => { S.cfg.ignoreIds = e.target.checked; saved(); } });
+  const cfgIn = (k, ph, w) => h("input", { type: "text", value: S.cfg[k] || "", placeholder: ph, style: { width: w || "110px" }, onchange: (e) => { S.cfg[k] = e.target.value.trim(); saved(); } });
+  const othersBox = h("div");
+  const drawOthers = () => {
+    const o = S.cfg.others || (S.cfg.others = []);
+    othersBox.replaceChildren(...o.map((x, i) => h("div", { class: "row tight", style: { marginBottom: "6px" } },
+      h("input", { type: "text", value: x.name, placeholder: "name, e.g. Die ID", style: { width: "150px" }, onchange: (e) => { x.name = e.target.value.trim(); saved(); } }),
+      h("input", { type: "text", value: x.test, placeholder: "test", style: { width: "110px" }, onchange: (e) => { x.test = e.target.value.trim(); saved(); } }),
+      h("button", { title: "Remove", onclick: () => { o.splice(i, 1); saved(); drawOthers(); } }, "×"))),
+      h("button", { onclick: () => { o.push({ name: "", test: "" }); drawOthers(); } }, "+ Add other ID"));
+  };
+  drawOthers();
   const lb = h("input", { type: "text", value: S.lbTest || "5100", style: { width: "90px" }, onchange: async (e) => { try { const r = await api("loadboard", { test: e.target.value.trim() }); S.lbTest = String(r.test); S.testsCache = {}; saved(); } catch (err) { toast(err.message, "bad"); } } });
   const wc = waferCal();
   const inp = (k, ph) => h("input", { type: "text", value: wc[k], placeholder: ph, style: { width: "110px" }, onchange: (e) => { wc[k] = e.target.value.trim(); saved(); } });
@@ -2966,17 +3046,21 @@ function viewSettings(el) {
   const hist = select([["pct", "% of group"], ["count", "counts"]], S.co.hist, (v) => { S.co.hist = v; saveChartOpts(); toast("Saved", "good", 1500); });
   const skin = select([["", "Default"], ["industry", "Industry (steel blue, serif headings)"], ["office", "Office (navy, sky blue, yellow)"], ["work", "Work (burgundy, magenta)"]], SC.getSkin(), (v) => { SC.setSkin(v); document.getElementById("skin").value = v; toast("Saved", "good", 1500); });
   const reset = () => {
-    S.cfg = Object.assign({}, CFG_DEFAULT); S.wcal = Object.assign({}, WCAL_DEFAULT);
+    S.cfg = Object.assign({}, CFG_DEFAULT, { others: [], card: CFG_DEFAULT.card.slice() }); S.wcal = Object.assign({}, WCAL_DEFAULT);
     S.optSort = S.cfg.sort; S.optDedup = ""; S.optMerge = false; S.mk = {};
     if (S.lbTest !== "5100") api("loadboard", { test: "5100" }).catch(() => {});
     S.lbTest = "5100"; saveCfg(); go("settings");
   };
   el.append(
     sec("Opening files", null, h("div", { class: "controls" }, field("Order of opened files", sort), field("Retested parts", dedup), h("label", { class: "chk" }, merge, "Combine the files I open into one dataset"))),
-    sec("Parts and tests", "How parts are identified when files are matched (Match & trace, Bad candidates, Retest trace…), the identity tests left out of rankings (wafer, X/Y, die ID…; ranges allowed), and the test holding the loadboard ID.",
-      h("div", { class: "controls" }, field("Identify parts by", key), field("Leave out tests", excl), field("Loadboard test", lb))),
-    sec("Die X/Y from tests", "For files whose PRR has no die X/Y: the tests holding the wafer, X and Y (and optional X/Y offsets, e.g. a reticle origin). Used by Wafer maps, Bad candidates and the Part datalog's custom wafer X/Y search.",
-      h("div", { class: "controls" }, field("Wafer test", inp("w", "none")), field("X test", inp("x", "X")), field("Y test", inp("y", "Y")), field("X offset test", inp("ox", "none")), field("Y offset test", inp("oy", "none")), field("Offset", omode), flip("fx", "flip X"), flip("fy", "flip Y"))),
+    sec("Part identification and trace", "The PRR part ID, part text, X/Y and wafer are always available for tracing (some products leave part text or X/Y empty). The datalogged (PTR) identity tests below add to them: they show in the part trace card and the parts search of Retest trace, and rebuild die X/Y for Wafer maps, Bad candidates and the Part datalog. Leave a test blank if the program does not log it.",
+      h("div", { class: "controls" }, field("Identify parts by", key), h("label", { class: "chk", title: "Identity tests differ by position or board only, so they would top marker rankings and first-fail picks for no physical reason" }, ignore, "Ignore the identification tests in analytics (rankings, signatures, first fails)")),
+      h("h3", {}, "Part trace"),
+      h("div", { class: "controls" }, field("Wafer test", inp("w", "none")), field("X test", inp("x", "X")), field("Y test", inp("y", "Y")), field("X offset test", inp("ox", "none")), field("Y offset test", inp("oy", "none")), field("Offset", omode), flip("fx", "flip X"), flip("fy", "flip Y")),
+      h("div", { class: "controls" }, field("WXY test (wafer, X, Y in one result)", cfgIn("wxy", "none"))),
+      h("h3", {}, "Other trace"),
+      h("div", { class: "controls" }, field("Test program revision test", cfgIn("rev", "none")), field("Loadboard test", lb)),
+      field("Other IDs", othersBox)),
     sec("Look", "Colour theme for the whole app; ◐ at the top switches light and dark. Each histogram also has its own bin-size slider above the chart.", h("div", { class: "controls" }, field("Theme", skin), field("Axis range", range), field("Histogram", hist))),
     h("div", { class: "row" }, h("button", { onclick: reset }, "Reset to defaults")));
 }

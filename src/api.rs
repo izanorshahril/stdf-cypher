@@ -2990,6 +2990,41 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
             .map(|t| d.tests[t as usize].key.clone())
             .unwrap_or_default()
     };
+    // part trace fields (Settings > Part identification and trace): the PRR
+    // identity plus the datalogged trace tests (`id_tests`: {field: test}),
+    // read from the first run each part was found in
+    let id_tests: Vec<(String, String)> = pp
+        .0
+        .get("id_tests")
+        .and_then(|x| x.as_object())
+        .map(|o| {
+            o.iter()
+                .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.trim().to_string())))
+                .filter(|(_, v)| !v.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let id_idx: Vec<Vec<Option<usize>>> = dss
+        .iter()
+        .map(|d| id_tests.iter().map(|(_, q)| d.find_test(q)).collect())
+        .collect();
+    let ids_of = |k: usize, r: usize| -> Value {
+        let d = &dss[k];
+        let p = &d.parts[r];
+        let mut o = serde_json::Map::new();
+        o.insert("part_id".into(), json!(p.part_id));
+        o.insert("part_txt".into(), json!(p.part_txt));
+        o.insert("wafer".into(), json!(d.wafers.get(p.wafer as usize)));
+        o.insert("x".into(), json!(p.x));
+        o.insert("y".into(), json!(p.y));
+        for ((name, _), t) in id_tests.iter().zip(&id_idx[k]) {
+            let v = t.map(|t| d.value(t, r)).filter(|v| v.is_finite());
+            // the loadboard is a file attribute: parts missing it take the file's board
+            let v = v.or_else(|| (name == "lb").then(|| t.and_then(|t| d.file_value(r, d.tests[t].num))).flatten());
+            o.insert(name.clone(), v.map(n).unwrap_or(Value::Null));
+        }
+        Value::Object(o)
+    };
     let limit = pp.usize("limit", 20000);
     let part_rows: Vec<Value> = parts
         .iter()
@@ -3014,7 +3049,8 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
                     None => json!({"row": Value::Null, "status": p.status[k]}),
                 })
                 .collect();
-            json!({"key": p.key, "outcome": p.outcome, "recovered_in": p.recovered_in, "runs": runs})
+            let ids = p.rows.iter().enumerate().find_map(|(k, r)| r.map(|r| ids_of(k, r))).unwrap_or(Value::Null);
+            json!({"key": p.key, "outcome": p.outcome, "recovered_in": p.recovered_in, "runs": runs, "ids": ids})
         })
         .collect();
     let by_site = retest::by_site(&parts, dss.len(), &|k, r| dss[k].parts[r].site);

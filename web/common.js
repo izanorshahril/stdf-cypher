@@ -135,7 +135,7 @@ const SC = (() => {
     container.replaceChildren(tools, wrap);
     function render() {
       let r = rows;
-      if (q) r = r.filter((row) => cols.some((c) => String(row[c.key] ?? "").toLowerCase().includes(q)));
+      if (q) r = r.filter((row) => cols.some((c) => String(row[c.key] ?? "").toLowerCase().includes(q)) || (opts.match && opts.match(row, q)));
       if (sortKey) {
         const c = cols.find((c) => c.key === sortKey);
         r = [...r].sort((a, b) => {
