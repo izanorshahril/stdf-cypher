@@ -310,3 +310,11 @@ nav.side button:hover:not(.active) { background: color-mix(in srgb, var(--surfac
 .kpi .v, h1 { font-variant-numeric: lining-nums tabular-nums; }
 nav.side { scrollbar-width: thin; }
 input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(--accent); }
+/* part trace card (Retest trace) */
+.trace-card { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
+.trace-chip { display: inline-flex; gap: 6px; align-items: baseline; padding: 3px 10px; border: 1px solid var(--border); border-radius: 999px; background: var(--surface-2); }
+.trace-pick { position: relative; }
+.trace-pick summary { cursor: pointer; font-size: 12.5px; color: var(--text-2); list-style: none; padding: 3px 8px; border: 1px dashed var(--border); border-radius: 999px; }
+.trace-pick summary::-webkit-details-marker { display: none; }
+.trace-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; min-width: 180px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18); }
+.trace-menu label.chk { display: flex; gap: 6px; align-items: center; white-space: nowrap; }
