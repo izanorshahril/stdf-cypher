@@ -5,16 +5,34 @@
 //! last row with that key, as in [`crate::data::matching`]). In each run a part
 //! passes, fails, was not retested (no match while still bad) or passed
 //! earlier (no match after a pass: good parts are usually not retested).
+//!
+//! A second identity (the link, e.g. part text) carries the chain on where
+//! the key is missing: a part that failed before its datalogged ID test has
+//! no key in that run, but is still found by the link value it had in the
+//! last run it was found in. The link never joins rows whose keys differ.
 
 use crate::data::matching::KeySpec;
 use crate::data::Dataset;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// One run of the chain.
 pub struct Run<'a> {
     pub ds: &'a Dataset,
-    pub key: KeySpec,
+    /// None when the key cannot be read in this run (e.g. its test is not
+    /// in the file): parts are found by the link only
+    pub key: Option<KeySpec>,
+    /// second identity, for parts without a key match
+    pub link: Option<KeySpec>,
+}
+
+impl Run<'_> {
+    fn key(&self, r: usize) -> Option<String> {
+        self.key.as_ref()?.key(self.ds, r)
+    }
+    fn link(&self, r: usize) -> Option<String> {
+        self.link.as_ref()?.key(self.ds, r)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -54,13 +72,25 @@ impl Outcome {
 
 #[derive(Debug, Clone)]
 pub struct PartTrace {
+    /// the key, or the link value for a part never found with a key
     pub key: String,
+    /// the key (from any run it was found in) and the link value of the
+    /// last run it was found in
+    pub ids: (Option<String>, Option<String>),
     /// the part's row in each run
     pub rows: Vec<Option<usize>>,
+    /// found by the link in this run (its key missing there)
+    pub linked: Vec<bool>,
     pub status: Vec<Status>,
     pub outcome: Outcome,
     /// the run (0-based) it last passed in, for recovered parts
     pub recovered_in: Option<usize>,
+}
+
+/// Rows with these identities may be the same part: links equal, keys not
+/// different.
+fn same(a: &(Option<String>, Option<String>), b: &(Option<String>, Option<String>)) -> bool {
+    a.1.is_some() && a.1 == b.1 && (a.0.is_none() || b.0.is_none() || a.0 == b.0)
 }
 
 /// Follow `start` (rows of run 1) through `runs`.
@@ -68,29 +98,6 @@ pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
     let Some(first) = runs.first() else {
         return vec![];
     };
-    // one part per key in run 1 (its last row), in run-1 order
-    let mut order: Vec<String> = vec![];
-    let mut row1: HashMap<String, usize> = HashMap::new();
-    for &r in start {
-        if let Some(k) = first.key.key(first.ds, r) {
-            if row1.insert(k.clone(), r).is_none() {
-                order.push(k);
-            }
-        }
-    }
-    // the last row per key in every later run
-    let index: Vec<HashMap<String, usize>> = runs[1..]
-        .iter()
-        .map(|run| {
-            let mut m = HashMap::new();
-            for r in 0..run.ds.n_parts() {
-                if let Some(k) = run.key.key(run.ds, r) {
-                    m.insert(k, r);
-                }
-            }
-            m
-        })
-        .collect();
     let pass = |ds: &Dataset, r: usize| {
         if ds.parts[r].is_pass() {
             Status::Pass
@@ -98,33 +105,97 @@ pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
             Status::Fail
         }
     };
-    order
-        .into_iter()
-        .map(|key| {
-            let r1 = row1[&key];
-            let mut rows = vec![Some(r1)];
-            let mut status = vec![pass(first.ds, r1)];
-            for (k, idx) in index.iter().enumerate() {
-                let r = idx.get(&key).copied();
-                // a later run may retest good parts too, so go by the last result
-                let passed = last_result(&rows, &status) == Some(Status::Pass);
-                rows.push(r);
-                status.push(match r {
-                    Some(r) => pass(runs[k + 1].ds, r),
-                    None if passed => Status::PassedEarlier,
-                    None => Status::NotRetested,
-                });
+    // one part per identity in run 1 (its last row), in run-1 order
+    let mut parts: Vec<PartTrace> = vec![];
+    let mut by_key: HashMap<String, usize> = HashMap::new();
+    for &r in start {
+        let id = (first.key(r), first.link(r));
+        if id.0.is_none() && id.1.is_none() {
+            continue;
+        }
+        let hit = match &id.0 {
+            Some(k) => by_key.get(k).copied(),
+            None => None,
+        }
+        .or_else(|| parts.iter().rposition(|p| same(&p.ids, &id)));
+        let i = hit.unwrap_or_else(|| {
+            parts.push(PartTrace {
+                key: String::new(),
+                ids: (None, None),
+                rows: vec![None],
+                linked: vec![false],
+                status: vec![Status::Fail],
+                outcome: Outcome::StillBad,
+                recovered_in: None,
+            });
+            parts.len() - 1
+        });
+        let p = &mut parts[i];
+        p.rows[0] = Some(r);
+        p.status[0] = pass(first.ds, r);
+        p.ids.0 = id.0.or(p.ids.0.take());
+        p.ids.1 = id.1.or(p.ids.1.take());
+        if let Some(k) = &p.ids.0 {
+            by_key.insert(k.clone(), i);
+        }
+    }
+    for run in &runs[1..] {
+        // the last row per key and per link
+        let (mut keys, mut links) = (HashMap::new(), HashMap::new());
+        let ids: Vec<(Option<String>, Option<String>)> =
+            (0..run.ds.n_parts()).map(|r| (run.key(r), run.link(r))).collect();
+        for (r, id) in ids.iter().enumerate() {
+            if let Some(x) = &id.0 {
+                keys.insert(x.as_str(), r);
             }
-            let (outcome, last) = outcome(&status, &rows);
-            PartTrace {
-                recovered_in: (outcome == Outcome::Recovered).then_some(last),
-                key,
-                rows,
-                status,
-                outcome,
+            if let Some(x) = &id.1 {
+                links.insert(x.as_str(), r);
             }
-        })
-        .collect()
+        }
+        // by key first; the link only takes rows no key claimed
+        let mut found: Vec<Option<usize>> = parts
+            .iter()
+            .map(|p| keys.get(p.ids.0.as_deref()?).copied())
+            .collect();
+        let mut taken: HashSet<usize> = found.iter().flatten().copied().collect();
+        let mut linked = vec![false; parts.len()];
+        for (i, p) in parts.iter().enumerate() {
+            if found[i].is_some() {
+                continue;
+            }
+            let Some(r) = p.ids.1.as_deref().and_then(|l| links.get(l).copied()) else {
+                continue;
+            };
+            if !taken.contains(&r) && same(&p.ids, &ids[r]) {
+                taken.insert(r);
+                found[i] = Some(r);
+                linked[i] = true;
+            }
+        }
+        for ((p, r), l) in parts.iter_mut().zip(found).zip(linked) {
+            // a later run may retest good parts too, so go by the last result
+            let passed = last_result(&p.rows, &p.status) == Some(Status::Pass);
+            p.rows.push(r);
+            p.linked.push(l);
+            p.status.push(match r {
+                Some(r) => pass(run.ds, r),
+                None if passed => Status::PassedEarlier,
+                None => Status::NotRetested,
+            });
+            if let Some(r) = r {
+                let (a, b) = ids[r].clone();
+                p.ids.0 = p.ids.0.take().or(a);
+                p.ids.1 = b.or(p.ids.1.take());
+            }
+        }
+    }
+    for p in &mut parts {
+        let (outcome, last) = outcome(&p.status, &p.rows);
+        p.outcome = outcome;
+        p.recovered_in = (outcome == Outcome::Recovered).then_some(last);
+        p.key = p.ids.0.clone().or_else(|| p.ids.1.clone()).unwrap_or_default();
+    }
+    parts
 }
 
 /// The part's result in the last run it was found in.
@@ -544,6 +615,75 @@ mod tests {
         );
     }
 
+    /// A run of (key, link, pass) parts; an empty key or link is missing.
+    fn ds(parts: &[(&str, &str, bool)]) -> Dataset {
+        use crate::data::Part;
+        Dataset {
+            parts: parts
+                .iter()
+                .map(|&(id, txt, ok)| Part {
+                    file: 0,
+                    part_id: id.into(),
+                    head: 1,
+                    site: 1,
+                    x: -32768,
+                    y: -32768,
+                    hbin: 1,
+                    sbin: 1,
+                    passed: Some(ok),
+                    part_flg: 0,
+                    num_test: 0,
+                    test_t: 0,
+                    wafer: u32::MAX,
+                    part_txt: txt.into(),
+                    first_fail: None,
+                    alarms: vec![],
+                    fails: vec![],
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn link_carries_the_chain_where_the_key_is_missing() {
+        use Status::*;
+        // the key (part ID here, standing in for WXY) is logged in runs 1 and
+        // 2 only; the parts fail before it in runs 3 and 4
+        let r1 = ds(&[("w1", "a", false), ("w2", "b", false), ("w3", "c", false)]);
+        let r2 = ds(&[("w1", "a", false), ("w2", "b", false), ("w3", "c", true)]);
+        let r3 = ds(&[("", "a", false), ("", "b", false), ("w9", "c", false)]);
+        let r4 = ds(&[("", "a", true), ("", "b", false)]);
+        let run = |d, key: bool, link: bool| Run {
+            ds: d,
+            key: key.then_some(KeySpec::PartId),
+            link: link.then_some(KeySpec::PartTxt),
+        };
+        // key only: the chain ends at run 2
+        let t = trace(&[run(&r1, true, false), run(&r2, true, false), run(&r3, true, false), run(&r4, true, false)], &[0, 1, 2]);
+        assert_eq!(t[0].status, [Fail, Fail, NotRetested, NotRetested]);
+        // with the link: followed to run 4, by part text in runs 3 and 4
+        let runs = [run(&r1, true, true), run(&r2, true, true), run(&r3, true, true), run(&r4, true, true)];
+        let t = trace(&runs, &[0, 1, 2]);
+        assert_eq!(t[0].status, [Fail, Fail, Fail, Pass]);
+        assert_eq!(t[0].rows, [Some(0), Some(0), Some(0), Some(0)]);
+        assert_eq!(t[0].linked, [false, false, true, true]);
+        assert_eq!((t[0].outcome, t[0].recovered_in), (Outcome::Recovered, Some(3)));
+        assert_eq!(t[0].key, "w1");
+        assert_eq!(t[1].outcome, Outcome::StillBad);
+        // c passed in run 2; run 3's "c" has another key, so it is another part
+        assert_eq!(t[2].status, [Fail, Pass, PassedEarlier, PassedEarlier]);
+        // a run without the key test at all: the link alone
+        let runs = [run(&r1, true, true), run(&r2, true, true), run(&r3, false, true), run(&r4, false, true)];
+        let t = trace(&runs, &[0, 1]);
+        assert_eq!(t[0].status, [Fail, Fail, Fail, Pass]);
+        // a run-1 part with no key at all is traced by its link
+        let r0 = ds(&[("", "a", false)]);
+        let t = trace(&[run(&r0, true, true), run(&r2, true, true)], &[0]);
+        // ...and takes the key found for it in run 2
+        assert_eq!((t[0].key.as_str(), t[0].rows[1]), ("w1", Some(0)));
+    }
+
     #[test]
     fn retest_of_good_parts_and_sites() {
         use Status::*;
@@ -551,6 +691,8 @@ mod tests {
         // retest) fail, run 5 fail again
         let p = PartTrace {
             key: "a".into(),
+            ids: (Some("a".into()), None),
+            linked: vec![false; 5],
             rows: vec![Some(0), Some(0), None, Some(0), Some(0)],
             status: vec![Fail, Pass, PassedEarlier, Fail, Fail],
             outcome: Outcome::StillBad,
@@ -560,6 +702,8 @@ mod tests {
         assert!(p.retested_good(3) && !p.retested_good(4));
         let q = PartTrace {
             key: "b".into(),
+            ids: (Some("b".into()), None),
+            linked: vec![false; 5],
             rows: vec![Some(1), Some(1), Some(1), None, None],
             status: vec![Fail, Fail, Pass, PassedEarlier, PassedEarlier],
             outcome: Outcome::Recovered,

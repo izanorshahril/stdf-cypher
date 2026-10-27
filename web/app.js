@@ -2155,6 +2155,9 @@ function viewRetest(el) {
       h("button", { onclick: () => { st.runs.push(ids.find((x) => !st.runs.includes(x)) ?? ids[0]); drawRuns(); } }, "+ Add run"));
   };
   const kp = keyPicker("rt");
+  if (st.link == null) st.link = "part_txt";
+  const link = select([["", "nothing (key only)"], ...KEYS.filter(([k]) => k !== "tests")], st.link, (v) => (st.link = v));
+  link.title = "Where a part has no key in a run (e.g. it failed before the WXY test), find it by this ID instead, from the last run it was found in. Never joins parts whose keys differ.";
   const mode = select([["reject", "rejects of run 1 (not pass)"], ["all", "all parts of run 1 (when a run retests good parts)"], ["test", "failing the traced test"], ["custom", "custom filter"]], st.mode, (v) => { st.mode = v; custom.hidden = v !== "custom"; });
   const custom = h("input", { type: "text", class: "filter-input", value: st.custom, placeholder: "e.g. fail(1013) and site = 2", hidden: st.mode !== "custom", oninput: (e) => (st.custom = e.target.value) });
   const tests = h("input", { type: "text", value: st.tests, placeholder: "blank = most common first fail", style: { width: "190px" }, title: "Test(s) to trace, e.g. 1013 or 1013, 1290. Values are shown in each test's display unit (logged UNITS scaled by RES_SCAL).", oninput: (e) => { st.tests = e.target.value; updHint(); } });
@@ -2172,7 +2175,7 @@ function viewRetest(el) {
     const filter = st.mode === "reject" ? "not pass" : st.mode === "all" ? "all" : st.mode === "test" ? `fail(${first})` : st.custom.trim() || "not pass";
     loading(out, "Following the parts through the runs…");
     try {
-      const d = await api("retest_trace", { runs: st.runs, key: kp.value(), filter: scoped(filter), tests: st.tests, exclude: idExclude(), id_tests: idTests(), value_from: st.valueFrom || "first", max_rate: (st.maxRate ?? 10) / 100, min_zone: st.minZone ?? 10 });
+      const d = await api("retest_trace", { runs: st.runs, key: kp.value(), link: st.link, filter: scoped(filter), tests: st.tests, exclude: idExclude(), id_tests: idTests(), value_from: st.valueFrom || "first", max_rate: (st.maxRate ?? 10) / 100, min_zone: st.minZone ?? 10 });
       S.rtLast = d;
       renderRetest(out, traceBox, d);
     } catch (e) { showErr(out, e); }
@@ -2184,8 +2187,8 @@ function viewRetest(el) {
     h("div", { class: "grid2" },
       h("div", { class: "card pad" }, h("b", {}, "Runs, in test order"), runsBox),
       h("div", { class: "card pad" }, h("b", {}, "Parts and tests"),
-        h("div", { class: "controls" }, field("Identify parts by", kp.el)),
-        h("p", { class: "muted small" }, "Part text (or wafer + X/Y) is safest: part IDs often restart at 1 in every run."),
+        h("div", { class: "controls" }, field("Identify parts by", kp.el), field("Then link by", link)),
+        h("p", { class: "muted small" }, "Part text (or wafer + X/Y) is safest: part IDs often restart at 1 in every run. The link follows parts on where the key is missing, e.g. a part that failed before its WXY test."),
         h("div", { class: "controls" }, field("Start with", h("div", { class: "row tight" }, mode, custom))),
         h("div", { class: "controls" }, field("Trace test(s)", h("div", { class: "row tight" }, tests, unitHint)), loadboardField(), h("button", { class: "primary", onclick: run }, "Trace")))),
     out, traceBox);
@@ -2219,7 +2222,7 @@ function renderRetest(out, traceBox, d) {
     kpi("Still bad", o.still_bad.toLocaleString(), `failed in ${rl(N - 1)}`),
     kpi("Not retested", o.not_retested.toLocaleString(), "failed, then no match in a later run"),
     o.passed_run1 ? kpi("Stayed good", o.passed_run1.toLocaleString(), "passed run 1 and never failed after") : "",
-    kpi("Matched by", d.key_desc, "")),
+    kpi("Matched by", d.key_desc, d.link ? `${(d.n_linked || 0).toLocaleString()} parts found by the link in a run without their key` : "")),
   h("div", { class: "row" },
     h("button", { onclick: () => useFilter(d.runs[0].id, "$retest_recovered") }, "Analyse recovered ($retest_recovered)"),
     h("button", { onclick: () => useFilter(d.runs[0].id, "$retest_still_bad") }, "Analyse still bad ($retest_still_bad)"),
@@ -2493,7 +2496,7 @@ function renderRetest(out, traceBox, d) {
   // one row per part
   flat = d.parts.map((p) => {
     const tv = traceValues(p.ids);
-    const o2 = { key: p.key, outcome: p.outcome, _trace: tv, _hay: Object.values(tv).filter(Boolean).join(" ").toLowerCase() };
+    const o2 = { key: p.key, outcome: p.outcome, linked: p.runs.map((r, k) => (r.linked ? `R${k + 1}` : "")).filter(Boolean).join(", "), _trace: tv, _hay: Object.values(tv).filter(Boolean).join(" ").toLowerCase() };
     p.runs.forEach((r, k) => {
       o2[`s${k}`] = r.row != null && rtClass(r, 0) === "other" ? (r.status === "pass" ? "pass, alarm" : `fail, not ${d.tests[0].key}`) : RT_STATUS[r.status];
       o2[`site${k}`] = r.site ?? null;
@@ -2504,6 +2507,7 @@ function renderRetest(out, traceBox, d) {
     return o2;
   });
   const cols = [{ key: "key", label: "Part" }, { key: "outcome", label: "Outcome", render: (v) => badge(RT_OUTCOME[v][0], RT_OUTCOME[v][2]) }];
+  if (d.link) cols.push({ key: "linked", label: "Linked in", title: "Runs where the part was found by the link, its key missing there" });
   d.runs.forEach((_, k) => {
     cols.push({ key: `s${k}`, label: `R${k + 1}`, title: `yellow: passes ${d.tests[0].key} but fails another test or has an alarm`, render: (v) => (v === "pass" ? badge("pass", "good") : v === "fail" ? badge("fail", "bad") : v && (v.startsWith("pass,") || v.startsWith("fail,")) ? badge(v, "warn") : h("span", { class: "muted small" }, v || "")) },
       { key: `site${k}`, label: `R${k + 1} site`, num: true }, { key: `b${k}`, label: `R${k + 1} bin`, num: true });

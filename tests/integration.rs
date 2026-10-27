@@ -1313,6 +1313,18 @@ fn retest_trace_follows_rejects_through_runs() {
     let n3 = reg.get(4).unwrap().0.n_parts();
     assert_eq!(n3, u(&s[1], "fail"));
     assert_eq!(u(&t["outcomes"], "not_retested"), n_rej - n3);
+    // a key test missing from the files: the link (part text) carries the
+    // whole chain, as tracing by part text does
+    let by_txt = api::run(&reg, "retest_trace", &json!({"runs": [0, 3, 4], "tests": key})).unwrap();
+    assert!(api::run(&reg, "retest_trace", &json!({"runs": [0, 3, 4], "key": "tests:999999"})).is_err());
+    let linked = api::run(&reg, "retest_trace", &json!({"runs": [0, 3, 4], "tests": key, "key": "tests:999999", "link": "part_txt"})).unwrap();
+    assert_eq!(linked["outcomes"], by_txt["outcomes"]);
+    assert_eq!(u(&linked, "n_linked"), n_rej);
+    assert_eq!(linked["parts"][0]["runs"][1]["linked"], true);
+    // key and link both readable: the key matches, the link is not needed
+    let both = api::run(&reg, "retest_trace", &json!({"runs": [0, 3, 4], "tests": key, "key": "tests:500", "link": "part_txt"})).unwrap();
+    assert_eq!(both["outcomes"], by_txt["outcomes"]);
+    assert_eq!(u(&both, "n_linked"), 0);
     assert!(api::run(&reg, "retest_trace", &json!({"runs": [0]})).is_err());
     assert!(api::run(&reg, "retest_trace", &json!({"runs": [0, 0]})).is_err());
 }

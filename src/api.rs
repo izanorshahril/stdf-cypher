@@ -2695,7 +2695,8 @@ fn candidates_op(reg: &Registry, pp: &P) -> Result<Value> {
 
 /// Retest trace: follow the parts of run 1 (`runs[0]`, rows matching
 /// `filter`, default `not pass`) through the later runs (`runs`: dataset ids
-/// in order, each a retest of the previous run's rejects), matched by `key`.
+/// in order, each a retest of the previous run's rejects), matched by `key`,
+/// then by `link` (optional, e.g. `part_txt`) where the key is missing.
 /// Traces the values of `tests` (blank = the most common first fail of the
 /// traced parts, leaving out `exclude`) in display units, summarizes each
 /// run, and stores `$retest_recovered` / `$retest_still_bad` /
@@ -2726,15 +2727,31 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
         .map(|&i| reg.get(i).map(|d| d.0))
         .collect::<Result<_>>()?;
     let key_s = pp.str_or("key", "part_txt");
+    // with a link, a run whose key cannot be read (its test missing) is
+    // followed by the link alone
+    let link_s = pp.str("link");
+    let link_s = link_s.trim();
     let runs: Vec<Run> = dss
         .iter()
-        .map(|d| {
-            Ok(Run {
-                ds: d,
-                key: KeySpec::parse(&key_s, d)?,
-            })
+        .enumerate()
+        .map(|(k, d)| {
+            let key = KeySpec::parse(&key_s, d);
+            if link_s.is_empty() {
+                return Ok(Run { ds: d, key: Some(key?), link: None });
+            }
+            let link = KeySpec::parse(link_s, d);
+            if let (Err(a), Err(b)) = (&key, &link) {
+                bail!("run {}: neither the key nor the link can be read: {a}; {b}", k + 1);
+            }
+            Ok(Run { ds: d, key: key.ok(), link: link.ok() })
         })
         .collect::<Result<_>>()?;
+    let key_d = runs.iter().find_map(|r| r.key.as_ref().map(|s| s.describe(r.ds)));
+    let link_d = runs.iter().find_map(|r| r.link.as_ref().map(|s| s.describe(r.ds)));
+    let key_desc = match (key_d, link_d) {
+        (Some(k), Some(l)) => format!("{k}, then {l}"),
+        (k, l) => k.or(l).unwrap_or_default(),
+    };
     let d1 = &dss[0];
     let filter = pp.str_or("filter", "not pass");
     let start = reg.rows(ids[0], d1, &filter)?;
@@ -2746,7 +2763,7 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
         bail!(
             "none of the {} selected parts of run 1 has a key ({})",
             start.len(),
-            runs[0].key.describe(d1)
+            key_desc
         );
     }
 
@@ -2940,9 +2957,21 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
             continue;
         };
         let (d, _) = reg.get(id)?;
-        let k = KeySpec::parse(&key_s, &d)?;
-        let by_key: std::collections::HashMap<&str, Outcome> =
-            parts.iter().map(|p| (p.key.as_str(), p.outcome)).collect();
+        let k = KeySpec::parse(&key_s, &d);
+        let l = (!link_s.is_empty()).then(|| KeySpec::parse(link_s, &d)).transpose();
+        let (k, l) = match (k, l) {
+            (Err(e), Ok(None)) => return Err(e),
+            (Err(_), Err(e)) => return Err(e),
+            (k, l) => (k.ok(), l.ok().flatten()),
+        };
+        let by_key: std::collections::HashMap<&str, Outcome> = parts
+            .iter()
+            .filter_map(|p| Some((p.ids.0.as_deref()?, p.outcome)))
+            .collect();
+        let by_link: std::collections::HashMap<&str, Outcome> = parts
+            .iter()
+            .filter_map(|p| Some((p.ids.1.as_deref()?, p.outcome)))
+            .collect();
         let mut flags: IndexMap<&str, Vec<bool>> = IndexMap::new();
         for o in [
             Outcome::Recovered,
@@ -2953,10 +2982,16 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
             flags.insert(o.set_name(), vec![false; d.n_parts()]);
         }
         for r in 0..d.n_parts() {
-            if let Some(o) = k
-                .key(&d, r)
-                .and_then(|key| by_key.get(key.as_str()).copied())
-            {
+            let kk = k.as_ref().and_then(|k| k.key(&d, r));
+            // by key, else by link when the row has no key
+            let o = match &kk {
+                Some(key) => by_key.get(key.as_str()).copied(),
+                None => l
+                    .as_ref()
+                    .and_then(|l| l.key(&d, r))
+                    .and_then(|x| by_link.get(x.as_str()).copied()),
+            };
+            if let Some(o) = o {
                 flags[o.set_name()][r] = true;
             }
         }
@@ -3043,7 +3078,7 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
                             .collect();
                         let fl: Vec<bool> = (0..tests.len()).map(|ti| fails_on(ti, k, *r)).collect();
                         let alarms: Vec<&str> = d.parts[*r].alarms.iter().map(|&t| d.tests[t as usize].key.as_str()).collect();
-                        json!({"row": r, "status": p.status[k], "site": d.parts[*r].site, "retest_good": p.retested_good(k), "alarms": alarms, "hbin": d.parts[*r].hbin, "sbin": d.parts[*r].sbin,
+                        json!({"row": r, "status": p.status[k], "linked": p.linked[k], "site": d.parts[*r].site, "retest_good": p.retested_good(k), "alarms": alarms, "hbin": d.parts[*r].hbin, "sbin": d.parts[*r].sbin,
                             "first_fail": ff(*r, d), "values": vals, "fails": fl})
                     }
                     None => json!({"row": Value::Null, "status": p.status[k]}),
@@ -3066,7 +3101,8 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
             let (l, u) = retest::wilson(*k_, *n_);
             json!({"run": k, "board": b, "retested": n_, "pass": k_, "rate": *k_ as f64 / *n_ as f64, "ci_lo": l, "ci_hi": u})
         }).collect::<Vec<_>>(),
-        "key": key_s, "key_desc": runs[0].key.describe(d1), "filter": filter, "n_start": start.len(), "n_parts": parts.len(),
+        "key": key_s, "link": link_s, "key_desc": key_desc,
+        "n_linked": parts.iter().filter(|p| p.linked.contains(&true)).count(), "filter": filter, "n_start": start.len(), "n_parts": parts.len(),
         "tests": tests.iter().zip(&tmap).map(|(&t, m)| {
             let info = &d1.tests[t];
             json!({"key": info.key, "num": info.num, "units": display_unit(&info.units, info.res_scal).0,
