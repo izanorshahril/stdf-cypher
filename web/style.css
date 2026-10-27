@@ -318,3 +318,10 @@ input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(-
 .trace-pick summary::-webkit-details-marker { display: none; }
 .trace-menu { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; min-width: 180px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.18); }
 .trace-menu label.chk { display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+/* ID trail of the highlighted part (Retest trace) */
+.id-trail { overflow-x: auto; margin-top: 8px; border: 1px solid var(--border); border-radius: 8px; }
+.id-trail th { position: static; cursor: default; }
+.id-trail td { font-family: var(--mono); font-size: 12px; }
+.id-trail td.id-diff { background: color-mix(in srgb, var(--warn) 22%, transparent); font-weight: 600; }
+.id-trail td.id-bad { color: var(--fail); text-decoration: line-through; }
+.focus-box { scroll-margin-top: 130px; }

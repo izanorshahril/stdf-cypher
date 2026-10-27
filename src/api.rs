@@ -2758,7 +2758,8 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
     if start.is_empty() {
         bail!("no part of run 1 matches '{filter}'");
     }
-    let parts = retest::trace(&runs, &start);
+    let au = retest::audit(&runs);
+    let parts = retest::trace(&runs, &start, &au);
     if parts.is_empty() {
         bail!(
             "none of the {} selected parts of run 1 has a key ({})",
@@ -3060,6 +3061,48 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
         }
         Value::Object(o)
     };
+    // ID audit: per run the issues and the traced parts on them, the rows of
+    // issues and flagged parts as $rt_id_issue in every run
+    let mut issue_at: std::collections::HashMap<(usize, usize), &str> = Default::default();
+    for i in &au.issues {
+        for &r in &i.rows {
+            issue_at.entry((i.run, r)).or_insert(i.kind);
+        }
+    }
+    let part_at: std::collections::HashMap<(usize, usize), &str> = parts
+        .iter()
+        .flat_map(|p| p.rows.iter().enumerate().filter_map(move |(k, r)| Some(((k, (*r)?), p.key.as_str()))))
+        .collect();
+    let mut id_sets: Vec<Vec<bool>> = dss.iter().map(|d| vec![false; d.n_parts()]).collect();
+    for &(k, r) in issue_at.keys() {
+        id_sets[k][r] = true;
+    }
+    for p in parts.iter().filter(|p| !p.flags.is_empty()) {
+        for k in p.flags.iter().map(|f| f.run).chain([0]) {
+            if let Some(r) = p.rows[k] {
+                id_sets[k][r] = true;
+            }
+        }
+    }
+    for (k, f) in id_sets.into_iter().enumerate() {
+        reg.put_set(ids[k], "rt_id_issue", f);
+    }
+    let max_issues = pp.usize("max_issues", 2000);
+    let audit = json!({
+        "checked": runs.iter().any(|r| r.key.is_some() && r.link.is_some()),
+        "n_issues": au.issues.len(),
+        "dropped_keys": au.bad_keys.iter().flatten().collect::<std::collections::HashSet<_>>().len(),
+        "dropped_links": au.bad_links.iter().flatten().collect::<std::collections::HashSet<_>>().len(),
+        "n_flagged": parts.iter().filter(|p| !p.flags.is_empty()).count(),
+        "issues": au.issues.iter().take(max_issues).map(|i| {
+            let mut tp: Vec<&str> = i.rows.iter().filter_map(|&r| part_at.get(&(i.run, r)).copied()).collect();
+            tp.dedup();
+            json!({"run": i.run, "kind": i.kind, "value": i.value, "pattern": i.pattern, "n_rows": i.rows.len(),
+                "rows": i.rows.iter().take(50).collect::<Vec<_>>(), "others": i.others.iter().take(50).collect::<Vec<_>>(),
+                "n_others": i.others.len(), "parts": tp.into_iter().take(50).collect::<Vec<_>>()})
+        }).collect::<Vec<_>>(),
+        "flags": parts.iter().flat_map(|p| p.flags.iter().map(move |f| json!({"run": f.run, "kind": f.kind, "detail": f.detail, "part": p.key}))).take(max_issues).collect::<Vec<_>>(),
+    });
     let limit = pp.usize("limit", 20000);
     let part_rows: Vec<Value> = parts
         .iter()
@@ -3078,14 +3121,15 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
                             .collect();
                         let fl: Vec<bool> = (0..tests.len()).map(|ti| fails_on(ti, k, *r)).collect();
                         let alarms: Vec<&str> = d.parts[*r].alarms.iter().map(|&t| d.tests[t as usize].key.as_str()).collect();
-                        json!({"row": r, "status": p.status[k], "linked": p.linked[k], "site": d.parts[*r].site, "retest_good": p.retested_good(k), "alarms": alarms, "hbin": d.parts[*r].hbin, "sbin": d.parts[*r].sbin,
+                        json!({"row": r, "status": p.status[k], "linked": p.linked[k], "id_key": runs[k].key(*r), "id_link": runs[k].link(*r),
+                            "id_issue": issue_at.get(&(k, *r)).copied(), "site": d.parts[*r].site, "retest_good": p.retested_good(k), "alarms": alarms, "hbin": d.parts[*r].hbin, "sbin": d.parts[*r].sbin,
                             "first_fail": ff(*r, d), "values": vals, "fails": fl})
                     }
                     None => json!({"row": Value::Null, "status": p.status[k]}),
                 })
                 .collect();
             let ids = p.rows.iter().enumerate().find_map(|(k, r)| r.map(|r| ids_of(k, r))).unwrap_or(Value::Null);
-            json!({"key": p.key, "outcome": p.outcome, "recovered_in": p.recovered_in, "runs": runs, "ids": ids})
+            json!({"key": p.key, "outcome": p.outcome, "recovered_in": p.recovered_in, "runs": runs, "ids": ids, "flags": p.flags})
         })
         .collect();
     let by_site = retest::by_site(&parts, dss.len(), &|k, r| dss[k].parts[r].site);
@@ -3116,7 +3160,7 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
         "summary": summary, "candidates": candidates,
         "by_site": {"counts": by_site.counts, "p": by_site.p.iter().map(|&v| n(v)).collect::<Vec<_>>()},
         "flows": flows.iter().map(|((k, a, b), c)| json!({"run": k, "from": a, "to": b, "n": c})).collect::<Vec<_>>(),
-        "parts": part_rows, "truncated": parts.len() > limit,
+        "parts": part_rows, "truncated": parts.len() > limit, "audit": audit,
     }))
 }
 

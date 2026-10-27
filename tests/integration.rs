@@ -1325,6 +1325,10 @@ fn retest_trace_follows_rejects_through_runs() {
     let both = api::run(&reg, "retest_trace", &json!({"runs": [0, 3, 4], "tests": key, "key": "tests:500", "link": "part_txt"})).unwrap();
     assert_eq!(both["outcomes"], by_txt["outcomes"]);
     assert_eq!(u(&both, "n_linked"), 0);
+    // clean IDs: WXY and part text agree everywhere, nothing to audit
+    assert_eq!(both["audit"]["checked"], true);
+    assert_eq!((u(&both["audit"], "n_issues"), u(&both["audit"], "n_flagged")), (0, 0));
+    assert!(reg.rows(0, &d1, "$rt_id_issue").unwrap().is_empty());
     assert!(api::run(&reg, "retest_trace", &json!({"runs": [0]})).is_err());
     assert!(api::run(&reg, "retest_trace", &json!({"runs": [0, 0]})).is_err());
 }

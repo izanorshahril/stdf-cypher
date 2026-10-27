@@ -8,11 +8,21 @@
 //!
 //! A second identity (the link, e.g. part text) carries the chain on where
 //! the key is missing: a part that failed before its datalogged ID test has
-//! no key in that run, but is still found by the link value it had in the
-//! last run it was found in. The link never joins rows whose keys differ.
+//! no key in that run, but is still found by its link value (the first one
+//! seen for it). The link never joins rows whose keys differ.
+//!
+//! Both IDs should be unique to a part, but are not always: a corrupt EEPROM
+//! gives many parts the same WXY (all zeros or all ones), a camera out of
+//! sync or a wrong sort moves a 2D code (part text) to another part. The
+//! [`audit`] finds, per run, a key shared by parts with different links, a
+//! link shared by parts with different keys, and placeholder values. Such
+//! values are not used for matching when the other ID is there to do it, so
+//! they never merge different parts; the trace also flags parts whose link
+//! changes between runs or whose link leads to a row with another key.
 
 use crate::data::matching::KeySpec;
 use crate::data::Dataset;
+use indexmap::IndexMap;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
@@ -27,12 +37,128 @@ pub struct Run<'a> {
 }
 
 impl Run<'_> {
-    fn key(&self, r: usize) -> Option<String> {
+    pub fn key(&self, r: usize) -> Option<String> {
         self.key.as_ref()?.key(self.ds, r)
     }
-    fn link(&self, r: usize) -> Option<String> {
+    pub fn link(&self, r: usize) -> Option<String> {
         self.link.as_ref()?.key(self.ds, r)
     }
+}
+
+/// One ID problem in one run.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdIssue {
+    pub run: usize,
+    /// key_shared: one key on parts with different links; link_shared: one
+    /// link on parts with different keys; suspect_key / suspect_link: a
+    /// placeholder value on a single part
+    pub kind: &'static str,
+    pub value: String,
+    /// e.g. "all zeros"
+    pub pattern: Option<String>,
+    pub rows: Vec<usize>,
+    /// the other ID's distinct values on those rows
+    pub others: Vec<String>,
+}
+
+/// The ID problems of a chain, and per run the values left out of matching
+/// there (a value shared in one run may be unique, and usable, in another).
+#[derive(Debug, Clone, Default)]
+pub struct Audit {
+    pub issues: Vec<IdIssue>,
+    pub bad_keys: Vec<HashSet<String>>,
+    pub bad_links: Vec<HashSet<String>>,
+}
+
+impl Audit {
+    fn bad_key(&self, run: usize, v: &str) -> bool {
+        self.bad_keys.get(run).is_some_and(|s| s.contains(v))
+    }
+    fn bad_link(&self, run: usize, v: &str) -> bool {
+        self.bad_links.get(run).is_some_and(|s| s.contains(v))
+    }
+}
+
+/// A value an ID reader writes when it has none: every component zero or
+/// all ones (-1, 65535, 4294967295…), or one character repeated (8+ long,
+/// e.g. 00000000 or FFFFFFFF).
+pub fn placeholder(v: &str) -> Option<String> {
+    const ONES: &[&str] = &["-1", "65535", "4294967295", "2147483647", "-2147483648", "18446744073709551615", "-32768", "32767"];
+    let comps: Vec<&str> = v.split('|').collect();
+    if comps.iter().all(|c| *c == "0") {
+        return Some("all zeros".into());
+    }
+    if comps.iter().all(|c| ONES.contains(c)) {
+        return Some("all ones".into());
+    }
+    let mut ch = v.chars();
+    let c = ch.next()?;
+    (v.chars().count() >= 8 && ch.all(|x| x == c)).then(|| format!("'{c}' repeated"))
+}
+
+/// Per run: keys shared by different links, links shared by different keys,
+/// and placeholder values. A value is left out of matching in that run when
+/// the run has the other ID to match by instead.
+pub fn audit(runs: &[Run]) -> Audit {
+    let mut a = Audit {
+        bad_keys: vec![HashSet::new(); runs.len()],
+        bad_links: vec![HashSet::new(); runs.len()],
+        ..Default::default()
+    };
+    for (k, run) in runs.iter().enumerate() {
+        let ids: Vec<(Option<String>, Option<String>)> =
+            (0..run.ds.n_parts()).map(|r| (run.key(r), run.link(r))).collect();
+        for by_key in [true, false] {
+            // value -> (rows, the other ID's distinct values)
+            let mut g: IndexMap<&str, (Vec<usize>, Vec<&str>)> = IndexMap::new();
+            for (r, id) in ids.iter().enumerate() {
+                let (v, o) = if by_key { (&id.0, &id.1) } else { (&id.1, &id.0) };
+                let Some(v) = v else { continue };
+                let e = g.entry(v.as_str()).or_default();
+                e.0.push(r);
+                if let Some(o) = o {
+                    if !e.1.contains(&o.as_str()) {
+                        e.1.push(o.as_str());
+                    }
+                }
+            }
+            let other_there = if by_key { run.link.is_some() } else { run.key.is_some() };
+            for (v, (rows, others)) in g {
+                let pattern = placeholder(v);
+                let kind = match (others.len() > 1, &pattern, by_key) {
+                    (true, _, true) => "key_shared",
+                    (true, _, false) => "link_shared",
+                    (false, Some(_), true) => "suspect_key",
+                    (false, Some(_), false) => "suspect_link",
+                    _ => continue,
+                };
+                if other_there {
+                    let bad = if by_key { &mut a.bad_keys } else { &mut a.bad_links };
+                    bad[k].insert(v.to_string());
+                }
+                a.issues.push(IdIssue {
+                    run: k,
+                    kind,
+                    value: v.to_string(),
+                    pattern,
+                    rows,
+                    others: others.into_iter().map(String::from).collect(),
+                });
+            }
+        }
+    }
+    a
+}
+
+/// A part whose IDs disagree across runs.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdFlag {
+    pub run: usize,
+    /// link_changed: found by key, with another link than before;
+    /// key_conflict: its link leads to a row with another key (not joined);
+    /// ambiguous: not found, its own key or link is on several parts there
+    pub kind: &'static str,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -74,13 +200,14 @@ impl Outcome {
 pub struct PartTrace {
     /// the key, or the link value for a part never found with a key
     pub key: String,
-    /// the key (from any run it was found in) and the link value of the
-    /// last run it was found in
+    /// the first key and link found for it (values the audit left out never
+    /// count)
     pub ids: (Option<String>, Option<String>),
     /// the part's row in each run
     pub rows: Vec<Option<usize>>,
-    /// found by the link in this run (its key missing there)
+    /// found by the link in this run (its key missing or left out there)
     pub linked: Vec<bool>,
+    pub flags: Vec<IdFlag>,
     pub status: Vec<Status>,
     pub outcome: Outcome,
     /// the run (0-based) it last passed in, for recovered parts
@@ -93,10 +220,17 @@ fn same(a: &(Option<String>, Option<String>), b: &(Option<String>, Option<String
     a.1.is_some() && a.1 == b.1 && (a.0.is_none() || b.0.is_none() || a.0 == b.0)
 }
 
-/// Follow `start` (rows of run 1) through `runs`.
-pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
+/// Follow `start` (rows of run 1) through `runs`, leaving out the IDs the
+/// audit `au` (of the same runs) found unreliable.
+pub fn trace(runs: &[Run], start: &[usize], au: &Audit) -> Vec<PartTrace> {
     let Some(first) = runs.first() else {
         return vec![];
+    };
+    let ids_of = |k: usize, r: usize| {
+        (
+            runs[k].key(r).filter(|v| !au.bad_key(k, v)),
+            runs[k].link(r).filter(|v| !au.bad_link(k, v)),
+        )
     };
     let pass = |ds: &Dataset, r: usize| {
         if ds.parts[r].is_pass() {
@@ -109,7 +243,7 @@ pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
     let mut parts: Vec<PartTrace> = vec![];
     let mut by_key: HashMap<String, usize> = HashMap::new();
     for &r in start {
-        let id = (first.key(r), first.link(r));
+        let id = ids_of(0, r);
         if id.0.is_none() && id.1.is_none() {
             continue;
         }
@@ -124,6 +258,7 @@ pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
                 ids: (None, None),
                 rows: vec![None],
                 linked: vec![false],
+                flags: vec![],
                 status: vec![Status::Fail],
                 outcome: Outcome::StillBad,
                 recovered_in: None,
@@ -139,11 +274,11 @@ pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
             by_key.insert(k.clone(), i);
         }
     }
-    for run in &runs[1..] {
+    for (k, run) in runs.iter().enumerate().skip(1) {
         // the last row per key and per link
         let (mut keys, mut links) = (HashMap::new(), HashMap::new());
         let ids: Vec<(Option<String>, Option<String>)> =
-            (0..run.ds.n_parts()).map(|r| (run.key(r), run.link(r))).collect();
+            (0..run.ds.n_parts()).map(|r| ids_of(k, r)).collect();
         for (r, id) in ids.iter().enumerate() {
             if let Some(x) = &id.0 {
                 keys.insert(x.as_str(), r);
@@ -159,20 +294,40 @@ pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
             .collect();
         let mut taken: HashSet<usize> = found.iter().flatten().copied().collect();
         let mut linked = vec![false; parts.len()];
+        let mut flags: Vec<Option<IdFlag>> = vec![None; parts.len()];
         for (i, p) in parts.iter().enumerate() {
-            if found[i].is_some() {
+            if let Some(r) = found[i] {
+                // the same part with another 2D code: a misread or a swap
+                if let (Some(a), Some(b)) = (&p.ids.1, &ids[r].1) {
+                    if a != b {
+                        flags[i] = Some(IdFlag { run: k, kind: "link_changed", detail: format!("{a} → {b}") });
+                    }
+                }
                 continue;
             }
             let Some(r) = p.ids.1.as_deref().and_then(|l| links.get(l).copied()) else {
+                // its own ID is on several parts here: not matched rather than guessed
+                let amb = [(p.ids.0.as_deref(), true), (p.ids.1.as_deref(), false)]
+                    .into_iter()
+                    .find_map(|(v, key)| v.filter(|v| if key { au.bad_key(k, v) } else { au.bad_link(k, v) }));
+                if let Some(v) = amb {
+                    flags[i] = Some(IdFlag { run: k, kind: "ambiguous", detail: format!("{v} is on several parts here") });
+                }
                 continue;
             };
             if !taken.contains(&r) && same(&p.ids, &ids[r]) {
                 taken.insert(r);
                 found[i] = Some(r);
                 linked[i] = true;
+            } else if let (Some(a), Some(b)) = (&p.ids.0, &ids[r].0) {
+                if a != b {
+                    let l = p.ids.1.as_deref().unwrap_or_default();
+                    flags[i] = Some(IdFlag { run: k, kind: "key_conflict", detail: format!("{l} is on key {b} here, not {a}") });
+                }
             }
         }
-        for ((p, r), l) in parts.iter_mut().zip(found).zip(linked) {
+        for (((p, r), l), f) in parts.iter_mut().zip(found).zip(linked).zip(flags) {
+            p.flags.extend(f);
             // a later run may retest good parts too, so go by the last result
             let passed = last_result(&p.rows, &p.status) == Some(Status::Pass);
             p.rows.push(r);
@@ -183,9 +338,10 @@ pub fn trace(runs: &[Run], start: &[usize]) -> Vec<PartTrace> {
                 None => Status::NotRetested,
             });
             if let Some(r) = r {
+                // a part keeps its first IDs: a changed one is flagged, not taken
                 let (a, b) = ids[r].clone();
                 p.ids.0 = p.ids.0.take().or(a);
-                p.ids.1 = b.or(p.ids.1.take());
+                p.ids.1 = p.ids.1.take().or(b);
             }
         }
     }
@@ -660,11 +816,11 @@ mod tests {
             link: link.then_some(KeySpec::PartTxt),
         };
         // key only: the chain ends at run 2
-        let t = trace(&[run(&r1, true, false), run(&r2, true, false), run(&r3, true, false), run(&r4, true, false)], &[0, 1, 2]);
+        let t = trace(&[run(&r1, true, false), run(&r2, true, false), run(&r3, true, false), run(&r4, true, false)], &[0, 1, 2], &Audit::default());
         assert_eq!(t[0].status, [Fail, Fail, NotRetested, NotRetested]);
         // with the link: followed to run 4, by part text in runs 3 and 4
         let runs = [run(&r1, true, true), run(&r2, true, true), run(&r3, true, true), run(&r4, true, true)];
-        let t = trace(&runs, &[0, 1, 2]);
+        let t = trace(&runs, &[0, 1, 2], &audit(&runs));
         assert_eq!(t[0].status, [Fail, Fail, Fail, Pass]);
         assert_eq!(t[0].rows, [Some(0), Some(0), Some(0), Some(0)]);
         assert_eq!(t[0].linked, [false, false, true, true]);
@@ -675,13 +831,64 @@ mod tests {
         assert_eq!(t[2].status, [Fail, Pass, PassedEarlier, PassedEarlier]);
         // a run without the key test at all: the link alone
         let runs = [run(&r1, true, true), run(&r2, true, true), run(&r3, false, true), run(&r4, false, true)];
-        let t = trace(&runs, &[0, 1]);
+        let t = trace(&runs, &[0, 1], &audit(&runs));
         assert_eq!(t[0].status, [Fail, Fail, Fail, Pass]);
         // a run-1 part with no key at all is traced by its link
         let r0 = ds(&[("", "a", false)]);
-        let t = trace(&[run(&r0, true, true), run(&r2, true, true)], &[0]);
+        let runs = [run(&r0, true, true), run(&r2, true, true)];
+        let t = trace(&runs, &[0], &audit(&runs));
         // ...and takes the key found for it in run 2
         assert_eq!((t[0].key.as_str(), t[0].rows[1]), ("w1", Some(0)));
+    }
+
+    #[test]
+    fn audit_keeps_bad_ids_from_merging_parts() {
+        use Status::*;
+        let run = |d| Run { ds: d, key: Some(KeySpec::PartId), link: Some(KeySpec::PartTxt) };
+        // EEPROM corrupt: a, b and c all read WXY 0 in run 1; d's 2D code is
+        // read as e's in run 2 (e is not in run 2); f and g swap codes in run 3
+        let r1 = ds(&[("0", "a", false), ("0", "b", false), ("0", "c", false), ("w4", "d", false), ("w5", "e", false), ("w6", "f", false), ("w7", "g", false)]);
+        let r2 = ds(&[("w1", "a", true), ("0", "b", false), ("w3", "c", true), ("w4", "e", true), ("w6", "f", false), ("w7", "g", false)]);
+        let r3 = ds(&[("0", "b", true), ("w6", "g", true), ("w7", "f", false)]);
+        let runs = [run(&r1), run(&r2), run(&r3)];
+        let au = audit(&runs);
+        let kinds = |k: usize| -> Vec<(&str, &str)> { au.issues.iter().filter(|i| i.run == k).map(|i| (i.kind, i.value.as_str())).collect() };
+        assert_eq!(kinds(0), [("key_shared", "0")]);
+        assert_eq!(au.issues[0].others, ["a", "b", "c"]);
+        assert_eq!(au.issues[0].pattern.as_deref(), Some("all zeros"));
+        // a single 0 is still a placeholder
+        assert_eq!(kinds(1), [("suspect_key", "0")]);
+        assert!(au.bad_keys.iter().all(|s| s.len() == 1 && s.contains("0")));
+        assert!(au.bad_links.iter().all(|s| s.is_empty()));
+        let t = trace(&runs, &[0, 1, 2, 3, 4, 5, 6], &au);
+        // a, b and c stay three parts, matched by part text
+        assert_eq!(t.len(), 7);
+        assert_eq!(t[0].status, [Fail, Pass, PassedEarlier]);
+        assert_eq!((t[1].status.clone(), t[1].linked.clone()), (vec![Fail, Fail, Pass], vec![false, true, true]));
+        // d keeps its key: found by it in run 2 with e's code, flagged
+        assert_eq!(t[3].rows[1], Some(3));
+        assert_eq!((t[3].flags[0].kind, t[3].flags[0].detail.as_str()), ("link_changed", "d → e"));
+        // e is not taken by d's row: its key differs
+        assert_eq!(t[4].rows[1], None);
+        assert_eq!(t[4].flags[0].kind, "key_conflict");
+        // the swap in run 3: both found by key, both flagged
+        assert_eq!((t[5].rows[2], t[6].rows[2]), (Some(1), Some(2)));
+        assert_eq!((t[5].flags[0].run, t[5].flags[0].kind), (2, "link_changed"));
+        assert_eq!(t[6].flags[0].detail, "g → f");
+        // b, its WXY 0 in run 1, meets its part text on two keys in run 2:
+        // not guessed, flagged
+        let r2b = ds(&[("w2", "b", false), ("w8", "b", false)]);
+        let runs = [run(&r1), run(&r2b)];
+        let t = trace(&runs, &[1], &audit(&runs));
+        assert_eq!((t[0].rows[1], t[0].flags[0].kind), (None, "ambiguous"));
+        // a 2D code on two parts in one run
+        let r4 = ds(&[("w1", "a", false), ("w2", "a", false)]);
+        let au = audit(&[run(&r4)]);
+        assert_eq!((au.issues[0].kind, au.issues[0].others.len()), ("link_shared", 2));
+        assert!(au.bad_links[0].contains("a"));
+        assert_eq!(placeholder("4294967295").as_deref(), Some("all ones"));
+        assert_eq!(placeholder("FFFFFFFF").as_deref(), Some("'F' repeated"));
+        assert_eq!(placeholder("0|12|0"), None);
     }
 
     #[test]
@@ -693,6 +900,7 @@ mod tests {
             key: "a".into(),
             ids: (Some("a".into()), None),
             linked: vec![false; 5],
+            flags: vec![],
             rows: vec![Some(0), Some(0), None, Some(0), Some(0)],
             status: vec![Fail, Pass, PassedEarlier, Fail, Fail],
             outcome: Outcome::StillBad,
@@ -704,6 +912,7 @@ mod tests {
             key: "b".into(),
             ids: (Some("b".into()), None),
             linked: vec![false; 5],
+            flags: vec![],
             rows: vec![Some(1), Some(1), Some(1), None, None],
             status: vec![Fail, Fail, Pass, PassedEarlier, PassedEarlier],
             outcome: Outcome::Recovered,

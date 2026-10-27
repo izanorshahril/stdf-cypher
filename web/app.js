@@ -2194,6 +2194,77 @@ function viewRetest(el) {
     out, traceBox);
   if (S.rtLast) renderRetest(out, traceBox, S.rtLast);
 }
+/** ID audit kinds: label, chart color, badge kind, what it means. */
+const RT_ID = {
+  key_shared: ["key shared", "@fail", "bad", "One key (e.g. WXY) on parts with different part texts in one run: a corrupt EEPROM or a constant value. Not used for matching; the part text matches instead."],
+  link_shared: ["link shared", "@warn", "warn", "One link (e.g. part text) on parts with different keys in one run: a 2D code misread or copied to another part. Not used for matching; the key matches instead."],
+  suspect_key: ["placeholder key", "@s3", "warn", "A key that looks like a reader default (all zeros, all ones, one character repeated). Not used for matching when there is a link."],
+  suspect_link: ["placeholder link", "@s4", "warn", "A link that looks like a reader default. Not used for matching when there is a key."],
+  link_changed: ["link changed", "@s1", "warn", "Found by its key, but with another part text than before: camera out of sync or a wrong sort. The part keeps its first part text."],
+  key_conflict: ["key conflict", "@s7", "bad", "Its part text is on a row with another key in this run: not joined, so it may show as not retested."],
+  ambiguous: ["ambiguous", "@s6", "bad", "Not found in this run because its own key or part text is on several parts there: not guessed, so it may show as not retested."],
+};
+const rtId = (k) => RT_ID[k] || [k, "@muted", "neutral", ""];
+/** ID audit: per run, IDs shared by different parts or placeholder values, and parts whose IDs disagree between runs. */
+function renderIdAudit(out, d, pick) {
+  const a = d.audit;
+  if (!a) return;
+  const rl = (k) => `Run ${k + 1}`;
+  const box = h("div");
+  out.append(h("h2", {}, "ID audit"), h("p", { class: "muted" }, "Part text and WXY should each belong to one part. A corrupt EEPROM can give many parts the same WXY (e.g. all zeros), and a camera out of sync or a wrong sort can put a 2D code on another part. Such values are kept out of matching when the other ID can do it, so they never merge different parts. Click a row to highlight its part."), box);
+  if (!a.checked) box.append(h("div", { class: "help" }, "Pick a link (Then link by) to check the key and the link against each other. Without one, only placeholder values are found."));
+  const rows = [
+    ...a.issues.map((i) => ({ run: i.run, kind: i.kind, value: i.value, pattern: i.pattern || "", n: i.n_rows, others: i.others.join(", ") + (i.n_others > i.others.length ? ` +${i.n_others - i.others.length}` : ""), parts: i.parts })),
+    ...a.flags.map((f) => ({ run: f.run, kind: f.kind, value: f.detail, pattern: "", n: 1, others: "", parts: [f.part] })),
+  ];
+  if (!rows.length) { box.append(h("p", { class: "muted small" }, "No ID problems found.")); return; }
+  box.append(h("div", { class: "kpis" },
+    kpi("ID issues", a.n_issues.toLocaleString(), "shared or placeholder values, over all runs"),
+    kpi("Parts flagged", a.n_flagged.toLocaleString(), "link changed or key conflict between runs"),
+    kpi("Left out of matching", `${a.dropped_keys} key${a.dropped_keys === 1 ? "" : "s"}, ${a.dropped_links} link${a.dropped_links === 1 ? "" : "s"}`, "distinct values, in the runs they were found in")),
+  h("div", { class: "row" }, h("button", { onclick: () => useFilter(d.runs[0].id, "$rt_id_issue") }, "Analyse ID issues ($rt_id_issue)")));
+  const [card, c] = chartBox();
+  box.append(card);
+  const xs = d.runs.map((_, k) => rl(k));
+  plot(c, { data: Object.entries(RT_ID).filter(([k]) => rows.some((r) => r.kind === k)).map(([k, [lab, col]]) => ({ type: "bar", name: lab, x: xs, y: d.runs.map((_, run) => rows.filter((r) => r.kind === k && r.run === run).length), marker: { color: col }, hovertemplate: `%{x}: %{y} ${lab}<extra></extra>` })),
+    layout: { title: { text: "ID problems per run", x: 0.01, xanchor: "left", font: { size: 15 } }, barmode: "stack", xaxis: { type: "category" }, yaxis: { title: { text: "issues / flagged parts" } }, margin: { l: 55, r: 20, t: 56, b: 40 }, legend: { orientation: "h", x: 1, xanchor: "right", y: 1.0, yanchor: "bottom" } } });
+  const tb = h("div");
+  box.append(tb);
+  table(tb, [
+    { key: "run", label: "Run", fmt: (v) => rl(v) },
+    { key: "kind", label: "Problem", render: (v) => h("span", { title: rtId(v)[3] }, badge(rtId(v)[0], rtId(v)[2])) },
+    { key: "value", label: "Value" },
+    { key: "pattern", label: "Pattern" },
+    { key: "n", label: "Rows", num: true },
+    { key: "others", label: "Other IDs on those rows" },
+    { key: "parts", label: "Traced parts", fmt: (v) => (v.length > 5 ? `${v.slice(0, 5).join(", ")} +${v.length - 5}` : v.join(", ")) },
+  ], rows, { placeholder: "Search value, part text, WXY…", onClick: (r) => { if (r.parts.length) pick(r.parts[0]); } });
+}
+/** The highlighted part's IDs in every run, with how it was found; values that disagree with its first ones are marked. */
+function idTrail(d, p) {
+  if (!p) return null;
+  // a value the audit found shared or a placeholder is struck through; the
+  // others are compared with the part's first good value
+  const BAD = { id_key: ["key_shared", "suspect_key"], id_link: ["link_shared", "suspect_link"] };
+  const bad = (r, f) => BAD[f].includes(r.id_issue);
+  const first = (f) => p.runs.filter((r) => !bad(r, f)).map((r) => r[f]).find((v) => v != null);
+  const k0 = first("id_key"), l0 = first("id_link");
+  const cell = (r, f, ref) => { const v = r[f]; return h("td", { class: v == null ? "" : bad(r, f) ? "id-bad" : ref != null && v !== ref ? "id-diff" : "" }, v ?? "–"); };
+  const flag = (k) => (p.flags || []).filter((f) => f.run === k);
+  const checks = (r, k) => [
+    ...(r.id_issue ? [[r.id_issue, ""]] : []),
+    ...flag(k).map((f) => [f.kind, ` (${f.detail})`]),
+  ].map(([x, more]) => h("span", { title: rtId(x)[3] + more }, badge(rtId(x)[0], rtId(x)[2])));
+  const found = (r, k) => (r.row == null ? (flag(k).length ? "not joined" : "–") : r.linked ? "link" : k ? "key" : "start");
+  const row = (label, cells) => h("tr", {}, h("th", {}, label), ...cells);
+  return h("div", { class: "id-trail" }, h("table", {},
+    h("thead", {}, row("IDs", p.runs.map((_, k) => h("th", {}, `R${k + 1}`)))),
+    h("tbody", {},
+      row("Key", p.runs.map((r) => cell(r, "id_key", k0))),
+      d.link ? row("Link", p.runs.map((r) => cell(r, "id_link", l0))) : null,
+      row("Found by", p.runs.map((r, k) => h("td", { class: "muted small" }, found(r, k)))),
+      row("Check", p.runs.map((r, k) => h("td", {}, ...checks(r, k)))))));
+}
 /** Parts table search: any trace value, and wafer X Y typed as 3|12|-4 (or with commas, spaces or slashes). */
 function rtSearch(r, q) {
   if (r._hay.includes(q)) return true;
@@ -2257,6 +2328,8 @@ function renderRetest(out, traceBox, d) {
     ], d.by_board, { search: false });
   }
 
+  // an audit row highlights its part and shows its ID trail (above the charts)
+  renderIdAudit(out, d, (k) => { if (S.rtHi !== k) focusPart(k, "chart"); focusBox.scrollIntoView({ behavior: "smooth", block: "start" }); });
   renderRetestCandidates(out, d);
 
   // flow
@@ -2327,7 +2400,8 @@ function renderRetest(out, traceBox, d) {
   const drawFocus = () => {
     focusDyn.replaceChildren(...(S.rtHi ? [h("span", { class: "muted small" }, "Highlighted:"), h("b", {}, S.rtHi), h("button", { class: "ghost small", title: "Clear the highlight", onclick: () => focusPart(null) }, "× clear"), h("button", { class: "small", title: "All results of this part in run 1 and the last run it was found in", onclick: tracePart }, "Trace this part")]
       : [h("span", { class: "muted small" }, "Find a part, or click a line or point, to highlight it and narrow the parts table to it (click it again to clear). Drag to zoom, double-click to zoom out.")]));
-    cardSlot.replaceChildren(...(S.rtHi ? [partCard(d.parts.find((x) => x.key === S.rtHi), drawFocus)] : []));
+    const hp = S.rtHi ? d.parts.find((x) => x.key === S.rtHi) : null;
+    cardSlot.replaceChildren(...(hp ? [partCard(hp, drawFocus), idTrail(d, hp)] : []));
   };
   focusBox.append(h("div", { class: "row tight", style: { justifyContent: "space-between" } },
     h("span", { class: "row tight" }, field("Find part", h("div", { class: "row tight" }, findIn, h("button", { onclick: findPart }, "Find"))), hits),
@@ -2496,7 +2570,8 @@ function renderRetest(out, traceBox, d) {
   // one row per part
   flat = d.parts.map((p) => {
     const tv = traceValues(p.ids);
-    const o2 = { key: p.key, outcome: p.outcome, linked: p.runs.map((r, k) => (r.linked ? `R${k + 1}` : "")).filter(Boolean).join(", "), _trace: tv, _hay: Object.values(tv).filter(Boolean).join(" ").toLowerCase() };
+    const idc = [...p.runs.map((r, k) => (r.id_issue ? `${rtId(r.id_issue)[0]} R${k + 1}` : "")), ...(p.flags || []).map((f) => `${rtId(f.kind)[0]} R${f.run + 1}`)].filter(Boolean).join("; ");
+    const o2 = { key: p.key, outcome: p.outcome, linked: p.runs.map((r, k) => (r.linked ? `R${k + 1}` : "")).filter(Boolean).join(", "), idcheck: idc, _trace: tv, _hay: Object.values(tv).filter(Boolean).join(" ").toLowerCase() };
     p.runs.forEach((r, k) => {
       o2[`s${k}`] = r.row != null && rtClass(r, 0) === "other" ? (r.status === "pass" ? "pass, alarm" : `fail, not ${d.tests[0].key}`) : RT_STATUS[r.status];
       o2[`site${k}`] = r.site ?? null;
@@ -2508,6 +2583,7 @@ function renderRetest(out, traceBox, d) {
   });
   const cols = [{ key: "key", label: "Part" }, { key: "outcome", label: "Outcome", render: (v) => badge(RT_OUTCOME[v][0], RT_OUTCOME[v][2]) }];
   if (d.link) cols.push({ key: "linked", label: "Linked in", title: "Runs where the part was found by the link, its key missing there" });
+  if (d.audit && (d.audit.n_issues || d.audit.n_flagged)) cols.push({ key: "idcheck", label: "ID check", title: "ID problems on this part (see ID audit)", render: (v) => (v ? badge(v, "warn") : "") });
   d.runs.forEach((_, k) => {
     cols.push({ key: `s${k}`, label: `R${k + 1}`, title: `yellow: passes ${d.tests[0].key} but fails another test or has an alarm`, render: (v) => (v === "pass" ? badge("pass", "good") : v === "fail" ? badge("fail", "bad") : v && (v.startsWith("pass,") || v.startsWith("fail,")) ? badge(v, "warn") : h("span", { class: "muted small" }, v || "")) },
       { key: `site${k}`, label: `R${k + 1} site`, num: true }, { key: `b${k}`, label: `R${k + 1} bin`, num: true });
