@@ -59,6 +59,9 @@ pub struct RecentFile {
 pub struct Settings {
     #[serde(default)]
     pub recent: Vec<RecentFile>,
+    /// threads for loading several files (0 = one per core)
+    #[serde(default)]
+    pub load_threads: usize,
 }
 
 impl Settings {
@@ -203,6 +206,9 @@ struct InstanceInfo {
     /// unix seconds when the instance started listening
     #[serde(default)]
     started: u64,
+    /// the dashboard's request token, so a second launch can hand its files over
+    #[serde(default)]
+    token: String,
 }
 
 /// Launches this close together are one "Open with" on several files.
@@ -219,7 +225,7 @@ fn instance_file() -> PathBuf {
     config_dir().join("instance.json")
 }
 
-pub fn write_instance(port: u16) {
+pub fn write_instance(port: u16, token: &str) {
     let _ = std::fs::create_dir_all(config_dir());
     let _ = std::fs::write(
         instance_file(),
@@ -227,6 +233,7 @@ pub fn write_instance(port: u16) {
             port,
             pid: std::process::id(),
             started: unix_now(),
+            token: token.to_string(),
         })
         .unwrap_or_default(),
     );
@@ -243,12 +250,12 @@ pub fn clear_instance() {
 }
 
 /// Minimal HTTP POST to a running instance (no HTTP client dependency).
-fn post_local(port: u16, path: &str, body: &str) -> Result<String> {
+fn post_local(port: u16, path: &str, body: &str, token: &str) -> Result<String> {
     let mut s =
         TcpStream::connect_timeout(&([127, 0, 0, 1], port).into(), Duration::from_millis(800))?;
     s.set_read_timeout(Some(Duration::from_secs(5)))?;
     let req = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-STDF-Token: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     s.write_all(req.as_bytes())?;
@@ -273,7 +280,7 @@ pub fn hand_off_to_running(files: &[String]) -> bool {
         return false;
     }
     let body = serde_json::json!({ "paths": files, "focus": true }).to_string();
-    match post_local(info.port, "/api/open", &body) {
+    match post_local(info.port, "/api/open", &body, &info.token) {
         Ok(resp) => resp.contains("\"ok\":true") && resp.contains("stdf-cypher"),
         Err(_) => false,
     }
@@ -326,19 +333,30 @@ pub fn find_app_browser() -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
+/// Spawn with no inherited stdio. A double-click launch frees its console
+/// (`detach_console_if_owned`), which leaves the inherited standard handles
+/// stale: a child that inherits them fails with "The handle is invalid (os error 6)".
+fn spawn_quiet(cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+}
+
 /// Open the dashboard in an app window (no address bar). Falls back to the default browser.
 pub fn open_window(url: &str) -> Result<()> {
     if let Some(b) = find_app_browser() {
         let profile = cache_dir().join("window-profile");
         let _ = std::fs::create_dir_all(&profile);
-        let res = std::process::Command::new(&b)
-            .arg(format!("--app={url}"))
-            .arg(format!("--user-data-dir={}", profile.display()))
-            .arg("--window-size=1440,920")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--disable-features=Translate,msEdgeSidebarV2")
-            .spawn();
+        let res = spawn_quiet(
+            std::process::Command::new(&b)
+                .arg(format!("--app={url}"))
+                .arg(format!("--user-data-dir={}", profile.display()))
+                .arg("--window-size=1440,920")
+                .arg("--no-first-run")
+                .arg("--no-default-browser-check")
+                .arg("--disable-features=Translate,msEdgeSidebarV2"),
+        );
         if res.is_ok() {
             return Ok(());
         }
@@ -348,13 +366,11 @@ pub fn open_window(url: &str) -> Result<()> {
 
 pub fn open_default_browser(url: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
-    let r = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
+    let r = spawn_quiet(std::process::Command::new("cmd").args(["/C", "start", "", url]));
     #[cfg(target_os = "macos")]
-    let r = std::process::Command::new("open").arg(url).spawn();
+    let r = spawn_quiet(std::process::Command::new("open").arg(url));
     #[cfg(all(unix, not(target_os = "macos")))]
-    let r = std::process::Command::new("xdg-open").arg(url).spawn();
+    let r = spawn_quiet(std::process::Command::new("xdg-open").arg(url));
     r.map(|_| ()).context("could not open a browser")
 }
 
@@ -364,19 +380,16 @@ pub fn reveal(path: &str) -> Result<()> {
     #[cfg(target_os = "windows")]
     {
         if p.is_file() {
-            std::process::Command::new("explorer")
-                .arg(format!("/select,{}", p.display()))
-                .spawn()?;
+            spawn_quiet(
+                std::process::Command::new("explorer").arg(format!("/select,{}", p.display())),
+            )?;
         } else {
-            std::process::Command::new("explorer").arg(p).spawn()?;
+            spawn_quiet(std::process::Command::new("explorer").arg(p))?;
         }
     }
     #[cfg(target_os = "macos")]
     {
-        std::process::Command::new("open")
-            .arg("-R")
-            .arg(p)
-            .spawn()?;
+        spawn_quiet(std::process::Command::new("open").arg("-R").arg(p))?;
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -385,7 +398,7 @@ pub fn reveal(path: &str) -> Result<()> {
         } else {
             p
         };
-        std::process::Command::new("xdg-open").arg(dir).spawn()?;
+        spawn_quiet(std::process::Command::new("xdg-open").arg(dir))?;
     }
     Ok(())
 }

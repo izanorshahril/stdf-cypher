@@ -110,6 +110,8 @@ pub struct Part {
     pub alarms: Vec<u32>,
     /// tests the tester flagged as failed for this part
     pub fails: Vec<u32>,
+    /// the file ends before this part's PRR (see SourceInfo::partial_parts): kept, without bin or verdict
+    pub partial: bool,
 }
 
 impl Part {
@@ -141,6 +143,8 @@ pub struct SourceInfo {
     pub start_t: u32,
     pub finish_t: u32,
     pub record_counts: IndexMap<String, u64>,
+    /// parts with no PRR record (file cut off or incomplete), kept without bin or verdict
+    pub partial_parts: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -166,6 +170,27 @@ pub struct Dataset {
     pub sbins: IndexMap<u16, BinDef>,
     #[serde(skip)]
     pub file_vals: FileValueCache,
+    /// per test (index as in `tests`): its limits part by part, for a test whose limits change
+    /// from part to part (PAT-style programs); None for the usual test with one pair of limits
+    #[serde(skip)]
+    pub part_limits: Vec<Option<PartLimits>>,
+    /// GDR and DTR records of the file (datalog text and generic data), in file order
+    pub datalog: Vec<DatalogEntry>,
+}
+
+/// A GDR or DTR record: where it sits in the file (the number of parts before it) and its text.
+#[derive(Debug, Clone, Serialize)]
+pub struct DatalogEntry {
+    pub kind: String,
+    pub after_part: usize,
+    pub text: String,
+}
+
+/// The limits of one test, one entry per part (NaN = no limit for that part).
+#[derive(Debug, Clone, Default)]
+pub struct PartLimits {
+    pub lo: Vec<f32>,
+    pub hi: Vec<f32>,
 }
 
 /// A value of a part attribute, used by filters and grouping.
@@ -489,6 +514,18 @@ impl Dataset {
             hbins: self.hbins.clone(),
             sbins: self.sbins.clone(),
             file_vals: Default::default(),
+            part_limits: self
+                .part_limits
+                .iter()
+                .map(|o| {
+                    o.as_ref().map(|pl| PartLimits {
+                        lo: rows.iter().map(|&r| pl.lo[r]).collect(),
+                        hi: rows.iter().map(|&r| pl.hi[r]).collect(),
+                    })
+                })
+                .collect(),
+            // the datalog stays with the whole file: a subset has no file position for it
+            datalog: vec![],
         };
         d.recount_tests();
         d
@@ -551,6 +588,17 @@ impl Dataset {
                 .join(" + "),
             ..Default::default()
         };
+        // the tests whose limits change part by part in some file
+        let variable: std::collections::HashSet<String> = sets
+            .iter()
+            .flat_map(|d| {
+                d.part_limits
+                    .iter()
+                    .zip(&d.tests)
+                    .filter(|(pl, _)| pl.is_some())
+                    .map(|(_, t)| t.key.clone())
+            })
+            .collect();
         for d in sets {
             let file_off = out.sources.len() as u16;
             let wafer_off = out.wafers.len() as u32;
@@ -566,6 +614,7 @@ impl Dataset {
                         out.tests.push(t.clone());
                         out.test_index.insert(t.key.clone(), i);
                         out.values.push(vec![f32::NAN; n_before]);
+                        out.part_limits.push(None);
                         i
                     }
                 })
@@ -591,6 +640,45 @@ impl Dataset {
             for (src_t, col) in d.values.into_iter().enumerate() {
                 let dst = &mut out.values[tmap[src_t]];
                 dst[n_before..n_after].copy_from_slice(&col);
+            }
+            // limits that change part by part follow their test; other parts get no limit
+            for pl in out.part_limits.iter_mut().flatten() {
+                pl.lo.resize(n_after, f32::NAN);
+                pl.hi.resize(n_after, f32::NAN);
+            }
+            // a file whose test has fixed limits gives its parts those limits; a part without the
+            // test has none
+            let n_rows = n_after - n_before;
+            for (src_t, t) in d.tests.iter().enumerate() {
+                if !variable.contains(&t.key) {
+                    continue;
+                }
+                let e = out.part_limits[tmap[src_t]].get_or_insert_with(|| PartLimits {
+                    lo: vec![f32::NAN; n_before],
+                    hi: vec![f32::NAN; n_before],
+                });
+                e.lo.resize(n_before, f32::NAN);
+                e.hi.resize(n_before, f32::NAN);
+                match d.part_limits.get(src_t).and_then(Option::as_ref) {
+                    Some(pl) => {
+                        e.lo.extend_from_slice(&pl.lo);
+                        e.hi.extend_from_slice(&pl.hi);
+                    }
+                    None => {
+                        let lo = t.lo.map_or(f32::NAN, |v| v as f32);
+                        let hi = t.hi.map_or(f32::NAN, |v| v as f32);
+                        e.lo.extend(std::iter::repeat_n(lo, n_rows));
+                        e.hi.extend(std::iter::repeat_n(hi, n_rows));
+                    }
+                }
+                e.lo.resize(n_after, f32::NAN);
+                e.hi.resize(n_after, f32::NAN);
+            }
+            for e in d.datalog {
+                out.datalog.push(DatalogEntry {
+                    after_part: e.after_part + n_before,
+                    ..e
+                });
             }
             out.sources.extend(d.sources);
             out.wafers.extend(d.wafers);

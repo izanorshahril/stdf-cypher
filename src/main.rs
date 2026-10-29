@@ -5,7 +5,7 @@ use std::sync::Arc;
 use stdf_cypher::analysis::{anomaly, anova, compare, correlation, summary};
 use stdf_cypher::data::{self, loader::DedupMode, Dataset, Filter, LoadOptions};
 use stdf_cypher::stdf::{record_code, StdfReader};
-use stdf_cypher::{api, ml, report, sample, server, split};
+use stdf_cypher::{api, ml, report, sample, server, split, xlsx};
 
 #[derive(Parser)]
 #[command(
@@ -15,6 +15,9 @@ use stdf_cypher::{api, ml, report, sample, server, split};
     after_help = "Run without arguments (or double-click stdf-cypher.exe) to open the desktop app."
 )]
 struct Cli {
+    /// threads for loading several files (0 = one per core); default: the saved setting
+    #[arg(long, global = true, value_name = "N")]
+    threads: Option<usize>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -67,6 +70,13 @@ enum Cmd {
         rec: Vec<String>,
         #[arg(short = 'n', long)]
         limit: Option<usize>,
+    },
+    /// Export every record to an Excel workbook: one sheet per record kind
+    Xlsx {
+        file: PathBuf,
+        /// the workbook to write (.xlsx)
+        #[arg(short, long)]
+        out: PathBuf,
     },
     /// Part results table (PRR) – prints or writes CSV
     Prr {
@@ -383,6 +393,9 @@ fn load(files: &[PathBuf], l: &LoadArgs) -> Result<Dataset> {
         files.len(),
         t.elapsed()
     );
+    if let Some(w) = summary::cut_off_warning(&ds) {
+        eprintln!("{w}");
+    }
     Ok(ds)
 }
 
@@ -478,6 +491,16 @@ fn output(out: &Option<PathBuf>, headers: &[&str], rows: &[Vec<String>], top: us
 }
 
 fn main() {
+    // thread setting: the saved one, then STDF_CYPHER_THREADS (--threads overrides both)
+    stdf_cypher::data::loader::set_load_threads(
+        stdf_cypher::desktop::Settings::load().load_threads,
+    );
+    if let Some(n) = std::env::var("STDF_CYPHER_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        stdf_cypher::data::loader::set_load_threads(n);
+    }
     // Double-click / drag-and-drop / "Open with": no sub-command, only files (or nothing)
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     // files or folders (a folder opens its STDF files); a sub-command wins
@@ -535,6 +558,9 @@ fn run_app(files: Vec<String>, window: bool) -> Result<()> {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Some(n) = cli.threads {
+        stdf_cypher::data::loader::set_load_threads(n);
+    }
     match cli.cmd {
         Cmd::Info { files, json, l } => {
             let ds = load(&files, &l)?;
@@ -621,6 +647,13 @@ fn run() -> Result<()> {
                     })
                     .collect();
                 print_table(&["wafer", "parts", "pass", "yield"], &wy);
+            }
+        }
+        Cmd::Xlsx { file, out } => {
+            let s = xlsx::export(&file, &out)?;
+            println!("{} records -> {}", s.records, out.display());
+            for (name, rows) in &s.sheets {
+                println!("  {name:<24} {rows:>12} rows");
             }
         }
         Cmd::Dump { file, rec, limit } => {

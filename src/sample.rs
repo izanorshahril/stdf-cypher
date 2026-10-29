@@ -38,6 +38,8 @@ pub struct SampleSpec {
     /// another draw of the re-measurement noise: same seed, meas_noise and a
     /// different meas_seed = the same parts on a further retest
     pub meas_seed: u64,
+    /// limits move from wafer to wafer (a PAT-style program) and every PTR logs its own
+    pub dynamic_limits: bool,
     /// loadboard (DIB) ID logged as test 5100 for every part
     pub loadboard: Option<f64>,
     /// share of parts whose loadboard result is missing
@@ -89,6 +91,7 @@ impl Default for SampleSpec {
             tester_offset: 0.0,
             base_units: false,
             meas_seed: 0,
+            dynamic_limits: false,
             loadboard: None,
             loadboard_missing: 0.0,
             band_tests: vec![],
@@ -110,6 +113,15 @@ struct TDef {
     load: f64,
     site_off: f64,
     radial: f64,
+}
+
+/// Limit factor of wafer `wi`: 1.0, or 1.00 to 1.09 when the limits are dynamic.
+fn limit_factor(spec: &SampleSpec, wi: usize) -> f64 {
+    if spec.dynamic_limits {
+        1.0 + 0.03 * (wi % 4) as f64
+    } else {
+        1.0
+    }
 }
 
 pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
@@ -348,7 +360,8 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                             v = d.hi + w * 3.0;
                         }
                     }
-                    let fail = v < d.lo || v > d.hi;
+                    let f = limit_factor(spec, wi);
+                    let fail = v < d.lo * f || v > d.hi * f;
                     if fail && fail_test.is_none() {
                         fail_test = Some(ti);
                     }
@@ -369,6 +382,8 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     let (v, fail) = vals[ti];
                     let v = v * scale;
                     let full = first_ptr[ti];
+                    let with_lim = full || spec.dynamic_limits;
+                    let f = limit_factor(spec, wi);
                     w.write(&Record::PTR(Ptr {
                         test_num: d.num,
                         head_num: 1,
@@ -379,10 +394,10 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                         result: v as f32,
                         test_txt: d.name.clone(),
                         alarm_id: String::new(),
-                        opt_flag: if full { Some(0x0C) } else { None },
+                        opt_flag: if with_lim { Some(0x0C) } else { None },
                         res_scal,
-                        lo_limit: full.then_some((d.lo * scale) as f32),
-                        hi_limit: full.then_some((d.hi * scale) as f32),
+                        lo_limit: with_lim.then_some((d.lo * f * scale) as f32),
+                        hi_limit: with_lim.then_some((d.hi * f * scale) as f32),
                         units: full.then(|| units.to_string()),
                         lo_spec: full.then_some(0.0),
                         hi_spec: full.then_some(0.0),

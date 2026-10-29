@@ -447,6 +447,21 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             reg.session.queue_open(str_list(p, "paths"));
             Ok(json!({"app": "stdf-cypher"}))
         }
+        "parse_threads" => {
+            // threads for loading files: give "threads" to change it (0 = one per core)
+            if pp.0.get("threads").is_some() {
+                let n = pp.usize("threads", 0).min(256);
+                crate::data::loader::set_load_threads(n);
+                let mut s = reg.session.synced_settings();
+                s.load_threads = n;
+                s.save();
+            }
+            Ok(json!({
+                "threads": crate::data::loader::load_threads_setting(),
+                "cores": crate::data::loader::cores(),
+                "using": crate::data::loader::effective_threads(usize::MAX),
+            }))
+        }
         "recent" => {
             let s = reg.session.synced_settings();
             Ok(json!(s.recent.iter().map(|r| {
@@ -752,6 +767,11 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             let paths = ok_paths;
             reg.session.remember(&paths);
             Ok(json!({"ids": ids, "errors": errors, "skipped": skipped}))
+        }
+        "datalog" => {
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            Ok(json!(ds.datalog))
         }
         "overview" => {
             let id = pp.usize("ds", 0);

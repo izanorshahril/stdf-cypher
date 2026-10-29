@@ -39,6 +39,38 @@ const SC = (() => {
   // optional hook that rewrites every figure before drawing (opacity, 3D…)
   let transform = null, afterPlot = null;
   function setTransform(fn, after) { transform = fn; afterPlot = after || null; replotAll(); }
+  /** Dense marker-only scatter traces draw several times faster in WebGL (scattergl) with the same look (20k points: about 65 ms against 400 ms in SVG). Lines are faster in SVG at these sizes, so they, fills, error bars and text traces stay SVG. */
+  const GL_MIN_POINTS = 5000;
+  function glData(data) {
+    return data.map((t) => (t.type === "scatter" && t.mode === "markers" && t.x && t.x.length >= GL_MIN_POINTS && !(t.fill || t.error_x || t.error_y || t.stackgroup || t.hoveron) ? Object.assign({}, t, { type: "scattergl" }) : t));
+  }
+  /** Lists the parts of a box or lasso selection under the chart: the points that carry a part id as customdata. */
+  function showSelection(el, ev) {
+    let strip = el._strip;
+    if (!strip) { strip = el._strip = document.createElement("div"); strip.className = "sel-strip"; el.after(strip); }
+    strip.replaceChildren();
+    strip.hidden = !ev;
+    if (!ev) return;
+    // a point is a part; parts with blank or reused ids are told apart by where they sit
+    const seen = new Set();
+    const rows = [];
+    for (const p of ev.points || []) {
+      if (typeof p.customdata !== "string") continue;
+      const series = (p.data && p.data.name) || "";
+      const key = [p.customdata, series, p.x, p.y].join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({ part: p.customdata, series, x: p.x, y: p.y });
+    }
+    if (!rows.length) { strip.append(h("div", {}, "No parts in the selection (this chart does not put one part on each point).")); return; }
+    const cols = [{ key: "part", label: "part" }, { key: "series", label: "series" }, { key: "x", label: "x" }, { key: "y", label: "y" }];
+    const shown = rows.slice(0, 200);
+    strip.append(
+      h("div", { class: "row tight" }, h("b", {}, `${rows.length} part${rows.length === 1 ? "" : "s"} selected`), h("button", { class: "small", onclick: () => download("selected_parts.csv", toCSV(cols, rows)) }, "Download CSV"), h("button", { class: "small", onclick: () => { strip.hidden = true; } }, "Hide")),
+      h("div", { class: "sel-list" }, shown.map((r) => r.part || "(blank id)").join(", ") + (rows.length > shown.length ? ` … and ${rows.length - shown.length} more` : ""))
+    );
+  }
+
   function plot(el, fig) {
     if (!el) return;
     if (typeof el === "string") el = document.getElementById(el);
@@ -48,8 +80,13 @@ const SC = (() => {
     let f = resolve(fig, tk);
     if (transform && !el.dataset.raw) f = transform(f, el) || f;
     const layout = themeLayout(f.layout || {});
-    const cfg = { responsive: true, displaylogo: false, modeBarButtonsToRemove: ["lasso2d", "select2d"], toImageButtonOptions: { format: "png", scale: 2 } };
-    if (window.Plotly) { if (el._dim !== f._dim) { Plotly.purge(el); el._dim = f._dim; } Plotly.react(el, f.data || [], layout, cfg); }
+    const cfg = { responsive: true, displaylogo: false, modeBarButtonsToRemove: ["lasso2d"], toImageButtonOptions: { format: "png", scale: 2 } };
+    if (window.Plotly) {
+      if (el._dim !== f._dim) { Plotly.purge(el); el._dim = f._dim; el._selBound = false; }
+      Plotly.react(el, glData(f.data || []), layout, cfg);
+      // box select (the modebar button) lists the parts under the chart
+      if (!el._selBound && el.on) { el._selBound = true; el.on("plotly_selected", (ev) => showSelection(el, ev)); el.on("plotly_deselect", () => showSelection(el, null)); }
+    }
     else el.innerHTML = '<div class="err">Plotly failed to load (offline?). Re-generate the report with --offline.</div>';
     if (afterPlot && !el.dataset.raw) afterPlot(el, f);
   }
@@ -150,7 +187,7 @@ const SC = (() => {
       const thead = h("thead", {}, h("tr", {}, cols.map((c) => h("th", { class: c.num ? "num" : "", title: c.title || "", onclick: () => { if (sortKey === c.key) asc = !asc; else { sortKey = c.key; asc = !c.num; } render(); } }, c.label, sortKey === c.key ? h("span", { class: "arrow" }, asc ? " ▲" : " ▼") : null))));
       const tbody = h("tbody");
       for (const row of r.slice(0, limit)) {
-        const tr = h("tr", { class: opts.onClick ? "clickable" + (selected === row ? " sel" : "") : "" });
+        const tr = h("tr", { class: [opts.onClick ? "clickable" + (selected === row ? " sel" : "") : "", opts.rowClass ? opts.rowClass(row) : ""].join(" ").trim() });
         for (const c of cols) {
           const v = row[c.key];
           const content = c.render ? c.render(v, row) : c.fmt ? c.fmt(v, row) : c.num ? fmt(v) : v ?? "";

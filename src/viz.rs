@@ -435,7 +435,21 @@ pub fn trend(ds: &Dataset, t: usize, groups: &[(String, Vec<usize>)]) -> Value {
         let ids: Vec<&str> = xs.iter().map(|&r| ds.parts[r].part_id.as_str()).collect();
         data.push(json!({"type":"scattergl","mode":"markers","name":name,"x":xs,"y":ys,"customdata":ids,"marker":{"color":series_color(name, i),"size":5,"opacity":0.75},"hovertemplate":format!("{name}<br>row %{{x}} part %{{customdata}}<br>%{{y:.4g}}<extra></extra>")}));
     }
-    let (shapes, ann) = limit_shapes(info.lo, info.hi, false);
+    let (shapes, ann) = match ds.part_limits.get(t) {
+        Some(Some(pl)) => {
+            // the limits change part to part: draw each part's own limits as steps
+            let mut rows: Vec<usize> = groups.iter().flat_map(|g| g.1.iter().copied()).collect();
+            rows.sort_unstable();
+            rows.dedup();
+            let rows: Vec<usize> = rows.into_iter().step_by(step).collect();
+            for (side, lim) in [("lower", &pl.lo), ("upper", &pl.hi)] {
+                let ys: Vec<f64> = rows.iter().map(|&r| lim[r] as f64).collect();
+                data.push(json!({"type":"scatter","mode":"lines","name":format!("{side} limit (per part)"),"x":rows,"y":ys,"line":{"color":"@limit","width":1.5,"dash":"dash","shape":"hv"},"hoverinfo":"skip"}));
+            }
+            (vec![], vec![])
+        }
+        _ => limit_shapes(info.lo, info.hi, false),
+    };
     let mut l = base_layout(
         &format!("Trend – {}", info.label()),
         "part (test order)",

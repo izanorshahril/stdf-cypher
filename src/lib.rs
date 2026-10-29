@@ -20,3 +20,4 @@ pub mod server;
 pub mod split;
 pub mod stdf;
 pub mod viz;
+pub mod xlsx;

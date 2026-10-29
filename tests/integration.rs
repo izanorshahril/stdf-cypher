@@ -8,6 +8,9 @@ use stdf_cypher::sample::{generate, SampleSpec};
 use stdf_cypher::stdf::{Endian, Record, StdfReader};
 use stdf_cypher::{api, ml, report, split};
 
+/// The loadboard test is one process-wide setting: the tests that change it or read it take this lock.
+static LOADBOARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Keep tests away from the user's real settings/cache folders.
 fn isolate() {
     static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
@@ -1335,6 +1338,7 @@ fn retest_trace_follows_rejects_through_runs() {
 
 #[test]
 fn recovery_zones_and_loadboard_on_a_planted_retest_chain() {
+    let _board = LOADBOARD.lock().unwrap_or_else(|e| e.into_inner());
     isolate();
     let d = tempfile::tempdir().unwrap();
     let band = |seed: u64, noise: f64, board: f64, missing: f64| SampleSpec {
@@ -1489,6 +1493,7 @@ fn recovery_zones_and_loadboard_on_a_planted_retest_chain() {
 
 #[test]
 fn investigation_case_commonality_across_lots() {
+    let _board = LOADBOARD.lock().unwrap_or_else(|e| e.into_inner());
     isolate();
     let d = tempfile::tempdir().unwrap();
     let spec = |lot: &str, seed: u64, ms: u64, band: bool, lb: f64| SampleSpec {
@@ -1825,4 +1830,364 @@ fn part_datalog_text_and_csv() {
         .nth(3)
         .unwrap()
         .starts_with("7,"));
+}
+
+#[test]
+fn load_many_gives_the_same_dataset_on_any_thread_count() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let paths: Vec<PathBuf> = (1..=3)
+        .map(|k| {
+            gen(
+                d.path(),
+                &format!("lot{k}.stdf"),
+                SampleSpec {
+                    seed: k,
+                    ..SampleSpec::default()
+                },
+            )
+        })
+        .collect();
+    let opt = LoadOptions::default();
+    let one = data::loader::load_many_threads(&paths, &opt, 1).unwrap();
+    // NaN marks a missing result, so compare the bits
+    let bits =
+        |ds: &Dataset| -> Vec<u32> { ds.values.iter().flatten().map(|v| v.to_bits()).collect() };
+    for threads in [2, 4, 8] {
+        let many = data::loader::load_many_threads(&paths, &opt, threads).unwrap();
+        assert_eq!(
+            serde_json::to_string(&one.parts).unwrap(),
+            serde_json::to_string(&many.parts).unwrap(),
+            "{threads} threads"
+        );
+        assert_eq!(bits(&one), bits(&many), "{threads} threads");
+        assert_eq!(one.tests.len(), many.tests.len());
+    }
+}
+
+#[test]
+fn load_threads_setting_is_capped_by_the_files() {
+    use stdf_cypher::data::loader::{effective_threads, set_load_threads};
+    set_load_threads(3);
+    assert_eq!(effective_threads(10), 3);
+    assert_eq!(effective_threads(2), 2, "never more threads than files");
+    set_load_threads(0);
+    assert_eq!(effective_threads(1), 1);
+    assert!(effective_threads(usize::MAX) >= 1);
+    set_load_threads(0);
+}
+
+#[test]
+fn parse_threads_op_sets_and_reports_the_setting() {
+    isolate();
+    let reg = api::Registry::app();
+    let r = api::run(&reg, "parse_threads", &json!({})).unwrap();
+    assert!(r["cores"].as_u64().unwrap() >= 1);
+    let r = api::run(&reg, "parse_threads", &json!({ "threads": 3 })).unwrap();
+    assert_eq!(r["threads"], 3);
+    assert_eq!(r["using"], 3);
+    assert_eq!(data::loader::load_threads_setting(), 3);
+    api::run(&reg, "parse_threads", &json!({ "threads": 0 })).unwrap();
+    assert_eq!(data::loader::load_threads_setting(), 0);
+}
+
+/// Copies an STDF file without its last PRR record, so that the file ends inside a part.
+fn without_last_prr(src: &Path, dst: &Path) {
+    let data = std::fs::read(src).unwrap();
+    let big = data[4] == 1;
+    let mut spans = vec![];
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        let len = if big {
+            u16::from_be_bytes([data[i], data[i + 1]])
+        } else {
+            u16::from_le_bytes([data[i], data[i + 1]])
+        } as usize;
+        spans.push((data[i + 2], data[i + 3], i, i + 4 + len));
+        i += 4 + len;
+    }
+    let last = spans.iter().rposition(|s| (s.0, s.1) == (5, 20)).unwrap();
+    let mut out = Vec::with_capacity(data.len());
+    for (k, s) in spans.iter().enumerate() {
+        if k != last {
+            out.extend_from_slice(&data[s.2..s.3]);
+        }
+    }
+    std::fs::write(dst, out).unwrap();
+}
+
+#[test]
+fn a_part_without_its_prr_is_kept_and_counted() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let full = gen(d.path(), "full.stdf", SampleSpec::default());
+    let cut = d.path().join("cut.stdf");
+    without_last_prr(&full, &cut);
+    let a = data::load(&full, &LoadOptions::default()).unwrap();
+    let b = data::load(&cut, &LoadOptions::default()).unwrap();
+    assert_eq!(a.parts.len(), b.parts.len(), "the cut part is kept");
+    assert_eq!(b.sources.iter().map(|s| s.partial_parts).sum::<u32>(), 1);
+    assert_eq!(a.sources.iter().map(|s| s.partial_parts).sum::<u32>(), 0);
+    let last = b.parts.len() - 1;
+    let p = &b.parts[last];
+    assert!(p.passed.is_none() && p.hbin == 0 && p.sbin == 0, "no bin, no verdict");
+    // its results are the ones the complete file has for the same part
+    for col in 0..a.values.len() {
+        assert_eq!(
+            a.values[col][last].to_bits(),
+            b.values[col][last].to_bits(),
+            "test {col}"
+        );
+    }
+    // every other part is unchanged
+    let n = last;
+    assert_eq!(
+        serde_json::to_string(&a.parts[..n]).unwrap(),
+        serde_json::to_string(&b.parts[..n]).unwrap()
+    );
+}
+
+#[test]
+fn cut_off_parts_come_with_the_yield_both_ways() {
+    use stdf_cypher::analysis::summary;
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let full = gen(d.path(), "full.stdf", SampleSpec::default());
+    let cut = d.path().join("cut.stdf");
+    without_last_prr(&full, &cut);
+    let a = data::load(&full, &LoadOptions::default()).unwrap();
+    let b = data::load(&cut, &LoadOptions::default()).unwrap();
+    let n = b.parts.len();
+    assert!(b.parts[n - 1].partial && !a.parts[n - 1].partial);
+    assert_eq!(b.parts.iter().filter(|p| p.partial).count(), 1);
+    let pass = b.parts.iter().filter(|p| p.is_pass()).count() as f64;
+    let with = b.yield_pct(&b.all_rows());
+    let without = summary::yield_without_partial(&b).unwrap();
+    assert!((with - pass * 100.0 / n as f64).abs() < 1e-9);
+    assert!((without - pass * 100.0 / (n - 1) as f64).abs() < 1e-9);
+    assert!(summary::yield_without_partial(&a).is_none());
+    let w = summary::cut_off_warning(&b).unwrap();
+    assert!(w.contains("1 part(s) cut off") && w.contains("counting them") && w.contains("without them"));
+    assert!(summary::cut_off_warning(&a).is_none());
+}
+
+#[test]
+fn dynamic_limits_are_logged_per_part_and_the_loader_keeps_them() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let p = gen(
+        d.path(),
+        "dyn.stdf",
+        SampleSpec {
+            dynamic_limits: true,
+            ..SampleSpec::default()
+        },
+    );
+    let ds = data::load(&p, &LoadOptions::default()).unwrap();
+    let t = ds.tests.iter().position(|t| t.num == 1000).unwrap();
+    // the limits each PTR of the test logs, in file (part) order
+    let mut logged: Vec<(f32, f32)> = vec![];
+    let mut r = StdfReader::open(&p).unwrap();
+    let endian = r.endian;
+    while let Some((h, body)) = r.next_raw().unwrap() {
+        if let Record::PTR(ptr) = Record::parse(h.typ, h.sub, body, endian) {
+            if ptr.test_num == 1000 {
+                logged.push((
+                    ptr.lo_limit.unwrap_or(f32::NAN),
+                    ptr.hi_limit.unwrap_or(f32::NAN),
+                ));
+            }
+        }
+    }
+    let distinct: std::collections::BTreeSet<u32> =
+        logged.iter().map(|l| l.0.to_bits()).collect();
+    assert!(distinct.len() > 1, "the file logs changing limits");
+    // the loader keeps every part’s own limits, not only the first ones
+    let pl = ds.part_limits[t].as_ref().expect("the limits change part to part");
+    assert_eq!(logged.len(), ds.parts.len());
+    for (row, (lo, hi)) in logged.iter().enumerate() {
+        assert_eq!(pl.lo[row].to_bits(), lo.to_bits(), "lo of part {row}");
+        assert_eq!(pl.hi[row].to_bits(), hi.to_bits(), "hi of part {row}");
+    }
+    // a file with fixed limits keeps no per-part limits
+    let fixed = gen(d.path(), "fixed.stdf", SampleSpec::default());
+    let fx = data::load(&fixed, &LoadOptions::default()).unwrap();
+    assert!(fx.part_limits.iter().all(|pl| pl.is_none()));
+    // the trend chart draws the per-part limits as steps, not one pair of lines
+    let groups = vec![("all".to_string(), ds.all_rows())];
+    let fig = stdf_cypher::viz::trend(&ds, t, &groups);
+    let names: Vec<&str> = fig["data"].as_array().unwrap().iter().filter_map(|x| x["name"].as_str()).collect();
+    assert!(names.contains(&"lower limit (per part)") && names.contains(&"upper limit (per part)"));
+    assert!(fig["layout"]["shapes"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn datalog_records_are_kept_with_their_position() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let p = gen(d.path(), "dtr.stdf", SampleSpec::default());
+    // a DTR record (type 50, subtype 30: TEXT_DAT as one Cn) after the last record
+    let text = b"tester: lot reloaded, probe card changed";
+    let mut bytes = std::fs::read(&p).unwrap();
+    let len = (1 + text.len()) as u16;
+    bytes.extend_from_slice(&len.to_le_bytes());
+    bytes.extend_from_slice(&[50, 30, text.len() as u8]);
+    bytes.extend_from_slice(text);
+    std::fs::write(&p, bytes).unwrap();
+    let ds = data::load(&p, &LoadOptions::default()).unwrap();
+    assert_eq!(ds.datalog.len(), 1);
+    assert_eq!(ds.datalog[0].kind, "DTR");
+    assert_eq!(ds.datalog[0].after_part, ds.parts.len());
+    assert_eq!(ds.datalog[0].text, std::str::from_utf8(text).unwrap());
+    // the API lists it
+    let reg = api::Registry::app();
+    api::run(&reg, "load", &json!({ "paths": [p.to_string_lossy()] })).unwrap();
+    let rows = api::run(&reg, "datalog", &json!({ "ds": 0 })).unwrap();
+    assert_eq!(rows[0]["kind"], "DTR");
+}
+
+#[test]
+fn zip_and_bzip2_files_load_like_the_plain_file() {
+    use std::io::Write;
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let plain = gen(d.path(), "lot.stdf", SampleSpec::default());
+    let bytes = std::fs::read(&plain).unwrap();
+    let want = data::load(&plain, &LoadOptions::default()).unwrap();
+    let same = |got: &Dataset| {
+        assert_eq!(
+            serde_json::to_string(&got.parts).unwrap(),
+            serde_json::to_string(&want.parts).unwrap()
+        );
+        let bits = |ds: &Dataset| -> Vec<u32> { ds.values.iter().flatten().map(|v| v.to_bits()).collect() };
+        assert_eq!(bits(got), bits(&want));
+    };
+    for (name, method) in [
+        ("deflated", zip::CompressionMethod::Deflated),
+        ("stored", zip::CompressionMethod::Stored),
+    ] {
+        let zp = d.path().join(format!("{name}.zip"));
+        let mut w = zip::ZipWriter::new(std::fs::File::create(&zp).unwrap());
+        let opts = zip::write::SimpleFileOptions::default().compression_method(method);
+        w.start_file("lot.stdf", opts).unwrap();
+        w.write_all(&bytes).unwrap();
+        w.finish().unwrap();
+        same(&data::load(&zp, &LoadOptions::default()).unwrap());
+    }
+    let bp = d.path().join("lot.stdf.bz2");
+    let mut e = bzip2::write::BzEncoder::new(
+        std::fs::File::create(&bp).unwrap(),
+        bzip2::Compression::default(),
+    );
+    e.write_all(&bytes).unwrap();
+    e.finish().unwrap();
+    same(&data::load(&bp, &LoadOptions::default()).unwrap());
+}
+
+#[test]
+fn xlsx_export_has_a_sheet_per_kind_and_splits_long_kinds() {
+    use std::io::Read;
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let stdf = gen(d.path(), "lot.stdf", SampleSpec { wafers: 1, radius: 4, tests: 3, ..Default::default() });
+    let book = d.path().join("lot.xlsx");
+    // five data rows per sheet, so a kind with more records continues on the next sheet
+    let s = stdf_cypher::xlsx::export_with(&stdf, &book, 5).unwrap();
+    let parts = load(&stdf).parts.len() as u64;
+    let prr: u64 = s.sheets.iter().filter(|(n, _)| n == "PRR" || n.starts_with("PRR (")).map(|(_, r)| *r).sum();
+    assert_eq!(prr, parts);
+    assert!(s.sheets.iter().all(|(_, r)| *r <= 5));
+    assert!(s.sheets.iter().any(|(n, _)| n == "PTR (2)"));
+    // the workbook is a zip: a workbook part naming every sheet, and one part per sheet
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&book).unwrap()).unwrap();
+    let mut wb = String::new();
+    zip.by_name("xl/workbook.xml").unwrap().read_to_string(&mut wb).unwrap();
+    for (name, _) in &s.sheets {
+        assert!(wb.contains(&format!("name=\"{name}\"")), "{name} is not in the workbook");
+    }
+    // a sheet has its header row (the record fields) and one row per record
+    let i = s.sheets.iter().position(|(n, _)| n == "PRR").unwrap();
+    let mut sheet = String::new();
+    zip.by_name(&format!("xl/worksheets/sheet{}.xml", i + 1)).unwrap().read_to_string(&mut sheet).unwrap();
+    assert!(sheet.contains("<t xml:space=\"preserve\">part_id</t>"));
+    assert_eq!(sheet.matches("<row ").count() as u64, s.sheets[i].1 + 1);
+}
+
+#[test]
+fn bzip2_streams_are_read_to_the_end_and_damaged_zip_entries_are_errors() {
+    use std::io::Write;
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let plain = gen(d.path(), "lot.stdf", SampleSpec { wafers: 1, radius: 3, tests: 3, ..Default::default() });
+    let bytes = std::fs::read(&plain).unwrap();
+    let count = |p: &Path| {
+        let mut r = StdfReader::open(p).unwrap();
+        let mut n = 0u64;
+        while r.next_raw().unwrap().is_some() {
+            n += 1;
+        }
+        n
+    };
+    let want = count(&plain);
+    // two bzip2 streams back to back are both read
+    let two = d.path().join("two.stdf.bz2");
+    let mut packed = Vec::new();
+    for _ in 0..2 {
+        let mut e = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        e.write_all(&bytes).unwrap();
+        packed.extend(e.finish().unwrap());
+    }
+    std::fs::write(&two, &packed).unwrap();
+    assert_eq!(count(&two), 2 * want);
+    // a stored zip entry that is intact reads; one with a changed byte is an error
+    let zipped = d.path().join("lot.zip");
+    let mut w = zip::ZipWriter::new(std::fs::File::create(&zipped).unwrap());
+    let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    w.start_file("lot.stdf", stored).unwrap();
+    w.write_all(&bytes).unwrap();
+    w.finish().unwrap();
+    assert_eq!(count(&zipped), want);
+    let start = zip::ZipArchive::new(std::fs::File::open(&zipped).unwrap())
+        .unwrap()
+        .by_index(0)
+        .unwrap()
+        .data_start()
+        .unwrap();
+    let mut raw = std::fs::read(&zipped).unwrap();
+    raw[start as usize + bytes.len() / 2] ^= 0x55;
+    std::fs::write(&zipped, &raw).unwrap();
+    let mut r = StdfReader::open(&zipped).unwrap();
+    let mut failed = false;
+    loop {
+        match r.next_raw() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    assert!(failed, "a damaged zip entry must be an error, not changed records");
+}
+
+#[test]
+fn merging_keeps_the_fixed_limits_of_a_file_beside_one_with_per_part_limits() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let fixed = data::load(gen(d.path(), "fixed.stdf", SampleSpec::default()), &LoadOptions::default()).unwrap();
+    let moving = data::load(
+        gen(d.path(), "dyn.stdf", SampleSpec { dynamic_limits: true, ..SampleSpec::default() }),
+        &LoadOptions::default(),
+    )
+    .unwrap();
+    let n_fixed = fixed.parts.len();
+    let t_fixed: Vec<(String, Option<f64>)> = fixed.tests.iter().map(|t| (t.key.clone(), t.lo)).collect();
+    let merged = Dataset::merge(vec![fixed, moving]);
+    let t = merged.tests.iter().position(|t| t.num == 1000).unwrap();
+    let pl = merged.part_limits[t].as_ref().expect("the test has per-part limits in the second file");
+    let (_, lo) = t_fixed.iter().find(|(k, _)| *k == merged.tests[t].key).unwrap();
+    let lo = lo.expect("the fixed file gives the test a low limit") as f32;
+    // the rows of the fixed file keep its limit; they are not blank
+    assert!(pl.lo[..n_fixed].iter().all(|v| *v == lo));
 }

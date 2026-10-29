@@ -173,12 +173,50 @@ pub struct Overview {
     pub tester: String,
     pub n_parts: usize,
     pub n_pass: usize,
+    /// parts with no PRR record (the file was cut off or is incomplete)
+    pub partial_parts: u32,
+    /// yield without those parts, in percent (None when there are none)
+    pub yield_without_partial_pct: Option<f64>,
     pub yield_pct: f64,
     pub n_tests: usize,
     pub n_wafers: usize,
     pub sites: usize,
     pub retests: usize,
     pub record_counts: IndexMap<String, u64>,
+}
+
+/// Yield in percent over the parts that are not cut off (None when no part is).
+pub fn yield_without_partial(ds: &Dataset) -> Option<f64> {
+    let cut = ds.parts.iter().filter(|p| p.partial).count();
+    if cut == 0 {
+        return None;
+    }
+    let kept = ds.parts.len() - cut;
+    let pass = ds.parts.iter().filter(|p| p.is_pass()).count();
+    Some(if kept == 0 {
+        0.0
+    } else {
+        pass as f64 * 100.0 / kept as f64
+    })
+}
+
+/// The warning for parts cut off before their PRR, with the yield both ways (counting them,
+/// and leaving them out). None when no part is cut off.
+pub fn cut_off_warning(ds: &Dataset) -> Option<String> {
+    let cut = ds.parts.iter().filter(|p| p.partial).count();
+    if cut == 0 {
+        return None;
+    }
+    let all = ds.parts.len();
+    let pass = ds.parts.iter().filter(|p| p.is_pass()).count();
+    let with = pass as f64 * 100.0 / all as f64;
+    let without = yield_without_partial(ds).unwrap_or(0.0);
+    Some(format!(
+        "warning: {cut} part(s) cut off before their PRR (file ends inside a part or is incomplete): \
+         kept with their results, no bin, no pass/fail. Yield {with:.2}% counting them ({pass}/{all}), \
+         {without:.2}% without them ({pass}/{})",
+        all - cut
+    ))
 }
 
 pub fn overview(ds: &Dataset) -> Overview {
@@ -194,6 +232,8 @@ pub fn overview(ds: &Dataset) -> Overview {
     lots.dedup();
     let src0 = ds.sources.first().cloned().unwrap_or_default();
     Overview {
+        partial_parts: ds.parts.iter().filter(|p| p.partial).count() as u32,
+        yield_without_partial_pct: yield_without_partial(ds),
         name: ds.name.clone(),
         files: ds.sources.iter().map(|s| short_name(&s.path)).collect(),
         lots,

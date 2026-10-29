@@ -5,7 +5,7 @@ const { h, plot, fmt, fmtP, pct, kpi, chartBox, badge, table } = SC;
 const S = { datasets: [], ds: 0, filter: "", view: "overview", testsCache: {}, scope: "all", co: { range: "both", dim: "2d", opacity: 0.6, hist: "pct" } };
 try { Object.assign(S.co, JSON.parse(localStorage.getItem("sc-chart") || "{}")); S.scope = localStorage.getItem("sc-scope") || "all"; } catch (e) {}
 // settings kept in this browser profile (Settings page); `sc-sort` predates it
-const CFG_DEFAULT = { sort: "time", dedup: "", merge: false, key: "part_txt", lbTest: "5100", ignoreIds: true, wxy: "500", rev: "", others: [], card: ["part_txt", "wxy", "wxy_t"] };
+const CFG_DEFAULT = { sort: "time", dedup: "", merge: false, key: "part_txt", lbTest: "5100", ignoreIds: true, wxy: "80149", rev: "", others: [], card: ["part_txt", "wxy", "wxy_t"] };
 const WCAL_DEFAULT = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false };
 S.cfg = Object.assign({}, CFG_DEFAULT);
 try {
@@ -15,6 +15,8 @@ try {
   const w = JSON.parse(localStorage.getItem("sc-wcal") || "null");
   if (w) S.wcal = Object.assign({}, WCAL_DEFAULT, w);
 } catch (e) {}
+// the WXY test default moved from 500 to 80149: settings saved before that move to it once
+if ((S.cfg.cfgVer || 0) < 2) { if (String(S.cfg.wxy) === "500") S.cfg.wxy = CFG_DEFAULT.wxy; S.cfg.cfgVer = 2; }
 // before 0.3.5 the identity tests were a free "leave out tests" list: keep
 // the tests no trace field covers as other IDs
 if (typeof S.cfg.exclude === "string") {
@@ -32,32 +34,41 @@ function saveCfg() {
   Object.assign(S.cfg, { sort: S.optSort, dedup: S.optDedup || "", merge: !!S.optMerge, lbTest: S.lbTest || "5100" });
   try { localStorage.setItem("sc-settings", JSON.stringify(S.cfg)); localStorage.setItem("sc-sort", S.cfg.sort); if (S.wcal) localStorage.setItem("sc-wcal", JSON.stringify(S.wcal)); } catch (e) {}
 }
-/** The identity / trace tests (Settings > Part identification and trace). */
-function idTests() {
-  const w = waferCal();
-  return { w: w.w, x_t: w.x, y_t: w.y, ox: w.ox, oy: w.oy, wxy: S.cfg.wxy, rev: S.cfg.rev, lb: S.lbTest || "", ...Object.fromEntries((S.cfg.others || []).map((o, i) => [`o${i}`, o.test])) };
+/** Whether a trace test is switched on (its "trace" box in Settings). Off, the test is left out of tracing only. */
+function traceOn(k) { return !(S.cfg.traceOff || {})[k]; }
+/** How WXY is checked and the Wafer, X, Y chip read: raw (the W, X, Y tests as logged, default) or die (the offset tests added). */
+function wxyBasis() { return S.cfg.wxyBasis === "die" ? "die" : "raw"; }
+/** The identity / trace tests (Settings > Part identification and trace). `trace`: the tests switched off for tracing are blank. */
+function idTests(trace) {
+  const w = waferCal(), on = (k, v) => (trace && !traceOn(k) ? "" : v);
+  return { w: on("w", w.w), x_t: on("x", w.x), y_t: on("y", w.y), ox: on("ox", w.ox), oy: on("oy", w.oy), wxy: on("wxy", S.cfg.wxy), rev: on("rev", S.cfg.rev), lb: on("lb", S.lbTest || ""), ...Object.fromEntries((S.cfg.others || []).map((o, i) => [`o${i}`, trace && o.off ? "" : o.test])) };
 }
 /** Tests left out of rankings and first-fail picks: the identity tests, unless Settings keeps them in. */
 function idExclude() {
   if (S.cfg.ignoreIds === false) return "";
   return Object.values(idTests()).map((v) => String(v || "").trim()).filter((v) => /^\d+(\s*-\s*\d+)?$/.test(v)).join(", ");
 }
+/** A "trace" box beside a trace test in Settings: untick it when the program does not log that test. */
+function traceBox(on, setOn) {
+  return h("span", { class: "trace-on", title: "Trace parts with this test (part trace card, parts search, Retest trace). Untick when the program does not log it; wafer maps and analytics keep their own settings." },
+    h("input", { type: "checkbox", checked: on, onchange: (e) => { setOn(e.target.checked); S.rtLast = null; saveCfg(); toast("Saved", "good", 1500); } }), "trace");
+}
 /** Part trace fields a part can show (mini card, search): [key, label]. */
 function traceFields() {
-  const w = waferCal();
+  const t = idTests(true);
   return [["part_txt", "Part text"], ["part_id", "Part ID"], ["prr_xy", "PRR X/Y"], ["wafer", "Wafer (WIR)"],
-    ...(S.cfg.wxy ? [["wxy", "WXY"]] : []), ...(w.w || w.x || w.y ? [["wxy_t", "Wafer, X, Y"]] : []),
-    ...(S.cfg.rev ? [["rev", "Program rev"]] : []), ...(S.lbTest ? [["lb", "Loadboard"]] : []),
-    ...(S.cfg.others || []).filter((o) => o.test).map((o, i) => [`o${i}`, o.name || `ID ${o.test}`])];
+    ...(t.wxy ? [["wxy", "WXY"]] : []), ...(t.w || t.x_t || t.y_t ? [["wxy_t", wxyBasis() === "die" ? "Wafer, die X, Y" : "Wafer, X, Y"]] : []),
+    ...(t.rev ? [["rev", "Program rev"]] : []), ...(t.lb ? [["lb", "Loadboard"]] : []),
+    ...(S.cfg.others || []).flatMap((o, i) => (o.test && !o.off ? [[`o${i}`, o.name || `ID ${o.test}`]] : []))];
 }
 /** A part's trace field values as text, from the PRR fields and trace tests in `ids`. */
 function traceValues(ids) {
   if (!ids) return {};
   const w = waferCal(), num = (v) => (v == null ? "" : Number.isInteger(v) ? String(v) : fmt(v, 6));
   const die = (v, o) => (v == null ? null : o == null ? v : w.mode === "sub" ? v - o : v + o);
-  const dx = die(ids.x_t, ids.ox), dy = die(ids.y_t, ids.oy);
+  const dx = die(ids.x_t, ids.ox), dy = die(ids.y_t, ids.oy), [tx, ty] = wxyBasis() === "die" ? [dx, dy] : [ids.x_t, ids.y_t];
   const out = { part_txt: ids.part_txt || "", part_id: ids.part_id || "", prr_xy: ids.x != null && ids.x !== NO_XY ? `${ids.x}, ${ids.y}` : "", wafer: ids.wafer || "",
-    wxy: num(ids.wxy), wxy_t: [ids.w, dx, dy].some((v) => v != null) ? [ids.w, dx, dy].map(num).join("|") : "", rev: num(ids.rev), lb: num(ids.lb) };
+    wxy: num(ids.wxy), wxy_t: [ids.w, tx, ty].every((v) => v != null) ? [ids.w, tx, ty].map(num).join("|") : "", rev: num(ids.rev), lb: num(ids.lb) };
   for (const k of Object.keys(ids)) if (/^o\d+$/.test(k)) out[k] = num(ids[k]);
   return out;
 }
@@ -71,7 +82,7 @@ function loadboardField() {
 }
 
 async function api(op, params) {
-  const r = await fetch("/api/" + op, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params || {}) });
+  const r = await fetch("/api/" + op, { method: "POST", headers: { "content-type": "application/json", "x-stdf-token": window.STDF_TOKEN }, body: JSON.stringify(params || {}) });
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || "request failed");
   return j.data;
@@ -360,7 +371,8 @@ async function viewOverview(el) {
     body.replaceChildren();
     body.append(h("div", { class: "kpis" },
       kpi("Parts", o.n_parts.toLocaleString(), S.filter ? `${d.selected.toLocaleString()} selected` : `${o.files.length} file(s)`),
-      kpi("Yield", pct(S.filter ? d.selected_yield : o.yield_pct), `${o.n_pass.toLocaleString()} pass`),
+      o.partial_parts ? kpi("Cut off", o.partial_parts.toLocaleString(), `no PRR record: kept without bin or verdict. Yield ${pct(o.yield_pct)} counting them, ${pct(o.yield_without_partial_pct)} without`) : "",
+      kpi("Yield", pct(S.filter ? d.selected_yield : o.yield_pct), o.yield_without_partial_pct != null ? `${o.n_pass.toLocaleString()} pass · ${pct(o.yield_without_partial_pct)} without the cut-off part` : `${o.n_pass.toLocaleString()} pass`),
       kpi("Tests", o.n_tests.toLocaleString()),
       kpi("Wafers", o.n_wafers || "–"),
       kpi("Sites", o.sites),
@@ -401,11 +413,23 @@ async function viewOverview(el) {
     body.append(h("h2", {}, "Source files"));
     const src = h("div");
     body.append(src);
+    body.append(h("h2", {}, "Datalog"), h("p", { class: "lead" }, "GDR and DTR records of the file (datalog text and generic data), with the number of parts before each one. Opened on demand."));
+    const dl = h("details", { class: "adv" }, h("summary", {}, "Show the datalog records"), h("div"));
+    dl.addEventListener("toggle", async () => {
+      if (!dl.open || dl.dataset.loaded) return;
+      dl.dataset.loaded = "1";
+      const rows = await api("datalog", P({}));
+      table(dl.lastChild, [{ key: "kind", label: "Kind" }, { key: "after_part", label: "After part", num: true }, { key: "text", label: "Text" }], rows, { search: true });
+    });
+    body.append(dl);
     table(src, [{ key: "path", label: "File" }, { key: "lot_id", label: "Lot" }, { key: "sublot_id", label: "Sublot" }, { key: "part_typ", label: "Product" }, { key: "job_nam", label: "Program" }, { key: "node_nam", label: "Node" }, { key: "test_cod", label: "Step" }, { key: "tst_temp", label: "Temp" }, { key: "endian", label: "Endian" }], d.sources, { search: false });
   } catch (e) { showErr(body, e); }
 }
 
 // ---- Test explorer
+/** Cpk cell: amber below 1.33, red below 1.00 (the rows are marked the same way). */
+const cpkFlag = (v) => (Number.isFinite(v) ? h("span", { class: v < 1 ? "flag-fail" : v < 1.33 ? "flag-warn" : "" }, fmt(v, 2)) : "");
+
 async function viewExplorer(el) {
   el.append(h("h1", {}, "Test explorer"), h("p", { class: "lead" }, "Pick a test to see its distribution against limits, split by any factor. Add a second test for a correlation scatter."));
   const left = h("div", { class: "card pad" });
@@ -425,9 +449,10 @@ async function viewExplorer(el) {
       { key: "key", label: "Test" },
       { key: "units", label: "Units" },
       { key: "n", label: "N", num: true },
-      { key: "cpk", label: "Cpk", num: true, fmt: (v) => fmt(v, 2) },
-      { key: "fail_pct", label: "Fail %", num: true, fmt: (v) => (v ? v.toFixed(2) : "0") },
-    ], tests, { onClick: (r) => { S.explorerTest = r.key; draw(); }, sort: "fail_pct", maxHeight: "760px", placeholder: "Search tests…" });
+      { key: "cpk", label: "Cpk", num: true, render: (v) => cpkFlag(v) },
+      { key: "fail_pct", label: "Fail %", num: true, render: (v) => h("span", { class: v ? "flag-fail" : "" }, v ? v.toFixed(2) : "0") },
+    ], tests, { onClick: (r) => { S.explorerTest = r.key; draw(); }, sort: "fail_pct", maxHeight: "760px", placeholder: "Search tests…", rowClass: (r) => (Number.isFinite(r.cpk) ? (r.cpk < 1 ? "row-fail" : r.cpk < 1.33 ? "row-warn" : "") : "") });
+    left.append(h("p", { class: "muted small" }, "Cpk amber below 1.33 and red below 1.00; fail % is red where a part failed."));
     if (!S.explorerTest) {
       const first = [...tests].filter((t) => t.kind !== "Functional").sort((a, b) => (b.fail_pct || 0) - (a.fail_pct || 0))[0];
       S.explorerTest = first && first.key;
@@ -1141,7 +1166,7 @@ async function partRaw(el, ds, index) {
 
 async function recParts(el) {
   el.append(h("div", { class: "controls" },
-    h("button", { onclick: () => { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(scoped(S.filter))}`; } }, "Download CSV (all tests)"),
+    h("button", { onclick: () => { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(scoped(S.filter))}&t=${encodeURIComponent(window.STDF_TOKEN)}`; } }, "Download CSV (all tests)"),
     h("button", { onclick: () => go("export") }, "Split, extract or save report…")));
   const out = h("div");
   el.append(out);
@@ -2175,7 +2200,7 @@ function viewRetest(el) {
     const filter = st.mode === "reject" ? "not pass" : st.mode === "all" ? "all" : st.mode === "test" ? `fail(${first})` : st.custom.trim() || "not pass";
     loading(out, "Following the parts through the runs…");
     try {
-      const d = await api("retest_trace", { runs: st.runs, key: kp.value(), link: st.link, filter: scoped(filter), tests: st.tests, exclude: idExclude(), id_tests: idTests(), value_from: st.valueFrom || "first", max_rate: (st.maxRate ?? 10) / 100, min_zone: st.minZone ?? 10 });
+      const d = await api("retest_trace", { runs: st.runs, key: kp.value(), link: st.link, filter: scoped(filter), tests: st.tests, exclude: idExclude(), id_tests: idTests(true), value_from: st.valueFrom || "first", max_rate: (st.maxRate ?? 10) / 100, min_zone: st.minZone ?? 10 });
       S.rtLast = d;
       renderRetest(out, traceBox, d);
     } catch (e) { showErr(out, e); }
@@ -2271,12 +2296,37 @@ function rtSearch(r, q) {
   const m = /^\s*(-?\d+)[\s,;/|]+(-?\d+)[\s,;/|]+(-?\d+)\s*$/.exec(q);
   return !!m && r._trace.wxy_t === `${m[1]}|${m[2]}|${m[3]}`;
 }
+/** The WXY test against the wafer, X and Y tests, on the basis chosen in Settings: raw (the tests as logged, default) or die (the offset tests added). Reads as wafer, then X and Y zero-padded to three digits (17113138 = 17|113|138). Null without WXY and the three tests. */
+function wxyCheck(ids) {
+  if (!ids || ids.wxy == null || ids.w == null || ids.x_t == null || ids.y_t == null) return null;
+  const w = waferCal(), i3 = (v) => String(Math.round(v)).padStart(3, "0");
+  const fits = (v) => Math.round(v) >= 0 && Math.round(v) <= 999;
+  const enc = (wf, x, y) => (fits(x) && fits(y) ? `${Math.round(wf)}${i3(x)}${i3(y)}` : "");
+  const die = (v, o) => (v == null ? null : o == null ? v : w.mode === "sub" ? v - o : v + o);
+  const wxy = String(Math.round(ids.wxy)), raw = enc(ids.w, ids.x_t, ids.y_t), dies = enc(ids.w, die(ids.x_t, ids.ox), die(ids.y_t, ids.oy));
+  const basis = wxyBasis(), want = basis === "die" ? dies : raw, other = basis === "die" ? raw : dies;
+  if (want && wxy === want) return { ok: true, text: `= ${basis} W|X|Y`, title: basis === "die" ? "WXY matches the wafer, die X and Y (offset tests applied)." : "WXY matches the wafer, X and Y tests as logged." };
+  const hint = other && wxy === other ? ` It matches the ${basis === "die" ? "raw" : "die"} W|X|Y: change Check WXY against in Settings.` : "";
+  return { ok: false, text: `≠ ${basis} W|X|Y`, title: `WXY ${wxy} is not the ${basis} W|X|Y (${want || "no 2-digit wafer, 3-digit X and Y"}).${hint}` };
+}
+/** The WXY check as a badge for the part card. */
+function wxyBadge(ids) {
+  const c = wxyCheck(ids);
+  if (!c) return null;
+  const b = badge(c.text, c.ok ? "good" : "bad");
+  b.title = c.title;
+  return b;
+}
 /** The part trace card: the trace fields picked here (kept in Settings), for one part. */
 function partCard(p, redraw) {
   if (!p) return null;
   const tv = traceValues(p.ids), all = traceFields();
   const pick = (S.cfg.card || []).filter((k) => all.some(([x]) => x === k));
-  const chips = all.filter(([k]) => pick.includes(k)).map(([k, l]) => h("span", { class: "trace-chip" }, h("span", { class: "muted small" }, l), h("b", {}, tv[k] || "–")));
+  const chips = all.filter(([k]) => pick.includes(k)).map(([k, l]) => {
+    const c = h("span", { class: "trace-chip" }, h("span", { class: "muted small" }, l), h("b", {}, tv[k] || "–"), k === "wxy" ? wxyBadge(p.ids) : null);
+    if (k === "wxy_t") c.title = wxyBasis() === "die" ? "Die X and Y: the X and Y tests with the offset tests applied. WXY is checked against these." : "X and Y as the tests logged them (offset tests not added). WXY is checked against these.";
+    return c;
+  });
   const menu = h("details", { class: "trace-pick", open: !!S.tracePickOpen }, h("summary", { title: "Pick the trace fields to show", onclick: (e) => (S.tracePickOpen = !e.currentTarget.parentNode.open) }, "Fields"),
     h("div", { class: "trace-menu" }, all.map(([k, l]) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: pick.includes(k), onchange: (e) => {
       S.cfg.card = e.target.checked ? [...pick, k] : pick.filter((x) => x !== k); saveCfg(); redraw();
@@ -2831,6 +2881,7 @@ function uploadOne(file, onProgress) {
   return new Promise((resolve, reject) => {
     const x = new XMLHttpRequest();
     x.open("POST", "/api/upload?name=" + encodeURIComponent(file.name));
+    x.setRequestHeader("x-stdf-token", window.STDF_TOKEN);
     x.upload.onprogress = (e) => onProgress(e.loaded);
     x.onload = () => { try { const j = JSON.parse(x.responseText); j.ok ? resolve(j.data.path) : reject(new Error(j.error)); } catch (e) { reject(e); } };
     x.onerror = () => reject(new Error("upload failed"));
@@ -3121,20 +3172,26 @@ function viewDatalog(el) {
 function viewSettings(el) {
   el.append(h("h1", {}, "Settings"), h("p", { class: "lead" }, "Defaults used across the views, saved on this PC. A view's own fields still override them for that analysis."));
   const sec = (title, note, ...kids) => h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, title), note ? h("p", { class: "muted small" }, note) : null, ...kids);
-  const saved = () => { saveCfg(); toast("Saved", "good", 1500); };
+  const saved = () => { S.rtLast = null; saveCfg(); toast("Saved", "good", 1500); };
   const sort = select([["time", "by test start time (MIR), else file time"], ["name", "by file name (run2 before run10)"], ["none", "as given"]], S.optSort, (v) => { S.optSort = v; saved(); });
   const dedup = select([["", "keep every test (incl. retests)"], ["last", "keep the last test of each part"], ["first", "keep the first test of each part"]], S.optDedup || "", (v) => { S.optDedup = v; saved(); });
+  // threads for loading several files: 0 = one per core (the server keeps the setting)
+  const threadHint = h("span", { class: "muted small" }, "");
+  const threads = h("input", { type: "number", min: "0", max: "256", value: "0", style: { width: "80px" }, title: "Threads used to read several files at once. 0 = one per core on this PC.",
+    onchange: async (e) => { try { const r = await api("parse_threads", { threads: Number(e.target.value) || 0 }); threads.value = String(r.threads); threadHint.textContent = `0 = auto (${r.cores} cores here)`; toast(`Loading uses ${r.using} thread(s)`, "good", 1500); } catch (err) { toast(err.message, "bad"); } } });
+  api("parse_threads", {}).then((r) => { threads.value = String(r.threads); threadHint.textContent = `0 = auto (${r.cores} cores here)`; }).catch(() => {});
   const merge = h("input", { type: "checkbox", checked: !!S.optMerge, onchange: (e) => { S.optMerge = e.target.checked; saved(); } });
   const key = select(KEYS.filter(([k]) => k !== "tests"), S.cfg.key, (v) => { S.cfg.key = v; S.mk = {}; saved(); });
   const ignore = h("input", { type: "checkbox", checked: S.cfg.ignoreIds !== false, onchange: (e) => { S.cfg.ignoreIds = e.target.checked; saved(); } });
   const cfgIn = (k, ph, w) => h("input", { type: "text", value: S.cfg[k] || "", placeholder: ph, style: { width: w || "110px" }, onchange: (e) => { S.cfg[k] = e.target.value.trim(); saved(); } });
+  const traced = (k, control) => h("span", { class: "row tight" }, control, traceBox(traceOn(k), (v) => { const off = Object.assign({}, S.cfg.traceOff); if (v) delete off[k]; else off[k] = true; S.cfg.traceOff = off; }));
   const othersBox = h("div");
   const drawOthers = () => {
     const o = S.cfg.others || (S.cfg.others = []);
     othersBox.replaceChildren(...o.map((x, i) => h("div", { class: "row tight", style: { marginBottom: "6px" } },
       h("input", { type: "text", value: x.name, placeholder: "name, e.g. Die ID", style: { width: "150px" }, onchange: (e) => { x.name = e.target.value.trim(); saved(); } }),
       h("input", { type: "text", value: x.test, placeholder: "test", style: { width: "110px" }, onchange: (e) => { x.test = e.target.value.trim(); saved(); } }),
-      h("button", { title: "Remove", onclick: () => { o.splice(i, 1); saved(); drawOthers(); } }, "×"))),
+      traceBox(!x.off, (v) => { x.off = v ? undefined : true; }), h("button", { title: "Remove", onclick: () => { o.splice(i, 1); saved(); drawOthers(); } }, "×"))),
       h("button", { onclick: () => { o.push({ name: "", test: "" }); drawOthers(); } }, "+ Add other ID"));
   };
   drawOthers();
@@ -3153,14 +3210,14 @@ function viewSettings(el) {
     S.lbTest = "5100"; saveCfg(); go("settings");
   };
   el.append(
-    sec("Opening files", null, h("div", { class: "controls" }, field("Order of opened files", sort), field("Retested parts", dedup), h("label", { class: "chk" }, merge, "Combine the files I open into one dataset"))),
-    sec("Part identification and trace", "The PRR part ID, part text, X/Y and wafer are always available for tracing (some products leave part text or X/Y empty). The datalogged (PTR) identity tests below add to them: they show in the part trace card and the parts search of Retest trace, and rebuild die X/Y for Wafer maps, Bad candidates and the Part datalog. Leave a test blank if the program does not log it.",
+    sec("Opening files", null, h("div", { class: "controls" }, field("Order of opened files", sort), field("Retested parts", dedup), field("Threads for loading files", h("span", { class: "row tight" }, threads, threadHint)), h("label", { class: "chk" }, merge, "Combine the files I open into one dataset"))),
+    sec("Part identification and trace", "The PRR part ID, part text, X/Y and wafer are always available for tracing (some products leave part text or X/Y empty). The datalogged (PTR) identity tests below add to them: they show in the part trace card and the parts search of Retest trace, and rebuild die X/Y for Wafer maps, Bad candidates and the Part datalog. Leave a test blank if the program does not log it, or untick its trace box to leave it out of tracing only. WXY is checked against the raw wafer, X and Y tests, or against die X and Y (offset tests added), as chosen under Check WXY against.",
       h("div", { class: "controls" }, field("Identify parts by", key), h("label", { class: "chk", title: "Identity tests differ by position or board only, so they would top marker rankings and first-fail picks for no physical reason" }, ignore, "Ignore the identification tests in analytics (rankings, signatures, first fails)")),
       h("h3", {}, "Part trace"),
-      h("div", { class: "controls" }, field("Wafer test", inp("w", "none")), field("X test", inp("x", "X")), field("Y test", inp("y", "Y")), field("X offset test", inp("ox", "none")), field("Y offset test", inp("oy", "none")), field("Offset", omode), flip("fx", "flip X"), flip("fy", "flip Y")),
-      h("div", { class: "controls" }, field("WXY test (wafer, X, Y in one result)", cfgIn("wxy", "none"))),
+      h("div", { class: "controls" }, field("Wafer test", traced("w", inp("w", "none"))), field("X test", traced("x", inp("x", "X"))), field("Y test", traced("y", inp("y", "Y"))), field("X offset test", traced("ox", inp("ox", "none"))), field("Y offset test", traced("oy", inp("oy", "none"))), field("Offset", omode), flip("fx", "flip X"), flip("fy", "flip Y")),
+      h("div", { class: "controls" }, field("WXY test (wafer, X, Y in one result)", traced("wxy", cfgIn("wxy", "none"))), field("Check WXY against", select([["raw", "raw W, X, Y tests"], ["die", "die X/Y (offsets added)"]], wxyBasis(), (v) => { S.cfg.wxyBasis = v; saved(); }))),
       h("h3", {}, "Other trace"),
-      h("div", { class: "controls" }, field("Test program revision test", cfgIn("rev", "none")), field("Loadboard test", lb)),
+      h("div", { class: "controls" }, field("Test program revision test", traced("rev", cfgIn("rev", "none"))), field("Loadboard test", traced("lb", lb))),
       field("Other IDs", othersBox)),
     sec("Look", "Colour theme for the whole app; ◐ at the top switches light and dark. Each histogram also has its own bin-size slider above the chart.", h("div", { class: "controls" }, field("Theme", skin), field("Axis range", range), field("Histogram", hist))),
     h("div", { class: "row" }, h("button", { onclick: reset }, "Reset to defaults")));
@@ -3193,7 +3250,7 @@ function viewExport(el) {
     h("p", { class: "muted" }, "One row per part with PRR fields and test values. Opens in Excel, JMP, Python…"),
     h("div", { class: "row" }, field("Tests", csvTests)),
     h("div", { class: "row" }, csvField, h("button", { class: "primary", onclick: async () => {
-      if (!csvPath.value) { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(S.filter)}&tests=${encodeURIComponent(csvTests.value)}`; return; }
+      if (!csvPath.value) { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(S.filter)}&tests=${encodeURIComponent(csvTests.value)}&t=${encodeURIComponent(window.STDF_TOKEN)}`; return; }
       busy("Writing CSV…");
       try { const r = await api("export_csv_file", { ds: String(S.ds), filter: S.filter, tests: csvTests.value, path: csvPath.value }); csvOut.replaceChildren(resultLine(`Saved ${r.path}`, r.path)); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
     } }, "Export CSV")), csvOut));
@@ -3301,7 +3358,7 @@ window.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.ke
 // and receives files opened from Explorer while the app is running
 function connectEvents() {
   try {
-    const es = new EventSource("/api/events");
+    const es = new EventSource("/api/events?t=" + encodeURIComponent(window.STDF_TOKEN));
     es.addEventListener("open", (e) => { try { const p = JSON.parse(e.data); if (p.length) loadPaths(p); } catch (x) {} });
     es.onopen = () => document.body.classList.remove("offline");
     es.onerror = () => { if (es.readyState === EventSource.CLOSED) document.body.classList.add("offline"); };
