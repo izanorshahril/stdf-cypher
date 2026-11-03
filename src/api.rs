@@ -721,6 +721,66 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
                 "total": row(None, total),
             }))
         }
+        "trim_quota" => {
+            // `target` parts of the candidate rows, spread over their sites (sites in `drop` left out)
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            let target = pp.usize("target", 0);
+            if target == 0 {
+                bail!("enter how many parts to keep");
+            }
+            let result = pp.str_or("result", "good");
+            let drop = id_list(pp.0.get("drop"));
+            let mut by: std::collections::BTreeMap<u8, Vec<usize>> = Default::default();
+            for r in id_list(pp.0.get("candidates")) {
+                if r >= ds.n_parts() {
+                    continue;
+                }
+                let p = &ds.parts[r];
+                let kept = match result.as_str() {
+                    "good" => p.passed == Some(true),
+                    "bad" => p.passed == Some(false),
+                    _ => true,
+                };
+                if p.partial || !kept || drop.contains(&(p.site as usize)) {
+                    continue;
+                }
+                by.entry(p.site).or_default().push(r);
+            }
+            let sites: Vec<u8> = by.keys().copied().collect();
+            let avail: Vec<usize> = sites.iter().map(|s| by[s].len()).collect();
+            let take = crate::trim::spread(&avail, target);
+            let mut rows = vec![];
+            let mut per_site = vec![];
+            for (k, s) in sites.iter().enumerate() {
+                rows.extend(by[s].iter().take(take[k]).copied());
+                per_site.push(json!({"site": s, "available": avail[k], "take": take[k]}));
+            }
+            rows.sort_unstable();
+            let taken: usize = take.iter().sum();
+            // a site short of its fair share is offered for dropping (two or more sites only)
+            let share = if sites.len() >= 2 {
+                target / sites.len()
+            } else {
+                0
+            };
+            let mut short = vec![];
+            for (k, s) in sites.iter().enumerate() {
+                if share > 0 && avail[k] < share {
+                    short.push(*s);
+                }
+            }
+            Ok(json!({
+                "rows": rows,
+                "target": target,
+                "taken": taken,
+                "available": avail.iter().sum::<usize>(),
+                "shortfall": target.saturating_sub(taken),
+                "share": share,
+                "short": short,
+                "per_site": per_site,
+            }))
+        }
         "trim_list" => {
             // every part as one compact row for the Edit & trim view: index, part ID, part text,
             // wafer, X, Y, site, hard bin, soft bin, pass (null = none), cut off, first fail

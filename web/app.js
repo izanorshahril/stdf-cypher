@@ -2876,7 +2876,8 @@ async function loadPaths(paths, opts) {
     if (r.skipped) toast(`Skipped ${r.skipped} file${r.skipped > 1 ? "s" : ""} that ${r.skipped > 1 ? "are" : "is"} not STDF`, "", 6000);
     for (const e of r.errors || []) toast(`Could not read ${e.name}: ${e.error}`, "bad", 10000);
     if (!opts.quiet) toast(`Opened ${r.ids.length} dataset${r.ids.length > 1 ? "s" : ""}`, "good");
-    go("overview");
+    // on the home screen the user picks the page: stay there, with the new dataset listed
+    go(S.view === "home" ? "home" : "overview");
   } catch (e) {
     toast(e.message, "bad", 10000);
   } finally { busy(null); }
@@ -2974,6 +2975,16 @@ function pathField(kind, value, opts) {
   if (!(S.info && S.info.native_dialogs)) btn.hidden = true;
   return [inp, h("div", { class: "pathfield" }, inp, btn)];
 }
+/** A save button with an arrow: the button saves the file; the arrow also offers "Save and open".
+ *  `run(open)` does the save and opens the saved file when `open` is true. */
+function saveSplit(label, run) {
+  const menu = h("div", { class: "save-menu", hidden: true },
+    h("button", { onclick: () => { menu.hidden = true; run(false); } }, "Save only"),
+    h("button", { onclick: () => { menu.hidden = true; run(true); } }, "Save and open in the app"));
+  const arrow = h("button", { class: "primary caret", title: "More save options", "aria-haspopup": "menu", onclick: (e) => { e.stopPropagation(); menu.hidden = !menu.hidden; } }, "▾");
+  return h("div", { class: "save-split" }, h("button", { class: "primary", onclick: () => run(false) }, label), arrow, menu);
+}
+document.addEventListener("click", () => document.querySelectorAll(".save-menu").forEach((m) => (m.hidden = true)));
 function resultLine(msg, path) {
   return h("div", { class: "result-line" }, badge("done", "good"), h("span", {}, msg), path && S.info && S.info.app_mode ? h("button", { class: "ghost", onclick: () => api("reveal", { path }) }, "Show in folder") : null);
 }
@@ -3007,14 +3018,15 @@ function mergeCard() {
     return h("div", {}, h("div", { class: "muted small" }, "Merge order (the first file's header opens the merged file):"), order,
       h("label", { class: "chk", title: "Each later file's part IDs are raised by the highest part ID written before it (e.g. file 1 ends at 481: file 2's part 1 becomes 482). Part IDs that are not numbers are counted up instead." }, renumber, "Renumber part IDs: each file continues from the previous file's last part ID"),
       h("div", { class: "row" }, pf,
-        h("button", { class: "primary", onclick: async () => {
+        saveSplit("Save merged STDF", async (open) => {
           if (!path.value) return toast("Choose where to save the merged file", "bad");
           busy("Writing merged STDF…");
           try {
             const r = await api("merge_files", { ds: list.map((f) => f.id), path: path.value, renumber: renumber.checked });
             res.replaceChildren(resultLine(`Saved ${r.path}: ${r.parts.toLocaleString()} parts (${r.good.toLocaleString()} good) from ${r.files} files`, r.path), h("button", { onclick: () => loadPaths([r.path]) }, "Open it"));
+            if (open) loadPaths([r.path]);
           } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
-        } }, "Save merged STDF"),
+        }),
         h("button", { onclick: () => combine(list.map((f) => f.id)) }, "Combine in the app")), res);
   };
   const draw = (groups) => {
@@ -3203,7 +3215,7 @@ function viewTrim(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
   el.append(h("h1", {}, "Edit & trim"), h("p", { class: "lead" }, `Choose the parts of ${ds ? ds.name : "the dataset"} to keep or remove, number the parts that stay if you like, and save a new STDF file. The file you opened is not changed.`));
   if (!ds) { el.append(h("p", { class: "muted" }, "Open an STDF file first.")); return; }
-  if (!S.trim || S.trim.ds !== S.ds) S.trim = { ds: S.ds, sel: new Set(), anchor: null, page: 0, q: "", show: "all", action: "keep", renumber: false, by: "id", text: "", filter: "", result: "any", sites: new Set(), touchText: "" };
+  if (!S.trim || S.trim.ds !== S.ds) S.trim = { ds: S.ds, sel: new Set(), anchor: null, page: 0, q: "", show: "all", action: "keep", renumber: false, method: "rules", op: "replace", numbers: "", by: "id", filter: "", result: "any", sites: null, touchText: "", quota: "", quotaDecided: "" };
   const body = h("div");
   el.append(body);
   loading(body, "Reading the parts…");
@@ -3217,18 +3229,154 @@ function drawTrim(body, ds, data, yields, est) {
   const st = S.trim, sel = st.sel, rows = data.rows, n = rows.length;
   // row: [index, part ID, part text, wafer, X, Y, site, hbin, sbin, pass, cut off, first fail], then touchdown and loop when estimated
   if (est) rows.forEach((r, i) => r.push(est.touch[i], est.loop[i]));
+  const sites = yields.sites || [];
+  if (!st.sites) st.sites = new Set(sites.map((s) => s.site));
   const hay = rows.map((r) => `${r[1]} ${r[2]} ${r[3]} ${r[4] ?? ""} ${r[5] ?? ""}`.toLowerCase());
-  const msg = h("div", { class: "muted small" });
+  const tn = () => (est && st.touchText.trim() ? numSet(st.touchText) : null);
+  const resultOk = (r) => st.result === "any" || (!r[10] && (st.result === "good" ? r[9] === true : r[9] === false));
+  const written = () => (st.action === "keep" ? [...sel].sort((a, b) => a - b) : rows.map((_, i) => i).filter((i) => !sel.has(i)));
+  const quotaKey = () => `${st.quota}|${[...st.sites].sort((a, b) => a - b).join(",")}|${st.filter}|${st.touchText}`;
+
+  // the operation's live message, and the candidates (the preview) of the chosen method
+  const say = h("div", { class: "muted small", role: "status", "aria-live": "polite" });
+  const preview = h("div", { class: "muted small" });
+  let cand = [];
+  let plan = null;
+  let seq = 0, timer = null;
+  let fcache = { expr: null, set: null };
+  const filterSet = async (expr) => {
+    if (!expr.trim()) return null;
+    if (fcache.expr !== expr) { const r = await api("trim_resolve", { ds: S.ds, filter: expr }); fcache = { expr, set: new Set(r.rows) }; }
+    return fcache.set;
+  };
+  const schedule = (ms) => { clearTimeout(timer); timer = setTimeout(computePreview, ms || 0); };
+  const computePreview = async () => {
+    const my = ++seq;
+    try {
+      if (st.method === "numbers") {
+        if (!st.numbers.trim()) { preview.textContent = "Type part IDs or row numbers."; cand = []; }
+        else {
+          const r = await api("trim_resolve", { ds: S.ds, text: st.numbers, by: st.by });
+          if (my !== seq) return;
+          cand = r.rows;
+          preview.textContent = `${r.count.toLocaleString()} part(s) for these numbers` + (r.missing.length ? `; not in the file: ${r.missing.join(", ")}` : "") + (r.shared.length ? `; part IDs on more than one part (all included): ${r.shared.join(", ")}` : "");
+        }
+        plan = null;
+      } else if (st.method === "rules") {
+        const fs = await filterSet(st.filter);
+        if (my !== seq) return;
+        cand = rows.filter((r) => (!fs || fs.has(r[0])) && st.sites.has(r[6]) && (!tn() || tn().has(r[12])) && resultOk(r)).map((r) => r[0]);
+        preview.textContent = !st.sites.size ? "No site is included: tick sites in the yield table." : `${cand.length.toLocaleString()} part(s) match these rules`;
+        plan = null;
+      } else {
+        const target = Number(st.quota);
+        if (!(target > 0)) { cand = []; plan = null; preview.textContent = "Enter how many good parts to keep."; }
+        else {
+          const fs = await filterSet(st.filter);
+          if (my !== seq) return;
+          const pool = rows.filter((r) => r[9] === true && !r[10] && (!fs || fs.has(r[0])) && st.sites.has(r[6]) && (!tn() || tn().has(r[12]))).map((r) => r[0]);
+          const q = await api("trim_quota", { ds: S.ds, target, candidates: pool, result: "good", drop: [] });
+          if (my !== seq) return;
+          plan = q;
+          cand = q.rows;
+          preview.textContent = `${q.taken.toLocaleString()} good part(s) over ${q.per_site.length} site(s)` + (q.shortfall ? `; only ${q.available.toLocaleString()} good part(s) match, ${q.shortfall.toLocaleString()} short of ${target.toLocaleString()}` : "");
+          // a site short of its share: ask whether to drop it, unless the user already answered for this setting
+          if (q.short.length && st.quotaDecided !== quotaKey()) {
+            const names = q.short.map((s) => `site ${s}`).join(", ");
+            shortBox.replaceChildren(h("p", {}, `${names} ${q.short.length > 1 ? "have" : "has"} fewer good parts than the fair share of ${q.share} (${target.toLocaleString()} parts over ${q.per_site.length} sites). Drop ${q.short.length > 1 ? "them" : "it"} from this quota pick?`),
+              h("div", { class: "row tight" },
+                h("button", { class: "primary", onclick: () => { for (const s of q.short) st.sites.delete(s); st.quotaDecided = ""; syncSites(); schedule(0); } }, `Yes, drop ${names}`),
+                h("button", { onclick: () => { st.quotaDecided = quotaKey(); schedule(0); } }, `No, keep ${names}`)));
+            shortBox.hidden = false;
+          } else shortBox.hidden = true;
+        }
+      }
+    } catch (e) { if (my === seq) { preview.textContent = e.message; cand = []; } }
+    if (my === seq) paint();
+  };
+
+  // apply the candidate rows to the selection: replace, add or take out
+  const applyRows = (list) => {
+    let added = 0, removed = 0;
+    if (st.op === "replace") {
+      const want = new Set(list);
+      for (const i of [...sel]) if (!want.has(i)) { sel.delete(i); removed++; }
+      for (const i of list) if (!sel.has(i)) { sel.add(i); added++; }
+    } else if (st.op === "add") {
+      for (const i of list) if (!sel.has(i)) { sel.add(i); added++; }
+    } else {
+      for (const i of list) if (sel.delete(i)) removed++;
+    }
+    st.anchor = null;
+    say.textContent = `Added ${added.toLocaleString()}, removed ${removed.toLocaleString()}. ${sel.size.toLocaleString()} part(s) selected.`;
+    paint();
+  };
+  const applyNow = async () => { await computePreview(); apply(); };
+  const apply = () => {
+    if (!cand.length) { say.textContent = "Nothing matched: the selection is unchanged."; return; }
+    applyRows(cand);
+  };
+
+  // the committed selection, always visible
+  const stripCount = h("b", {});
+  const stripKinds = h("span", { class: "muted small" });
+  const strip = h("div", { class: "trim-strip card pad" },
+    h("div", { class: "row tight", style: { flexWrap: "wrap" } }, h("span", { class: "strip-title" }, "Selected"), stripCount, stripKinds,
+      h("button", { class: "ghost small", title: "list only the selected parts", onclick: () => { st.show = "selected"; st.page = 0; showSel.value = "selected"; paint(); } }, "Review selected"),
+      h("button", { class: "ghost small", onclick: () => { sel.clear(); st.anchor = null; say.textContent = "Selection cleared."; paint(); } }, "Clear selection")));
+
+  // 1 · site eligibility, in the yield table
+  const siteChecks = new Map();
+  const totalYield = yields.total.yield_pct;
+  const lowYield = (y) => y !== null && totalYield !== null && y < totalYield - 10;
+  const syncSites = () => { for (const [s, b] of siteChecks) b.checked = st.sites.has(s); };
+  const yieldTable = h("div", { class: "tbl-wrap" }, h("table", {},
+    h("thead", {}, h("tr", {}, ...["In", "Site", "Parts", "Good", "Bad", "Cut off", "Yield", ""].map((c) => h("th", { class: ["Site", "Parts", "Good", "Bad", "Cut off", "Yield"].includes(c) ? "num" : "" }, c)))),
+    h("tbody", {}, ...sites.map((s) => {
+      const box = h("input", { type: "checkbox", "aria-label": `include site ${s.site} in the rules and the quota`, onchange: (e) => { if (e.target.checked) st.sites.add(s.site); else st.sites.delete(s.site); st.quotaDecided = ""; schedule(0); } });
+      siteChecks.set(s.site, box);
+      return h("tr", {},
+        h("td", {}, box),
+        h("td", { class: "num" }, s.site),
+        h("td", { class: "num" }, s.parts.toLocaleString()),
+        h("td", { class: "num" }, s.good.toLocaleString()),
+        h("td", { class: "num" }, s.bad.toLocaleString()),
+        h("td", { class: "num" }, s.cut_off ? s.cut_off.toLocaleString() : ""),
+        h("td", { class: `num ${lowYield(s.yield_pct) ? "flag-fail" : ""}` }, s.yield_pct === null ? "–" : `${s.yield_pct.toFixed(1)} %`),
+        h("td", {}, lowYield(s.yield_pct) ? h("span", { class: "flag-fail" }, "low yield") : ""));
+    }),
+    h("tfoot", {}, h("tr", {}, h("td", {}), h("td", {}, "All"), h("td", { class: "num" }, yields.total.parts.toLocaleString()), h("td", { class: "num" }, yields.total.good.toLocaleString()), h("td", { class: "num" }, yields.total.bad.toLocaleString()), h("td", { class: "num" }, yields.total.cut_off ? yields.total.cut_off.toLocaleString() : ""), h("td", { class: "num" }, totalYield === null ? "–" : `${totalYield.toFixed(1)} %`), h("td", {}))))));
+  const allSites = h("button", { class: "ghost small", onclick: () => { st.sites = new Set(sites.map((s) => s.site)); st.quotaDecided = ""; schedule(0); } }, "All sites");
+
+  // 2 · choose parts: one method at a time, then one operation
+  const methods = [["numbers", "By numbers"], ["rules", "By rules"], ["quota", "Quota"]];
+  const methodBtns = methods.map(([k, label]) => [k, h("button", { class: "ghost", onclick: () => { st.method = k; plan = null; schedule(0); } }, label)]);
+  const numIn = h("input", { type: "text", value: st.numbers, placeholder: "e.g. 1-3,5,2000-2012", style: { minWidth: "300px" }, oninput: (e) => { st.numbers = e.target.value; schedule(250); }, onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); applyNow(); } } });
+  const byEl = select([["id", "part IDs"], ["row", "row numbers (1 = first part)"]], st.by, (v) => { st.by = v; schedule(0); });
+  const numPanel = h("fieldset", { class: "trim-panel" }, h("legend", {}, "By numbers"), field("Part IDs or row numbers", numIn), field("Read the numbers as", byEl), h("p", { class: "muted small" }, "Ranges and lists, e.g. 1-3,5,2000-2012. Enter applies the operation."));
+  const filterIn = h("input", { type: "text", value: st.filter, placeholder: "e.g. hbin = 1 and not pass", style: { minWidth: "300px" }, oninput: (e) => { st.filter = e.target.value; schedule(250); }, onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); applyNow(); } } });
+  const resultSel = select([["any", "all results (incl. cut off and unknown)"], ["good", "good only"], ["bad", "bad only"]], st.result, (v) => { st.result = v; schedule(0); });
+  const touchIn = est ? h("input", { type: "text", value: st.touchText, placeholder: "e.g. 3-5,9", style: { minWidth: "180px" }, oninput: (e) => { st.touchText = e.target.value; schedule(250); } }) : null;
+  const rulesPanel = h("fieldset", { class: "trim-panel" }, h("legend", {}, "By rules"), field("Filter expression", filterIn), field("Result", resultSel), touchIn ? field("Touchdown numbers", touchIn) : null,
+    h("p", { class: "muted small" }, "Rules that are set must all hold. Sites are ticked in the yield table above. Blank rules do not restrict."));
+  const quotaIn = h("input", { type: "number", min: "1", value: st.quota, placeholder: "e.g. 25", style: { width: "100px" }, oninput: (e) => { st.quota = e.target.value; st.quotaDecided = ""; schedule(250); }, onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); applyNow(); } } });
+  const shortBox = h("div", { class: "quota-ask card pad", hidden: true, role: "alertdialog", "aria-label": "Sites short of their share" });
+  const quotaTable = h("div", {});
+  const quotaPanel = h("fieldset", { class: "trim-panel" }, h("legend", {}, "Quota"), field("Good parts to keep", quotaIn),
+    h("p", { class: "muted small" }, "Good parts of the rules (filter, sites, touchdown), spread evenly over the sites and taken in file order. A site with fewer than its share gives all it has."),
+    shortBox, quotaTable);
+  // the operation, then apply
+  const opRadios = [["replace", "Replace selection"], ["add", "Add to selection"], ["take", "Take out of selection"]].map(([k, label]) =>
+    h("label", { class: "chk" }, h("input", { type: "radio", name: "trim-op", value: k, checked: st.op === k, onchange: () => { st.op = k; } }), label));
+  const applyBtn = h("button", { class: "primary", onclick: apply }, "Apply to selection");
+
+  // 3 · review the parts: search, show, paged table, bulk apply
+  const search = h("input", { type: "text", value: st.q, placeholder: "search ID, text, wafer, X/Y", "aria-label": "search this table", style: { minWidth: "240px" }, oninput: (e) => { st.q = e.target.value; st.page = 0; paint(); } });
+  const showSel = select([["all", "all parts"], ["selected", "selected only"], ["not", "not selected"]], st.show, (v) => { st.show = v; st.page = 0; paint(); });
   const listBody = h("tbody");
   const pageLbl = h("span", { class: "muted small" });
-  const sumLine = h("div", { class: "row tight", style: { flexWrap: "wrap" } });
-  const writeLine = h("div", { class: "muted" });
-  const idLine = h("div", { class: "muted small" });
-  const matchLine = h("span", { class: "muted small" });
-  const out = h("div");
-  const tn = () => (est && st.touchText.trim() ? numSet(st.touchText) : null);
-  const okResult = (r) => st.result === "any" || (!r[10] && (st.result === "good" ? r[9] === true : r[9] === false));
-  const isMatch = (r) => okResult(r) && (!st.sites.size || st.sites.has(r[6])) && (!tn() || tn().has(r[12]));
+  const prev = h("button", { class: "ghost small", onclick: () => { st.page--; paint(); } }, "‹ Previous");
+  const next = h("button", { class: "ghost small", onclick: () => { st.page++; paint(); } }, "Next ›");
   const shown = () => {
     const q = st.q.trim().toLowerCase(), list = [];
     for (let i = 0; i < n; i++) {
@@ -3239,9 +3387,9 @@ function drawTrim(body, ds, data, yields, est) {
     }
     return list;
   };
-  // the parts that will be written, in file order
-  const written = () => (st.action === "keep" ? [...sel].sort((a, b) => a - b) : rows.map((_, i) => i).filter((i) => !sel.has(i)));
-  const click = (i, list, e) => {
+  let curList = [], rowKey = "", rowEls = [], rowBoxes = [];
+  const click = (i, e) => {
+    const list = curList;
     const a = st.anchor === null ? -1 : list.indexOf(st.anchor), b = list.indexOf(i);
     if (e.shiftKey && a >= 0 && b >= 0) {
       if (!(e.ctrlKey || e.metaKey)) sel.clear();
@@ -3256,142 +3404,121 @@ function drawTrim(body, ds, data, yields, est) {
     }
     paint();
   };
-  // pick the parts a rule names: `set` replaces the selection, `add` adds to it
-  const pickWhere = (pred, mode) => {
-    if (mode === "set") sel.clear();
-    let k = 0;
-    rows.forEach((r, i) => { if (pred(r, i)) { sel.add(i); k++; } });
-    st.anchor = null;
-    msg.textContent = `${k.toLocaleString()} part(s) ${mode === "set" ? "selected" : "added to the selection"}`;
-    paint();
-  };
-  const prev = h("button", { class: "ghost small", onclick: () => { st.page--; paint(); } }, "‹ Previous");
-  const next = h("button", { class: "ghost small", onclick: () => { st.page++; paint(); } }, "Next ›");
-  const paint = () => {
-    const list = shown();
-    const pages = Math.max(1, Math.ceil(list.length / TRIM_PAGE));
-    st.page = Math.max(0, Math.min(st.page, pages - 1));
-    const at = st.page * TRIM_PAGE;
-    listBody.replaceChildren(...list.slice(at, at + TRIM_PAGE).map((i) => {
-      const r = rows[i];
-      const cells = [h("td", { class: "num" }, i + 1), h("td", {}, r[1]), h("td", {}, r[2]), h("td", {}, r[3]),
-        h("td", { class: "num" }, r[4]), h("td", { class: "num" }, r[5]), h("td", { class: "num" }, r[6]),
-        h("td", { class: "num" }, r[7]), h("td", { class: "num" }, r[8]),
-        h("td", {}, r[10] ? "cut off" : r[9] === null ? "n/a" : r[9] ? "good" : "bad"), h("td", {}, r[11])];
-      if (est) cells.push(h("td", { class: "num" }, r[12]), h("td", { class: "num" }, r[13]));
-      return h("tr", { class: sel.has(i) ? "clickable sel" : "clickable", onclick: (e) => click(i, list, e) }, ...cells);
-    }));
-    prev.disabled = st.page === 0;
-    next.disabled = st.page >= pages - 1;
-    pageLbl.textContent = `page ${st.page + 1} of ${pages.toLocaleString()} · ${list.length.toLocaleString()} part(s) listed`;
-    sumLine.replaceChildren(h("b", {}, `${sel.size.toLocaleString()} selected`), h("span", { class: "muted small" }, `of ${n.toLocaleString()} parts`));
-    matchLine.textContent = `${matchCount().toLocaleString()} part(s) match`;
-    const w = written(), removed = n - w.length;
-    const good = w.filter((i) => rows[i][9] === true).length, cut = w.filter((i) => rows[i][10]).length;
-    writeLine.textContent = w.length
-      ? `Writes ${w.length.toLocaleString()} part(s) (${good.toLocaleString()} good) and removes ${removed.toLocaleString()}.` + (cut ? ` ${cut} part(s) cut off before their PRR are written without bin or verdict.` : "")
-      : "Nothing would be written: keep at least one part.";
-    const idOf = (i) => rows[i][1] || "–";
-    idLine.textContent = !w.length ? "" : st.renumber
-      ? `Part IDs will run 1 … ${w.length.toLocaleString()}.`
-      : `Part IDs keep their numbers, ${idOf(w[0])} … ${idOf(w[w.length - 1])}${removed ? ", with gaps where parts were removed" : ""}.`;
-    saveBtn.disabled = !w.length;
-  };
-  const matchCount = () => { let k = 0; for (const r of rows) if (isMatch(r)) k++; return k; };
-  const runPick = async (params, mode) => {
-    try {
-      const r = await api("trim_resolve", Object.assign({ ds: S.ds }, params));
-      if (mode === "set") sel.clear();
-      for (const i of r.rows) { if (mode === "take") sel.delete(i); else sel.add(i); }
-      st.anchor = null;
-      const bits = [`${r.count.toLocaleString()} part(s) ${mode === "take" ? "taken out" : "picked"}`];
-      if (r.missing.length) bits.push(`not in the file: ${r.missing.join(", ")}`);
-      if (r.shared.length) bits.push(`part IDs on more than one part (all picked): ${r.shared.join(", ")}`);
-      msg.textContent = bits.join(" · ");
-      paint();
-    } catch (e) { toast(e.message, "bad"); }
-  };
-  // 1 · choose parts: numbers, ranges and IDs typed; or a filter; or the result and sites below
-  const numbers = h("input", { type: "text", value: st.text, placeholder: "e.g. 1-3,5,2000-2012", style: { minWidth: "300px" }, oninput: (e) => (st.text = e.target.value),
-    onkeydown: (e) => { if (e.key === "Enter") runPick({ text: numbers.value, by: byEl.value }, "set"); } });
-  const byEl = select([["id", "part IDs"], ["row", "row numbers (1 = first part)"]], st.by, (v) => (st.by = v));
-  const filterIn = h("input", { type: "text", value: st.filter, placeholder: "or a filter, e.g. hbin = 1 and not pass", style: { minWidth: "300px" }, oninput: (e) => (st.filter = e.target.value) });
-  const resultSel = select([["any", "good and bad"], ["good", "good only"], ["bad", "bad only"]], st.result, (v) => { st.result = v; paint(); });
-  const siteBoxes = (yields.sites || []).map((s) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: st.sites.has(s.site), onchange: (e) => { if (e.target.checked) st.sites.add(s.site); else st.sites.delete(s.site); paint(); } }), `site ${s.site}`));
-  const touchIn = est ? h("input", { type: "text", value: st.touchText, placeholder: "e.g. 3-5,9", style: { minWidth: "180px" }, oninput: (e) => { st.touchText = e.target.value; paint(); } }) : null;
-  // 2 · the list: click, Ctrl+click, Shift+click
-  const search = h("input", { type: "text", value: st.q, placeholder: "search ID, text, wafer, X/Y", style: { minWidth: "240px" }, oninput: (e) => { st.q = e.target.value; st.page = 0; paint(); } });
-  const showSel = select([["all", "all parts"], ["selected", "selected only"], ["not", "not selected"]], st.show, (v) => { st.show = v; st.page = 0; paint(); });
-  const saveBtn = h("button", { class: "primary", onclick: async () => {
+  const bulkBtn = h("button", { class: "ghost small", onclick: () => applyRows(shown()) }, "Apply operation to all listed");
+  const listCount = h("span", { class: "muted small" });
+
+  // 4 · output and save
+  const actionSel = select([["keep", "keep the selected parts"], ["remove", "remove the selected parts"]], st.action, (v) => { st.action = v; paint(); });
+  const idSel = select([["keep", "keep the part IDs as they are"], ["backfill", "backfill: renumber the parts that stay 1…N"]], st.renumber ? "backfill" : "keep", (v) => { st.renumber = v === "backfill"; paint(); });
+  const writeLine = h("div", { class: "muted" });
+  const idLine = h("div", { class: "muted small" });
+  const out = h("div");
+  const base = ds.name.replace(/\.(stdf|std)(\.gz)?$/i, "").replace(/\.gz$/i, "");
+  const srcDir = ds.paths && ds.paths.length ? dirname(ds.paths[0]) : "";
+  const sep = srcDir.includes("\\") ? "\\" : "/";
+  const [pathBox, pathF] = pathField("save", srcDir ? srcDir + sep + base + "_trim.stdf" : "", { title: "Save trimmed STDF", name: base + "_trim.stdf", ext: "stdf" });
+  const saveBtnGroup = saveSplit("Save trimmed STDF", async (open) => {
     if (!pathBox.value) return toast("Choose where to save the trimmed STDF", "bad");
     busy("Writing trimmed STDF…");
     try {
       const r = await api("trim_save", { ds: S.ds, rows: [...sel], action: st.action, renumber: st.renumber, path: pathBox.value });
       out.replaceChildren(resultLine(`Saved ${r.path}: ${r.kept.toLocaleString()} parts (${r.good.toLocaleString()} good), removed ${r.removed.toLocaleString()}${r.first_id ? `, IDs ${r.first_id} … ${r.last_id}` : ""}`, r.path), h("button", { onclick: () => loadPaths([r.path]) }, "Open it"));
+      if (open) loadPaths([r.path]);
     } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
-  } }, "Save trimmed STDF");
-  // 3 · what to write
-  const actionSel = select([["keep", "keep the selected parts"], ["remove", "remove the selected parts"]], st.action, (v) => { st.action = v; paint(); });
-  const idSel = select([["keep", "keep the part IDs as they are"], ["backfill", "backfill: renumber the parts that stay 1…N"]], st.renumber ? "backfill" : "keep", (v) => { st.renumber = v === "backfill"; paint(); });
-  // 4 · save beside the file it came from
-  const base = ds.name.replace(/\.(stdf|std)(\.gz)?$/i, "").replace(/\.gz$/i, "");
-  const srcDir = ds.paths && ds.paths.length ? dirname(ds.paths[0]) : "";
-  const sep = srcDir.includes("\\") ? "\\" : "/";
-  const [pathBox, pathF] = pathField("save", srcDir ? srcDir + sep + base + "_trim.stdf" : "", { title: "Save trimmed STDF", name: base + "_trim.stdf", ext: "stdf" });
+  });
 
-  // yield by site: the figures to decide which site to leave out
-  const flagLow = (y, total) => y !== null && total !== null && y < total - 10;
-  const totalYield = yields.total.yield_pct;
-  const yieldTable = h("div", { class: "tbl-wrap" }, h("table", {},
-    h("thead", {}, h("tr", {}, ...["Site", "Parts", "Good", "Bad", "Cut off", "Yield", ""].map((c) => h("th", { class: ["Parts", "Good", "Bad", "Cut off", "Yield"].includes(c) ? "num" : "" }, c)))),
-    h("tbody", {}, ...(yields.sites || []).map((s) => h("tr", {},
-      h("td", { class: "num" }, s.site),
-      h("td", { class: "num" }, s.parts.toLocaleString()),
-      h("td", { class: "num" }, s.good.toLocaleString()),
-      h("td", { class: "num" }, s.bad.toLocaleString()),
-      h("td", { class: "num" }, s.cut_off ? s.cut_off.toLocaleString() : ""),
-      h("td", { class: `num ${flagLow(s.yield_pct, totalYield) ? "flag-fail" : ""}` }, s.yield_pct === null ? "–" : `${s.yield_pct.toFixed(1)} %`),
-      h("td", {},
-        h("button", { class: "ghost small", title: "add this site's parts to the selection", onclick: () => pickWhere((r) => r[6] === s.site, "add") }, "Select"),
-        h("button", { class: "ghost small", title: "select only this site's parts", onclick: () => pickWhere((r) => r[6] === s.site, "set") }, "Only this site"))))),
-    h("tfoot", {}, h("tr", {}, h("td", {}, "All"), h("td", { class: "num" }, yields.total.parts.toLocaleString()), h("td", { class: "num" }, yields.total.good.toLocaleString()), h("td", { class: "num" }, yields.total.bad.toLocaleString()), h("td", { class: "num" }, yields.total.cut_off ? yields.total.cut_off.toLocaleString() : ""), h("td", { class: "num" }, totalYield === null ? "–" : `${totalYield.toFixed(1)} %`), h("td", {})))));
+  // paint: everything that depends on the selection, the method and the page
+  const paint = () => {
+    methodBtns.forEach(([k, b]) => { b.className = st.method === k ? "primary" : "ghost"; b.setAttribute("aria-pressed", String(st.method === k)); });
+    numPanel.hidden = st.method !== "numbers";
+    rulesPanel.hidden = st.method !== "rules";
+    quotaPanel.hidden = st.method !== "quota";
+    applyBtn.disabled = !shortBox.hidden;
+    syncSites();
+
+    const list = shown();
+    curList = list;
+    const pages = Math.max(1, Math.ceil(list.length / TRIM_PAGE));
+    st.page = Math.max(0, Math.min(st.page, pages - 1));
+    const at = st.page * TRIM_PAGE;
+    const slice = list.slice(at, at + TRIM_PAGE);
+    const key = slice.join(",");
+    if (key !== rowKey) {
+      rowKey = key;
+      rowBoxes = [];
+      rowEls = slice.map((i) => {
+        const r = rows[i];
+        const box = h("input", { type: "checkbox", "aria-label": `select part ${r[1]}, row ${i + 1}`, onclick: (e) => { e.stopPropagation(); if (sel.has(i)) sel.delete(i); else sel.add(i); st.anchor = i; paint(); } });
+        rowBoxes.push(box);
+        const cells = [h("td", {}, box), h("td", { class: "num" }, i + 1), h("td", {}, r[1]), h("td", {}, r[2]), h("td", {}, r[3]),
+          h("td", { class: "num" }, r[4]), h("td", { class: "num" }, r[5]), h("td", { class: "num" }, r[6]),
+          h("td", { class: "num" }, r[7]), h("td", { class: "num" }, r[8]),
+          h("td", {}, r[10] ? "cut off" : r[9] === null ? "n/a" : r[9] ? "good" : "bad"), h("td", {}, r[11])];
+        if (est) cells.push(h("td", { class: "num" }, r[12]), h("td", { class: "num" }, r[13]));
+        return h("tr", { class: "clickable", onclick: (e) => click(i, e) }, ...cells);
+      });
+      listBody.replaceChildren(...rowEls);
+    }
+    slice.forEach((i, k) => {
+      rowEls[k].className = sel.has(i) ? "clickable sel" : "clickable";
+      rowBoxes[k].checked = sel.has(i);
+    });
+    prev.disabled = st.page === 0;
+    next.disabled = st.page >= pages - 1;
+    pageLbl.textContent = `page ${st.page + 1} of ${pages.toLocaleString()} · ${list.length.toLocaleString()} part(s) listed`;
+    listCount.textContent = `${list.length.toLocaleString()} listed`;
+    bulkBtn.disabled = !list.length;
+
+    const goodN = [...sel].filter((i) => rows[i][9] === true).length;
+    const badN = [...sel].filter((i) => rows[i][9] === false).length;
+    const cutN = [...sel].filter((i) => rows[i][10]).length;
+    stripCount.textContent = `${sel.size.toLocaleString()} of ${n.toLocaleString()} parts`;
+    stripKinds.textContent = `${goodN.toLocaleString()} good · ${badN.toLocaleString()} bad · ${cutN.toLocaleString()} cut off`;
+
+    // quota: the allocation per site, before it is applied
+    if (st.method === "quota" && plan && plan.per_site.length) {
+      quotaTable.replaceChildren(h("table", {},
+        h("thead", {}, h("tr", {}, h("th", {}, "Site"), h("th", { class: "num" }, "Good available"), h("th", { class: "num" }, "Taken"))),
+        h("tbody", {}, ...plan.per_site.map((p) => h("tr", {}, h("td", {}, p.site), h("td", { class: "num" }, p.available), h("td", { class: "num" }, p.take))))));
+    } else quotaTable.replaceChildren();
+
+    const w = written(), removed = n - w.length;
+    const good = w.filter((i) => rows[i][9] === true).length, cut = w.filter((i) => rows[i][10]).length;
+    writeLine.textContent = w.length
+      ? `Will write ${w.length.toLocaleString()} part(s) (${good.toLocaleString()} good) and remove ${removed.toLocaleString()}.` + (cut ? ` ${cut} part(s) cut off before their PRR are written without bin or verdict.` : "")
+      : "Nothing would be written: keep at least one part.";
+    const idOf = (i) => rows[i][1] || "–";
+    idLine.textContent = !w.length ? "" : st.renumber
+      ? `Part IDs will run 1 … ${w.length.toLocaleString()}.`
+      : `Part IDs keep their numbers, ${idOf(w[0])} … ${idOf(w[w.length - 1])}${removed ? ", with gaps where parts were removed" : ""}.`;
+    saveBtnGroup.querySelectorAll("button").forEach((b) => (b.disabled = !w.length));
+  };
 
   body.append(
-    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "Yield by site"),
-      h("p", { class: "muted small" }, "Yield is good ÷ (good + bad), cut-off parts left out. A site more than 10 points below the file's yield is flagged red: select its parts and set Selected parts to remove to leave it out."),
+    strip,
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "1 · Sites and yield"),
+      h("p", { class: "muted small" }, "Tick the sites the rules and the quota may use. Yield is good ÷ (good + bad), cut-off parts left out. A site more than 10 points below the file's yield is flagged."),
+      h("div", { class: "row tight" }, allSites),
       yieldTable),
-    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "1 · Choose parts"),
-      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, numbers, byEl,
-        h("button", { class: "primary", onclick: () => runPick({ text: numbers.value, by: byEl.value }, "set") }, "Select these"),
-        h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "add") }, "Add"),
-        h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "take") }, "Take out")),
-      h("p", { class: "muted small" }, "Numbers and ranges (1-3,5,2000-2012) or part IDs, separated by commas or lines. Select these replaces the selection; Add and Take out change it. Ranges work on part IDs and on row numbers."),
-      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, filterIn,
-        h("button", { onclick: () => runPick({ filter: filterIn.value }, "set") }, "Select matches"),
-        h("button", { onclick: () => runPick({ filter: filterIn.value }, "add") }, "Add matches")),
-      h("h3", {}, est ? "By result, site and touchdown" : "By result and site"),
-      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, field("Result", resultSel), touchIn ? field("Touchdown", touchIn) : null),
-      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, h("span", { class: "muted small" }, "Sites (none ticked = all):"), ...siteBoxes),
-      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, h("button", { class: "primary", onclick: () => pickWhere((r) => isMatch(r), "set") }, "Select matches"),
-        h("button", { onclick: () => pickWhere((r) => isMatch(r), "add") }, "Add matches"), matchLine),
-      msg),
-    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "2 · Parts in the file"),
-      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, search, showSel,
-        h("button", { onclick: () => { for (const i of shown()) sel.add(i); paint(); } }, "Select all shown"),
-        h("button", { onclick: () => { rows.forEach((_, i) => { if (sel.has(i)) sel.delete(i); else sel.add(i); }); st.anchor = null; paint(); } }, "Invert selection"),
-        h("button", { onclick: () => { sel.clear(); st.anchor = null; paint(); } }, "Clear selection")),
-      sumLine,
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "2 · Choose parts"),
+      h("div", { class: "row tight", role: "group", "aria-label": "method" }, ...methodBtns.map(([, b]) => b)),
+      numPanel, rulesPanel, quotaPanel,
+      h("div", { class: "row tight", style: { flexWrap: "wrap" }, role: "radiogroup", "aria-label": "operation" }, h("span", { class: "muted small" }, "Then:"), ...opRadios, applyBtn),
+      preview, say),
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "3 · Review parts"),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, search, showSel, bulkBtn, listCount),
       h("div", { class: "tbl-wrap trim-list" }, h("table", {},
-        h("thead", {}, h("tr", {}, ...["#", "Part ID", "Part text", "Wafer", "X", "Y", "Site", "HBin", "SBin", "Result", "First fail", ...(est ? ["Touchdown", "Loop"] : [])].map((c, k) => h("th", { class: (k >= 4 && k <= 8) || c === "Touchdown" || c === "Loop" ? "num" : "" }, c)))),
+        h("thead", {}, h("tr", {}, ...["", "#", "Part ID", "Part text", "Wafer", "X", "Y", "Site", "HBin", "SBin", "Result", "First fail", ...(est ? ["Touchdown", "Loop"] : [])].map((c, k) => h("th", { class: (k >= 5 && k <= 9) || c === "Touchdown" || c === "Loop" ? "num" : "", "aria-label": c === "" ? "select" : null }, c)))),
         listBody)),
       h("div", { class: "row tight" }, prev, pageLbl, next),
-      h("p", { class: "muted small" }, "Click a part to select only it. Ctrl+click adds or removes one part, Shift+click selects the range from the last part clicked. All parts of the file are listed; the filter at the top does not apply here.")),
-    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "3 · What to write"),
+      h("p", { class: "muted small" }, "Click a part to select only it. Ctrl+click adds or removes one part, Shift+click selects the range from the last part clicked. The box on each row selects it from the keyboard too. The search only finds parts; it does not change the selection.")),
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "4 · Output and save"),
       h("div", { class: "row tight", style: { flexWrap: "wrap" } }, field("Selected parts", actionSel), field("Part IDs", idSel)),
-      writeLine, idLine),
-    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "4 · Save"),
+      writeLine, idLine,
       h("p", { class: "muted" }, "Records are copied byte-for-byte; the bin and pass/fail summaries are rebuilt for the parts written. Test synopsis (TSR) records are not written, as in Merge, split & export."),
-      h("div", { class: "row" }, pathF, saveBtn), out));
+      h("div", { class: "row" }, pathF, saveBtnGroup), out));
+  if (!st.sites.size) say.textContent = "No site is included: tick sites in the yield table.";
+  schedule(0);
   paint();
 }
 
@@ -3497,11 +3624,11 @@ function viewExport(el) {
   const exOut = h("div");
   el.append(h("div", { class: "card pad section" }, h("h2", {}, "Extract selected parts to a new STDF"),
     h("p", { class: "muted" }, S.filter ? `Parts matching: ${S.filter}` : "Set a part filter at the top first (e.g. part_id in (12, 57) or hbin = 5)."),
-    h("div", { class: "row" }, exField, h("button", { class: "primary", disabled: !S.filter, onclick: async () => {
+    h("div", { class: "row" }, exField, (() => { const b = saveSplit("Extract", async (open) => {
       if (!exPath.value) return toast("Choose where to save the file", "bad");
       busy("Writing STDF…");
-      try { const r = await api("export_stdf", P({ path: exPath.value })); exOut.replaceChildren(resultLine(`Wrote ${r.parts} parts to ${r.path}`, r.path)); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
-    } }, "Extract")), exOut));
+      try { const r = await api("export_stdf", P({ path: exPath.value })); exOut.replaceChildren(resultLine(`Wrote ${r.parts} parts to ${r.path}`, r.path)); if (open) loadPaths([r.path]); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+    }); b.querySelectorAll("button").forEach((x) => (x.disabled = !S.filter)); return b; })()), exOut));
 
   // split
   const by = select([["hbin", "hard bin"], ["sbin", "soft bin"], ["site", "site"], ["head", "head"], ["wafer", "wafer"], ["pass", "pass / fail"], ["part_id", "part ID (one file per part)"], ["part_txt", "part text (one file per PART_TXT)"], ["xy", "die X,Y (one file per die)"], ["test", "PTR result (one file per value of a test)…"], ["list", "a list of parts I paste…"], ["groups", "my own groups (filters)…"]], "hbin", () => renderGroups());

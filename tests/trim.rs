@@ -283,3 +283,69 @@ fn the_api_lists_selects_and_saves() {
     )
     .is_err());
 }
+
+#[test]
+fn quota_spreads_good_parts_and_names_the_short_sites() {
+    isolate();
+    let d = tempfile::tempdir().unwrap();
+    let p = d.path().join("quota.stdf");
+    stdf_cypher::sample::touchdown_file(
+        &p,
+        &stdf_cypher::sample::TouchSpec {
+            touchdowns: 30,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let reg = api::Registry::app();
+    api::run(&reg, "load", &json!({ "paths": [p.to_string_lossy()] })).unwrap();
+    let list = api::run(&reg, "trim_list", &json!({ "ds": 0 })).unwrap();
+    let all = list["rows"].as_array().unwrap();
+    let rows: Vec<usize> = all
+        .iter()
+        .map(|r| r[0].as_u64().unwrap() as usize)
+        .collect();
+    let good_total = all.iter().filter(|r| r[9] == json!(true)).count();
+
+    // 25 good parts from the sites: every one is good, and the target is met
+    let q = api::run(
+        &reg,
+        "trim_quota",
+        &json!({ "ds": 0, "target": 25, "candidates": rows, "result": "good" }),
+    )
+    .unwrap();
+    assert_eq!(q["taken"], 25);
+    assert_eq!(q["shortfall"], 0);
+    for r in q["rows"].as_array().unwrap() {
+        assert_eq!(all[r.as_u64().unwrap() as usize][9], json!(true));
+    }
+
+    // 200 good parts: the weak site 3 has fewer than its share of 25 and is named
+    let big = api::run(
+        &reg,
+        "trim_quota",
+        &json!({ "ds": 0, "target": 200, "candidates": rows, "result": "good" }),
+    )
+    .unwrap();
+    assert_eq!(big["taken"], good_total.min(200));
+    assert!(big["short"].as_array().unwrap().contains(&json!(3)));
+
+    // dropping site 3: none of its parts are taken, and it is not named again
+    let dropped = api::run(
+        &reg,
+        "trim_quota",
+        &json!({ "ds": 0, "target": 200, "candidates": rows, "result": "good", "drop": [3] }),
+    )
+    .unwrap();
+    assert!(dropped["per_site"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["site"] != json!(3)));
+    assert!(dropped["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| all[r.as_u64().unwrap() as usize][6] != json!(3)));
+    assert!(!dropped["short"].as_array().unwrap().contains(&json!(3)));
+}
