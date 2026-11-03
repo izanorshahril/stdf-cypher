@@ -194,35 +194,6 @@ fn pick(rows: &mut BTreeSet<usize>, out: &mut Resolved, label: String, found: Op
     }
 }
 
-/// Spread `target` over sites that have `avail` parts each: every site takes the same
-/// number (the first sites in file order take one more when it does not divide), a
-/// site with fewer than that takes all it has, and the rest is shared out. The total
-/// is `target`, or all the parts when there are not enough.
-pub fn spread(avail: &[usize], target: usize) -> Vec<usize> {
-    let mut take = vec![0usize; avail.len()];
-    let total: usize = avail.iter().sum();
-    let mut remaining = target.min(total);
-    let mut order: Vec<usize> = (0..avail.len()).collect();
-    order.sort_by_key(|&i| avail[i]);
-    let k = order.len();
-    for (pos, &i) in order.iter().enumerate() {
-        let left = k - pos;
-        let fair = remaining / left;
-        if avail[i] <= fair {
-            take[i] = avail[i];
-            remaining -= avail[i];
-        } else {
-            // this site and the ones after it all have more than the fair share
-            let extra = remaining - fair * left;
-            for (j, &s) in order[pos..].iter().enumerate() {
-                take[s] = fair + usize::from(j < extra);
-            }
-            break;
-        }
-    }
-    take
-}
-
 /// The rows to write: the picked rows, or every other row of the `n` parts.
 pub fn rows_to_keep(n: usize, picked: &[usize], action: Action) -> Vec<usize> {
     let set: BTreeSet<usize> = picked.iter().copied().filter(|&r| r < n).collect();
@@ -393,18 +364,5 @@ mod tests {
         assert_eq!(rows_to_keep(5, &[1, 3], Action::Remove), vec![0, 2, 4]);
         assert_eq!(Action::parse("remove").unwrap(), Action::Remove);
         assert!(Action::parse("both").is_err());
-    }
-
-    #[test]
-    fn spread_shares_the_target_and_caps_short_sites() {
-        // the four sites of the example: 25 good parts is 6 or 7 from each
-        assert_eq!(spread(&[28, 29, 29, 30], 25), vec![7, 6, 6, 6]);
-        assert_eq!(spread(&[28, 29, 29, 30], 25).iter().sum::<usize>(), 25);
-        // a short site gives all it has, the others share the rest
-        assert_eq!(spread(&[5, 30, 30, 30], 60), vec![5, 19, 18, 18]);
-        // not enough parts: all of them
-        assert_eq!(spread(&[3, 3], 10), vec![3, 3]);
-        assert_eq!(spread(&[10, 10, 10], 0), vec![0, 0, 0]);
-        assert!(spread(&[], 5).is_empty());
     }
 }

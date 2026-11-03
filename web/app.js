@@ -3270,7 +3270,7 @@ function drawTrim(body, ds, data, yields, est) {
         plan = null;
       } else {
         const target = Number(st.quota);
-        if (!(target > 0)) { cand = []; plan = null; preview.textContent = "Enter how many good parts to keep."; }
+        if (!(target > 0)) { cand = []; plan = null; preview.textContent = "Enter how many good parts per site."; }
         else {
           const fs = await filterSet(st.filter);
           if (my !== seq) return;
@@ -3279,11 +3279,11 @@ function drawTrim(body, ds, data, yields, est) {
           if (my !== seq) return;
           plan = q;
           cand = q.rows;
-          preview.textContent = `${q.taken.toLocaleString()} good part(s) over ${q.per_site.length} site(s)` + (q.shortfall ? `; only ${q.available.toLocaleString()} good part(s) match, ${q.shortfall.toLocaleString()} short of ${target.toLocaleString()}` : "");
+          preview.textContent = `${q.taken.toLocaleString()} good part(s): ${target.toLocaleString()} from each of ${q.per_site.length} site(s)` + (q.shortfall ? `; ${q.shortfall.toLocaleString()} short, where a site has fewer than ${target.toLocaleString()}` : "");
           // a site short of its share: ask whether to drop it, unless the user already answered for this setting
           if (q.short.length && st.quotaDecided !== quotaKey()) {
             const names = q.short.map((s) => `site ${s}`).join(", ");
-            shortBox.replaceChildren(h("p", {}, `${names} ${q.short.length > 1 ? "have" : "has"} fewer good parts than the fair share of ${q.share} (${target.toLocaleString()} parts over ${q.per_site.length} sites). Drop ${q.short.length > 1 ? "them" : "it"} from this quota pick?`),
+            shortBox.replaceChildren(h("p", {}, `${names} ${q.short.length > 1 ? "have" : "has"} fewer than ${target.toLocaleString()} good parts, the number wanted from each site. Drop ${q.short.length > 1 ? "them" : "it"} from this quota pick? Keeping ${q.short.length > 1 ? "them" : "it"} takes all the good parts ${q.short.length > 1 ? "they have" : "it has"}.`),
               h("div", { class: "row tight" },
                 h("button", { class: "primary", onclick: () => { for (const s of q.short) st.sites.delete(s); st.quotaDecided = ""; syncSites(); schedule(0); } }, `Yes, drop ${names}`),
                 h("button", { onclick: () => { st.quotaDecided = quotaKey(); schedule(0); } }, `No, keep ${names}`)));
@@ -3362,8 +3362,8 @@ function drawTrim(body, ds, data, yields, est) {
   const quotaIn = h("input", { type: "number", min: "1", value: st.quota, placeholder: "e.g. 25", style: { width: "100px" }, oninput: (e) => { st.quota = e.target.value; st.quotaDecided = ""; schedule(250); }, onkeydown: (e) => { if (e.key === "Enter") { e.preventDefault(); applyNow(); } } });
   const shortBox = h("div", { class: "quota-ask card pad", hidden: true, role: "alertdialog", "aria-label": "Sites short of their share" });
   const quotaTable = h("div", {});
-  const quotaPanel = h("fieldset", { class: "trim-panel" }, h("legend", {}, "Quota"), field("Good parts to keep", quotaIn),
-    h("p", { class: "muted small" }, "Good parts of the rules (filter, sites, touchdown), spread evenly over the sites and taken in file order. A site with fewer than its share gives all it has."),
+  const quotaPanel = h("fieldset", { class: "trim-panel" }, h("legend", {}, "Quota"), field("Good parts per site", quotaIn),
+    h("p", { class: "muted small" }, "This many good parts from every site ticked in the yield table, taken in file order and within the filter and touchdown rules. A site with fewer good parts gives all it has."),
     shortBox, quotaTable);
   // the operation, then apply
   const opRadios = [["replace", "Replace selection"], ["add", "Add to selection"], ["take", "Take out of selection"]].map(([k, label]) =>

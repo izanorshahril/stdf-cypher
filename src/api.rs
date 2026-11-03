@@ -749,34 +749,26 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             }
             let sites: Vec<u8> = by.keys().copied().collect();
             let avail: Vec<usize> = sites.iter().map(|s| by[s].len()).collect();
-            let take = crate::trim::spread(&avail, target);
             let mut rows = vec![];
             let mut per_site = vec![];
-            for (k, s) in sites.iter().enumerate() {
-                rows.extend(by[s].iter().take(take[k]).copied());
-                per_site.push(json!({"site": s, "available": avail[k], "take": take[k]}));
-            }
-            rows.sort_unstable();
-            let taken: usize = take.iter().sum();
-            // a site short of its fair share is offered for dropping (two or more sites only)
-            let share = if sites.len() >= 2 {
-                target / sites.len()
-            } else {
-                0
-            };
             let mut short = vec![];
             for (k, s) in sites.iter().enumerate() {
-                if share > 0 && avail[k] < share {
+                // every site gives `target` parts, or all it has when it has fewer
+                let take = avail[k].min(target);
+                rows.extend(by[s].iter().take(take).copied());
+                per_site.push(json!({"site": s, "available": avail[k], "take": take}));
+                if avail[k] < target {
                     short.push(*s);
                 }
             }
+            rows.sort_unstable();
+            let taken = rows.len();
             Ok(json!({
                 "rows": rows,
                 "target": target,
                 "taken": taken,
                 "available": avail.iter().sum::<usize>(),
-                "shortfall": target.saturating_sub(taken),
-                "share": share,
+                "shortfall": avail.iter().map(|a| target.saturating_sub(*a)).sum::<usize>(),
                 "short": short,
                 "per_site": per_site,
             }))

@@ -285,7 +285,7 @@ fn the_api_lists_selects_and_saves() {
 }
 
 #[test]
-fn quota_spreads_good_parts_and_names_the_short_sites() {
+fn quota_takes_the_target_from_each_site_and_names_the_short_ones() {
     isolate();
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("quota.stdf");
@@ -305,36 +305,66 @@ fn quota_spreads_good_parts_and_names_the_short_sites() {
         .iter()
         .map(|r| r[0].as_u64().unwrap() as usize)
         .collect();
-    let good_total = all.iter().filter(|r| r[9] == json!(true)).count();
 
-    // 25 good parts from the sites: every one is good, and the target is met
+    // 25 good parts from every site: a site with fewer takes all it has
     let q = api::run(
         &reg,
         "trim_quota",
         &json!({ "ds": 0, "target": 25, "candidates": rows, "result": "good" }),
     )
     .unwrap();
-    assert_eq!(q["taken"], 25);
-    assert_eq!(q["shortfall"], 0);
+    let mut expect = 0u64;
+    for s in q["per_site"].as_array().unwrap() {
+        let (avail, take) = (
+            s["available"].as_u64().unwrap(),
+            s["take"].as_u64().unwrap(),
+        );
+        assert_eq!(take, avail.min(25), "site {}", s["site"]);
+        expect += take;
+    }
+    assert_eq!(q["taken"], expect);
+    // the sites with fewer than 25 good parts are short; the shortfall is what they miss
+    let short: Vec<u64> = q["per_site"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["available"].as_u64().unwrap() < 25)
+        .map(|s| s["site"].as_u64().unwrap())
+        .collect();
+    assert_eq!(
+        q["short"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect::<Vec<_>>(),
+        short
+    );
+    let missing: u64 = q["per_site"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| 25u64.saturating_sub(s["available"].as_u64().unwrap()))
+        .sum();
+    assert_eq!(q["shortfall"], missing);
+    assert!(!short.is_empty(), "the weak site is short of 25");
+    let weak = q["per_site"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["site"] == json!(3))
+        .unwrap()["available"]
+        .as_u64()
+        .unwrap();
     for r in q["rows"].as_array().unwrap() {
         assert_eq!(all[r.as_u64().unwrap() as usize][9], json!(true));
     }
 
-    // 200 good parts: the weak site 3 has fewer than its share of 25 and is named
-    let big = api::run(
-        &reg,
-        "trim_quota",
-        &json!({ "ds": 0, "target": 200, "candidates": rows, "result": "good" }),
-    )
-    .unwrap();
-    assert_eq!(big["taken"], good_total.min(200));
-    assert!(big["short"].as_array().unwrap().contains(&json!(3)));
-
-    // dropping site 3: none of its parts are taken, and it is not named again
+    // dropping site 3: the other sites still give 25 each, and site 3 is not taken
     let dropped = api::run(
         &reg,
         "trim_quota",
-        &json!({ "ds": 0, "target": 200, "candidates": rows, "result": "good", "drop": [3] }),
+        &json!({ "ds": 0, "target": 25, "candidates": rows, "result": "good", "drop": [3] }),
     )
     .unwrap();
     assert!(dropped["per_site"]
@@ -342,10 +372,10 @@ fn quota_spreads_good_parts_and_names_the_short_sites() {
         .unwrap()
         .iter()
         .all(|s| s["site"] != json!(3)));
+    assert_eq!(dropped["taken"], expect - weak);
     assert!(dropped["rows"]
         .as_array()
         .unwrap()
         .iter()
         .all(|r| all[r.as_u64().unwrap() as usize][6] != json!(3)));
-    assert!(!dropped["short"].as_array().unwrap().contains(&json!(3)));
 }
