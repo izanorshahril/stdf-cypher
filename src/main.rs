@@ -5,7 +5,7 @@ use std::sync::Arc;
 use stdf_cypher::analysis::{anomaly, anova, compare, correlation, summary};
 use stdf_cypher::data::{self, loader::DedupMode, Dataset, Filter, LoadOptions};
 use stdf_cypher::stdf::{record_code, StdfReader};
-use stdf_cypher::{api, ml, report, sample, server, split, xlsx};
+use stdf_cypher::{api, ml, report, sample, server, split, trim, xlsx};
 
 #[derive(Parser)]
 #[command(
@@ -123,6 +123,26 @@ enum Cmd {
         out_dir: PathBuf,
         #[arg(long)]
         prefix: Option<String>,
+        #[command(flatten)]
+        l: LoadArgs,
+    },
+    /// Keep or remove parts by part ID or row, optionally number the rest 1…N, and write a new STDF file
+    Trim {
+        file: PathBuf,
+        /// parts to keep: part IDs, numbers and ranges, e.g. 1-3,5,2000-2012
+        #[arg(long, conflicts_with = "remove")]
+        keep: Option<String>,
+        /// parts to remove, same syntax as --keep
+        #[arg(long)]
+        remove: Option<String>,
+        /// read the numbers as part IDs (id) or as rows counted from 1 in file order (row)
+        #[arg(long, default_value = "id", value_parser = ["id", "row"])]
+        by: String,
+        /// number the parts that stay 1, 2, 3… (otherwise they keep their part IDs)
+        #[arg(long)]
+        renumber: bool,
+        #[arg(short, long)]
+        out: PathBuf,
         #[command(flatten)]
         l: LoadArgs,
     },
@@ -851,6 +871,56 @@ fn run() -> Result<()> {
             };
             let res = split::split_file(&file, &ds, &sb, &out_dir, prefix.as_deref())?;
             print_split(&res);
+        }
+        Cmd::Trim {
+            file,
+            keep,
+            remove,
+            by,
+            renumber,
+            out,
+            l,
+        } => {
+            let (text, action) = match (keep, remove) {
+                (Some(t), None) => (t, trim::Action::Keep),
+                (None, Some(t)) => (t, trim::Action::Remove),
+                _ => bail!("give --keep or --remove with part IDs or numbers (-f adds the parts a filter matches)"),
+            };
+            // the dataset must hold every part of the file: no de-duplication
+            let ds = load(
+                std::slice::from_ref(&file),
+                &LoadArgs {
+                    dedup: None,
+                    ..l.clone()
+                },
+            )?;
+            let mut picked = if text.trim().is_empty() {
+                trim::Resolved::default()
+            } else {
+                trim::resolve(&ds, trim::By::parse(&by)?, &text)?
+            };
+            if !l.filter.trim().is_empty() {
+                picked
+                    .rows
+                    .extend(Filter::parse(&l.filter, &ds)?.select_all(&ds));
+                picked.rows.sort_unstable();
+                picked.rows.dedup();
+            }
+            if !picked.missing.is_empty() {
+                eprintln!("not in the file: {}", picked.missing.join(", "));
+            }
+            if !picked.shared.is_empty() {
+                eprintln!(
+                    "part IDs on more than one part (all picked): {}",
+                    picked.shared.join(", ")
+                );
+            }
+            let keep_rows = trim::rows_to_keep(ds.n_parts(), &picked.rows, action);
+            let res = trim::write(&file, &ds, &keep_rows, renumber, &out)?;
+            println!(
+                "wrote {} parts ({} good), removed {}, IDs {}…{} -> {}",
+                res.kept, res.good, res.removed, res.first_id, res.last_id, res.path
+            );
         }
         Cmd::Extract { file, out, l } => {
             if l.filter.trim().is_empty() {

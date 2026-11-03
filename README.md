@@ -37,6 +37,7 @@ stdf-cypher split lot1.stdf --by hbin -o out/
 * **Themes:** pick a colour theme at the top (or on Settings): Default, Industry (steel blue and charcoal, serif headings), Office (navy, sky blue and yellow) or Work (burgundy and magenta); ◐ switches light and dark for each.
 * **Merge:** open files of the same lot and test step (MIR lot, test code and flow) are offered for merging on *Match, merge & trace* and *Merge, split & export*, with any parts they share (by wafer + X/Y, else part text) reported but not blocking. Set the file order with ↑ ↓, optionally renumber part IDs so each file continues from the previous file's last ID, then combine them into one dataset or save one merged STDF (first file's header, every file's wafers and parts, bin and part counts recounted).
 * **Split & export:** save an offline HTML report, export a CSV, extract the filtered parts to a new STDF, or split a file by bin, site, wafer, part ID or your own groups. Output paths default to the folder of the source file.
+* **Edit & trim:** keep or remove chosen parts of one file and save the result as a new STDF; the source file is never changed. See the feature table and the `trim` command.
 * **Quit:** close the window. The app exits by itself a few seconds later.
 * **Settings and recent files** live in `%APPDATA%\stdf-cypher`. Temporary copies of dragged-in files and the sample data live in `%LOCALAPPDATA%\stdf-cypher`.
 
@@ -52,6 +53,7 @@ When double-clicked, Windows briefly shows a console window before the app hides
 | **PRR / parts** | Part table with part ID, head, site, X/Y, hard/soft bin, pass/fail flags, test time, wafer and first failing test. Retests can be deduplicated (`--dedup first\|last`). |
 | **Filter language** | One expression syntax works everywhere: `site in (1,2) and hbin != 5`, `t[1000] > 0.35`, `wafer ~ "W0[1-3]"`, `part_id in @ids.txt`. |
 | **Split / extract** | Split by any part field (part_id, hbin, sbin, site, head, pass, wafer, xy) or by named filter groups. Records are copied **byte-for-byte**. Limits are re-attached when the limit-carrying first PTR/MPR went to another output, and HBR/SBR/PCR/WRR summaries are regenerated so counts match each output. |
+| **Edit & trim** | Keep or remove parts by part ID or by row, with ranges and lists (`1-3,5,2000-2012`), by a filter, or any mix. In the dashboard, click, Ctrl+click and Shift+click pick parts from the list. Part IDs are kept as they are, or backfilled to run 1…N. Written byte-for-byte to a new file (`.stdf` or `.stdf.gz`). A part cut off before its PRR is kept when it is selected. |
 | **Compare A vs B** | Every test gets: mean/median shift in σ and in % of limit range, σ ratio, Welch t-test, Kolmogorov–Smirnov, Benjamini–Hochberg q-values, and a SHIFT/SPREAD flag. You also get bin and site-yield deltas. Works file-vs-file or **group vs rest within one file**. |
 | **Correlation** | **Unit correlation:** the same parts on two testers (or a retest) are matched by part ID or wafer+X/Y, and each test is classified CORRELATED / OFFSET / UNCORRELATED. A bin-agreement matrix is included. **Test-to-test:** Pearson/Spearman matrix with the strongest pairs. **Target:** tests ranked by correlation with fail or with another test. |
 | **ANOVA** | One-way ANOVA (F, p, η²), Kruskal–Wallis and Brown–Forsythe/Levene for every test, against site, head, wafer, file/lot, bin, X, Y… BH-corrected. |
@@ -100,6 +102,7 @@ Tabular commands print the top rows; add `-o file.csv` for the full table.
 | `export FILES… -o out.csv [--tests 1000,1010]` | Parts × tests matrix |
 | `split FILE --by FIELD \| -g NAME=EXPR… [--rest NAME] -o DIR` | Split into STDF files |
 | `extract FILE -f EXPR -o out.stdf` | Write matching parts to a new STDF |
+| `trim FILE (--keep SPEC \| --remove SPEC) [--by id\|row] [--renumber] [-f EXPR] -o out.stdf` | Keep or remove parts by part ID or row (SPEC: `1-3,5,2000-2012`); `-f` adds the parts a filter matches; `--renumber` backfills the IDs 1…N |
 | `compare A B [--filter-a] [--filter-b] [--match-by key\|num\|name] [--html r.html]` | Lot/file comparison |
 | `group FILES… -s EXPR [--vs EXPR]` | Group of parts vs the rest |
 | `correlate FILE --with FILE2` | Unit (tester-to-tester) correlation |
@@ -122,6 +125,9 @@ stdf-cypher split ft.stdf --by part_id -f "part_id in (1..100)" -o parts/
 
 # named groups (first match wins); everything else goes to "other"
 stdf-cypher split lot.stdf -g "site12=site in (1,2)" -g "fails=not pass" --rest other -o out/
+
+# keep parts 1-3, 5 and 2000-2012 by part ID; number the kept parts 1…N
+stdf-cypher trim lot.stdf --keep 1-3,5,2000-2012 --renumber -o lot_trim.stdf
 
 # pull the golden units listed in a text file
 stdf-cypher extract lot.stdf -f "part_id in @golden_ids.txt" -o golden.stdf
@@ -182,6 +188,7 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
 * **Machine learning**: random-forest drivers, PCA + clustering
 * **Records**: the part table (PRR, with part text and alarms) with per-part test drill-down and the part's raw PIR…PRR records; a **record viewer** for every record type in the file (paged, PTR/MPR/FTR/TSR filterable by test number)
 * **Merge, split & export**: merge pieces of one lot into one STDF, HTML report, CSV, extract selection to STDF, split by a PRR field (incl. part text), by the value of a PTR test (one file per value), by a pasted list of parts, or by custom groups (part sets such as `$match` work here)
+* **Edit & trim**: every part of the file is listed. Pick parts by click, Ctrl+click or Shift+click, by typed IDs or row numbers (`1-3,5,2000-2012`), or by a filter; keep or remove them; choose whether the part IDs stay or are backfilled 1…N; then save a new STDF. The view shows how many parts will be written, how many are good and where the IDs will run
 
 ## Design notes
 
@@ -190,7 +197,7 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
 * **Limits:** taken from the first PTR/MPR that carries them, honouring OPT_FLAG (bits 4–7 invalid/no limit, bits 2–3 spec). A PTR whose own limits differ from the test's keeps them per part, and the trend draws them as per-part limit lines.
 * **Datalog:** GDR and DTR records are kept in file order with the part they follow, and listed in the Overview.
 * **Pass/fail:** from PRR PART_FLG. A per-test fail comes from TEST_FLG bit 7 or is out of limits.
-* **Splitting** is a two-pass process. First the dataset is loaded, so a filter can use test values. Then raw records are streamed and each PIR…PRR block is copied unchanged. TSR records are dropped from split outputs because they can't be recomputed exactly.
+* **Splitting** is a two-pass process. First the dataset is loaded, so a filter can use test values. Then raw records are streamed and each PIR…PRR block is copied unchanged. TSR records are dropped from split and trim outputs because they can't be recomputed exactly. Records between two parts (datalog) follow the last part before them, so they are dropped with a dropped part. A part cut off before its PRR is copied as it is, without bin or verdict.
 * **Parallel reading:** a chunk of records is built from an empty state. Where it needs the state before it (a test named by an earlier chunk, a per-part limit, a multi-pin record, a TSR), it is read again on one thread, and a window that mostly needs this stops the parallel reading for the rest of the file.
 * **Statistics** are validated against SciPy: Welch t, Mann–Whitney, KS, Pearson/Spearman, one-way ANOVA, Kruskal–Wallis, Levene.
 
@@ -202,6 +209,7 @@ src/data/        Dataset model, loader, filter language, part matching (match/tr
 src/analysis/    stats, summary, compare, correlation, anova, anomaly
 src/ml/          feature matrix, PCA, k-means, random forest, isolation forest
 src/split.rs     raw pass-through splitter
+src/trim.rs      edit & trim: part selection by ID or row, keep or remove, backfilled IDs
 src/xlsx.rs      Excel workbook export (one sheet per record kind, no spreadsheet crate)
 src/viz.rs       Plotly figure builders (theme-token colours)
 src/api.rs       JSON operations used by the dashboard

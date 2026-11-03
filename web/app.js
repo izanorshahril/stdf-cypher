@@ -329,6 +329,7 @@ const VIEWS = {
   ml: { label: "Machine learning", fn: viewML },
   records: { label: "Records", fn: viewRecords },
   datalog: { label: "Part datalog", fn: viewDatalog },
+  trim: { label: "Edit & trim", fn: viewTrim },
   export: { label: "Merge, split & export", fn: viewExport },
   settings: { label: "Settings", fn: viewSettings, always: true },
 };
@@ -1167,6 +1168,7 @@ async function partRaw(el, ds, index) {
 async function recParts(el) {
   el.append(h("div", { class: "controls" },
     h("button", { onclick: () => { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(scoped(S.filter))}&t=${encodeURIComponent(window.STDF_TOKEN)}`; } }, "Download CSV (all tests)"),
+    h("button", { onclick: () => go("trim") }, "Edit & trim…"),
     h("button", { onclick: () => go("export") }, "Split, extract or save report…")));
   const out = h("div");
   el.append(out);
@@ -3168,6 +3170,159 @@ function viewDatalog(el) {
   drawList();
   drawTests();
 }
+// ---- Edit & trim: pick parts by ID or row, keep or remove them, number the rest, save a new STDF
+const TRIM_PAGE = 200;
+function viewTrim(el) {
+  const ds = S.datasets.find((d) => d.id === S.ds);
+  el.append(h("h1", {}, "Edit & trim"), h("p", { class: "lead" }, `Choose the parts of ${ds ? ds.name : "the dataset"} to keep or remove, number the parts that stay if you like, and save a new STDF file. The file you opened is not changed.`));
+  if (!ds) { el.append(h("p", { class: "muted" }, "Open an STDF file first.")); return; }
+  if (!S.trim || S.trim.ds !== S.ds) S.trim = { ds: S.ds, sel: new Set(), anchor: null, page: 0, q: "", show: "all", action: "keep", renumber: false, by: "id", text: "", filter: "" };
+  const body = h("div");
+  el.append(body);
+  loading(body, "Reading the parts…");
+  api("trim_list", { ds: S.ds }).then((data) => drawTrim(body, ds, data)).catch((e) => showErr(body, e));
+}
+function drawTrim(body, ds, data) {
+  body.replaceChildren();
+  if (!data.editable) { body.append(h("div", { class: "card pad" }, "Trimming works on a dataset opened from one STDF file. This dataset was combined or made in the app: open its file on its own to trim it.")); return; }
+  const st = S.trim, sel = st.sel, rows = data.rows, n = rows.length;
+  // row: [index, part ID, part text, wafer, X, Y, site, hbin, sbin, pass, cut off, first fail]
+  const hay = rows.map((r) => `${r[1]} ${r[2]} ${r[3]} ${r[4] ?? ""} ${r[5] ?? ""}`.toLowerCase());
+  const msg = h("div", { class: "muted small" });
+  const listBody = h("tbody");
+  const pageLbl = h("span", { class: "muted small" });
+  const sumLine = h("div", { class: "row tight", style: { flexWrap: "wrap" } });
+  const writeLine = h("div", { class: "muted" });
+  const idLine = h("div", { class: "muted small" });
+  const out = h("div");
+  const shown = () => {
+    const q = st.q.trim().toLowerCase(), list = [];
+    for (let i = 0; i < n; i++) {
+      if (st.show === "selected" && !sel.has(i)) continue;
+      if (st.show === "not" && sel.has(i)) continue;
+      if (q && !hay[i].includes(q)) continue;
+      list.push(i);
+    }
+    return list;
+  };
+  // the parts that will be written, in file order
+  const written = () => (st.action === "keep" ? [...sel].sort((a, b) => a - b) : rows.map((_, i) => i).filter((i) => !sel.has(i)));
+  const click = (i, list, e) => {
+    const a = st.anchor === null ? -1 : list.indexOf(st.anchor), b = list.indexOf(i);
+    if (e.shiftKey && a >= 0 && b >= 0) {
+      if (!(e.ctrlKey || e.metaKey)) sel.clear();
+      for (let k = Math.min(a, b); k <= Math.max(a, b); k++) sel.add(list[k]);
+    } else if (e.ctrlKey || e.metaKey) {
+      if (sel.has(i)) sel.delete(i); else sel.add(i);
+      st.anchor = i;
+    } else {
+      sel.clear();
+      sel.add(i);
+      st.anchor = i;
+    }
+    paint();
+  };
+  const prev = h("button", { class: "ghost small", onclick: () => { st.page--; paint(); } }, "‹ Previous");
+  const next = h("button", { class: "ghost small", onclick: () => { st.page++; paint(); } }, "Next ›");
+  const paint = () => {
+    const list = shown();
+    const pages = Math.max(1, Math.ceil(list.length / TRIM_PAGE));
+    st.page = Math.max(0, Math.min(st.page, pages - 1));
+    const at = st.page * TRIM_PAGE;
+    listBody.replaceChildren(...list.slice(at, at + TRIM_PAGE).map((i) => {
+      const r = rows[i];
+      return h("tr", { class: sel.has(i) ? "clickable sel" : "clickable", onclick: (e) => click(i, list, e) },
+        h("td", { class: "num" }, i + 1), h("td", {}, r[1]), h("td", {}, r[2]), h("td", {}, r[3]),
+        h("td", { class: "num" }, r[4]), h("td", { class: "num" }, r[5]), h("td", { class: "num" }, r[6]),
+        h("td", { class: "num" }, r[7]), h("td", { class: "num" }, r[8]),
+        h("td", {}, r[10] ? "cut off" : r[9] === null ? "n/a" : r[9] ? "good" : "bad"), h("td", {}, r[11]));
+    }));
+    prev.disabled = st.page === 0;
+    next.disabled = st.page >= pages - 1;
+    pageLbl.textContent = `page ${st.page + 1} of ${pages.toLocaleString()} · ${list.length.toLocaleString()} part(s) listed`;
+    sumLine.replaceChildren(h("b", {}, `${sel.size.toLocaleString()} selected`), h("span", { class: "muted small" }, `of ${n.toLocaleString()} parts`));
+    const w = written(), removed = n - w.length;
+    const good = w.filter((i) => rows[i][9] === true).length, cut = w.filter((i) => rows[i][10]).length;
+    writeLine.textContent = w.length
+      ? `Writes ${w.length.toLocaleString()} part(s) (${good.toLocaleString()} good) and removes ${removed.toLocaleString()}.` + (cut ? ` ${cut} part(s) cut off before their PRR are written without bin or verdict.` : "")
+      : "Nothing would be written: keep at least one part.";
+    const idOf = (i) => rows[i][1] || "–";
+    idLine.textContent = !w.length ? "" : st.renumber
+      ? `Part IDs will run 1 … ${w.length.toLocaleString()}.`
+      : `Part IDs keep their numbers, ${idOf(w[0])} … ${idOf(w[w.length - 1])}${removed ? ", with gaps where parts were removed" : ""}.`;
+    saveBtn.disabled = !w.length;
+  };
+  const runPick = async (params, mode) => {
+    try {
+      const r = await api("trim_resolve", Object.assign({ ds: S.ds }, params));
+      if (mode === "set") sel.clear();
+      for (const i of r.rows) { if (mode === "take") sel.delete(i); else sel.add(i); }
+      st.anchor = null;
+      const bits = [`${r.count.toLocaleString()} part(s) ${mode === "take" ? "taken out" : "picked"}`];
+      if (r.missing.length) bits.push(`not in the file: ${r.missing.join(", ")}`);
+      if (r.shared.length) bits.push(`part IDs on more than one part (all picked): ${r.shared.join(", ")}`);
+      msg.textContent = bits.join(" · ");
+      paint();
+    } catch (e) { toast(e.message, "bad"); }
+  };
+  // 1 · choose parts: numbers, ranges and IDs typed; or a filter; the list below picks by click
+  const numbers = h("input", { type: "text", value: st.text, placeholder: "e.g. 1-3,5,2000-2012", style: { minWidth: "300px" }, oninput: (e) => (st.text = e.target.value),
+    onkeydown: (e) => { if (e.key === "Enter") runPick({ text: numbers.value, by: byEl.value }, "set"); } });
+  const byEl = select([["id", "part IDs"], ["row", "row numbers (1 = first part)"]], st.by, (v) => (st.by = v));
+  const filterIn = h("input", { type: "text", value: st.filter, placeholder: "or a filter, e.g. hbin = 1 and not pass", style: { minWidth: "300px" }, oninput: (e) => (st.filter = e.target.value) });
+  // 2 · the list: click, Ctrl+click, Shift+click
+  const search = h("input", { type: "text", value: st.q, placeholder: "search ID, text, wafer, X/Y", style: { minWidth: "240px" }, oninput: (e) => { st.q = e.target.value; st.page = 0; paint(); } });
+  const showSel = select([["all", "all parts"], ["selected", "selected only"], ["not", "not selected"]], st.show, (v) => { st.show = v; st.page = 0; paint(); });
+  const saveBtn = h("button", { class: "primary", onclick: async () => {
+    if (!pathBox.value) return toast("Choose where to save the trimmed STDF", "bad");
+    busy("Writing trimmed STDF…");
+    try {
+      const r = await api("trim_save", { ds: S.ds, rows: [...sel], action: st.action, renumber: st.renumber, path: pathBox.value });
+      out.replaceChildren(resultLine(`Saved ${r.path}: ${r.kept.toLocaleString()} parts (${r.good.toLocaleString()} good), removed ${r.removed.toLocaleString()}${r.first_id ? `, IDs ${r.first_id} … ${r.last_id}` : ""}`, r.path), h("button", { onclick: () => loadPaths([r.path]) }, "Open it"));
+    } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+  } }, "Save trimmed STDF");
+  // 3 · what to write
+  const actionSel = select([["keep", "keep the selected parts"], ["remove", "remove the selected parts"]], st.action, (v) => { st.action = v; paint(); });
+  const idSel = select([["keep", "keep the part IDs as they are"], ["backfill", "backfill: renumber the parts that stay 1…N"]], st.renumber ? "backfill" : "keep", (v) => { st.renumber = v === "backfill"; paint(); });
+  // 4 · save beside the file it came from
+  const base = ds.name.replace(/\.(stdf|std)(\.gz)?$/i, "").replace(/\.gz$/i, "");
+  const srcDir = ds.paths && ds.paths.length ? dirname(ds.paths[0]) : "";
+  const sep = srcDir.includes("\\") ? "\\" : "/";
+  const [pathBox, pathF] = pathField("save", srcDir ? srcDir + sep + base + "_trim.stdf" : "", { title: "Save trimmed STDF", name: base + "_trim.stdf", ext: "stdf" });
+
+  const pickBtns = [
+    h("button", { class: "primary", onclick: () => runPick({ text: numbers.value, by: byEl.value }, "set") }, "Select these"),
+    h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "add") }, "Add"),
+    h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "take") }, "Take out"),
+  ];
+  body.append(
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "1 · Choose parts"),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, numbers, byEl, ...pickBtns),
+      h("p", { class: "muted small" }, "Numbers and ranges (1-3,5,2000-2012) or part IDs, separated by commas or lines. Select these replaces the selection; Add and Take out change it. Ranges work on part IDs and on row numbers."),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, filterIn,
+        h("button", { onclick: () => runPick({ filter: filterIn.value }, "set") }, "Select matches"),
+        h("button", { onclick: () => runPick({ filter: filterIn.value }, "add") }, "Add matches")),
+      msg),
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "2 · Parts in the file"),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, search, showSel,
+        h("button", { onclick: () => { for (const i of shown()) sel.add(i); paint(); } }, "Select all shown"),
+        h("button", { onclick: () => { rows.forEach((_, i) => { if (sel.has(i)) sel.delete(i); else sel.add(i); }); st.anchor = null; paint(); } }, "Invert selection"),
+        h("button", { onclick: () => { sel.clear(); st.anchor = null; paint(); } }, "Clear selection")),
+      sumLine,
+      h("div", { class: "tbl-wrap trim-list" }, h("table", {},
+        h("thead", {}, h("tr", {}, ...["#", "Part ID", "Part text", "Wafer", "X", "Y", "Site", "HBin", "SBin", "Result", "First fail"].map((c, k) => h("th", { class: k >= 4 && k <= 8 ? "num" : "" }, c)))),
+        listBody)),
+      h("div", { class: "row tight" }, prev, pageLbl, next),
+      h("p", { class: "muted small" }, "Click a part to select only it. Ctrl+click adds or removes one part, Shift+click selects the range from the last part clicked. All parts of the file are listed; the filter at the top does not apply here.")),
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "3 · What to write"),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, field("Selected parts", actionSel), field("Part IDs", idSel)),
+      writeLine, idLine),
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "4 · Save"),
+      h("p", { class: "muted" }, "Records are copied byte-for-byte; the bin and pass/fail summaries are rebuilt for the parts written. Test synopsis (TSR) records are not written, as in Merge, split & export."),
+      h("div", { class: "row" }, pathF, saveBtn), out));
+  paint();
+}
+
 // ---- Settings: defaults used across the views, kept in this browser profile
 function viewSettings(el) {
   el.append(h("h1", {}, "Settings"), h("p", { class: "lead" }, "Defaults used across the views, saved on this PC. A view's own fields still override them for that analysis."));

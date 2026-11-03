@@ -636,6 +636,87 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             )?;
             Ok(json!({"outputs": res, "out_dir": out_dir}))
         }
+        "trim_list" => {
+            // every part as one compact row for the Edit & trim view: index, part ID, part text,
+            // wafer, X, Y, site, hard bin, soft bin, pass (null = none), cut off, first fail
+            let id = pp.usize("ds", 0);
+            let (ds, paths) = reg.get(id)?;
+            let coord = |v: i16| if v == -32768 { Value::Null } else { json!(v) };
+            let rows: Vec<Value> = ds
+                .parts
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    json!([
+                        i,
+                        p.part_id,
+                        p.part_txt,
+                        ds.wafer_name(p),
+                        coord(p.x),
+                        coord(p.y),
+                        p.site,
+                        p.hbin,
+                        p.sbin,
+                        p.passed,
+                        p.partial,
+                        p.first_fail
+                            .map(|f| ds.tests[f as usize].key.clone())
+                            .unwrap_or_default()
+                    ])
+                })
+                .collect();
+            Ok(json!({
+                "n": ds.n_parts(),
+                "partial": ds.parts.iter().filter(|p| p.partial).count(),
+                "editable": paths.len() == 1 && ds.sources.len() == 1,
+                "rows": rows,
+            }))
+        }
+        "trim_resolve" => {
+            // the parts a selection picks: the numbers or part IDs typed, plus the parts a filter matches
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            let text = pp.str("text");
+            let filter = pp.str("filter");
+            if text.trim().is_empty() && filter.trim().is_empty() {
+                bail!("enter part IDs or numbers, or a filter");
+            }
+            let mut r = if text.trim().is_empty() {
+                crate::trim::Resolved::default()
+            } else {
+                crate::trim::resolve(&ds, crate::trim::By::parse(&pp.str_or("by", "id"))?, &text)?
+            };
+            if !filter.trim().is_empty() {
+                r.rows.extend(reg.rows(id, &ds, &filter)?);
+                r.rows.sort_unstable();
+                r.rows.dedup();
+            }
+            Ok(
+                json!({"rows": r.rows, "count": r.rows.len(), "missing": r.missing, "shared": r.shared, "total": ds.n_parts()}),
+            )
+        }
+        "trim_save" => {
+            // write the picked parts (action keep) or all the others (action remove) to a new STDF file
+            let id = pp.usize("ds", 0);
+            let (ds, paths) = reg.get(id)?;
+            if paths.len() != 1 || ds.sources.len() != 1 {
+                bail!("trimming works on datasets opened from a single file");
+            }
+            let out = pp.str("path");
+            if out.is_empty() {
+                bail!("choose where to save the trimmed STDF");
+            }
+            let action = crate::trim::Action::parse(&pp.str_or("action", "keep"))?;
+            let keep = crate::trim::rows_to_keep(ds.n_parts(), &id_list(pp.0.get("rows")), action);
+            let res = crate::trim::write(
+                std::path::Path::new(&paths[0]),
+                &ds,
+                &keep,
+                pp.bool("renumber", false),
+                std::path::Path::new(&out),
+            )?;
+            Ok(json!(res))
+        }
         "save_report" => {
             let id = pp.usize("ds", 0);
             let (ds, _) = reg.get(id)?;

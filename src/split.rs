@@ -7,7 +7,9 @@
 //! (PIR ... PRR) is copied byte-for-byte to its output. Header records are
 //! copied to every output; HBR/SBR/PCR/WRR summaries are regenerated so the
 //! counts match the parts actually written; TSR records are dropped because
-//! they cannot be recomputed exactly.
+//! they cannot be recomputed exactly. Records between two parts (datalog)
+//! follow the part before them, so they are dropped with a dropped part. A
+//! part cut off before its PRR is copied as it is, without bin or verdict.
 
 use crate::data::{Dataset, Filter};
 use crate::stdf::*;
@@ -34,6 +36,16 @@ pub struct SplitOutput {
     pub path: String,
     pub parts: u64,
     pub good: u64,
+}
+
+/// Options for [`split_with_options`].
+#[derive(Debug, Clone, Default)]
+pub struct SplitOptions {
+    /// number the written parts 1, 2, 3… in file order (PRR PART_ID), so the IDs have no gaps
+    pub renumber: bool,
+    /// fail, instead of warning, when the dataset does not match the file's parts
+    /// (e.g. it was loaded de-duplicated)
+    pub strict: bool,
 }
 
 #[derive(Default)]
@@ -102,6 +114,40 @@ fn test_num(p: &[u8], endian: Endian) -> u32 {
         Endian::Little => u32::from_le_bytes(b),
         Endian::Big => u32::from_be_bytes(b),
     }
+}
+
+/// The output called `name`, opened with the header and, when the part sits in a new wafer,
+/// that wafer's WIR.
+fn open_out<'a>(
+    outs: &'a mut HashMap<String, Out>,
+    order: &mut Vec<String>,
+    name: &str,
+    out_dir: &Path,
+    stem: &str,
+    header: &[Vec<u8>],
+    cur_wir: Option<&(usize, Vec<u8>)>,
+) -> &'a mut Out {
+    let o = outs.entry(name.to_string()).or_insert_with(|| {
+        order.push(name.to_string());
+        Out {
+            path: out_dir.join(format!("{}_{}.stdf", stem, sanitize(name))),
+            ..Default::default()
+        }
+    });
+    if !o.started {
+        for r in header {
+            o.buf.extend_from_slice(r);
+        }
+        o.started = true;
+    }
+    if let Some((wi, wir)) = cur_wir {
+        if o.wafer_written != Some(*wi) {
+            o.buf.extend_from_slice(wir);
+            o.wafer_written = Some(*wi);
+            o.wafer_cnt = (0, 0);
+        }
+    }
+    o
 }
 
 fn sanitize(s: &str) -> String {
@@ -196,6 +242,24 @@ pub fn split_with_assignment(
     out_dir: &Path,
     prefix: Option<&str>,
 ) -> Result<Vec<SplitOutput>> {
+    split_with_options(
+        input,
+        ds,
+        assignment,
+        out_dir,
+        prefix,
+        &SplitOptions::default(),
+    )
+}
+
+pub fn split_with_options(
+    input: &Path,
+    ds: &Dataset,
+    assignment: &[Option<String>],
+    out_dir: &Path,
+    prefix: Option<&str>,
+    opts: &SplitOptions,
+) -> Result<Vec<SplitOutput>> {
     std::fs::create_dir_all(out_dir)?;
     let stem = prefix.map(|s| s.to_string()).unwrap_or_else(|| {
         let n = input
@@ -212,12 +276,13 @@ pub fn split_with_assignment(
     let mut outs: HashMap<String, Out> = HashMap::new();
     let mut order: Vec<String> = vec![];
     let mut header: Vec<Vec<u8>> = vec![];
-    let mut seen_part = false;
     let mut blocks: HashMap<(u8, u8), Vec<Vec<u8>>> = HashMap::new();
     let mut cur_wir: Option<(usize, Vec<u8>)> = None;
     let mut wafer_idx = 0usize;
     let mut mrr: Option<Vec<u8>> = None;
     let mut prr_k = 0usize;
+    // the output of the last PRR's part, None when that part was left out
+    let mut last_out: Option<String> = None;
     let mut raw = Vec::with_capacity(1024);
     let mut defaults: HashMap<(u8, u32), Record> = HashMap::new();
 
@@ -250,7 +315,6 @@ pub fn split_with_assignment(
                 cur_wir = None;
             }
             records::code::PIR => {
-                seen_part = true;
                 let hs = (
                     payload.first().copied().unwrap_or(1),
                     payload.get(1).copied().unwrap_or(1),
@@ -258,7 +322,6 @@ pub fn split_with_assignment(
                 blocks.insert(hs, vec![raw.clone()]);
             }
             records::code::PTR | records::code::MPR | records::code::FTR => {
-                seen_part = true;
                 if code != records::code::FTR {
                     let k = (h.sub, test_num(payload, endian));
                     if !defaults.contains_key(&k) && has_opt_section(code, payload, endian) {
@@ -277,7 +340,6 @@ pub fn split_with_assignment(
                 blocks.entry(key).or_default().push(raw.clone());
             }
             records::code::PRR => {
-                seen_part = true;
                 let hs = (
                     payload.first().copied().unwrap_or(1),
                     payload.get(1).copied().unwrap_or(1),
@@ -296,29 +358,29 @@ pub fn split_with_assignment(
                 block.push(raw.clone());
                 let target = assignment.get(prr_k).cloned().flatten();
                 prr_k += 1;
-                let Some(name) = target else { continue };
-                let prr = match Record::parse(h.typ, h.sub, payload, endian) {
+                let Some(name) = target else {
+                    last_out = None;
+                    continue;
+                };
+                last_out = Some(name.clone());
+                let mut prr = match Record::parse(h.typ, h.sub, payload, endian) {
                     Record::PRR(p) => p,
                     _ => unreachable!(),
                 };
-                let o = outs.entry(name.clone()).or_insert_with(|| {
-                    order.push(name.clone());
-                    Out {
-                        path: out_dir.join(format!("{}_{}.stdf", stem, sanitize(&name))),
-                        ..Default::default()
-                    }
-                });
-                if !o.started {
-                    for r in &header {
-                        o.buf.extend_from_slice(r);
-                    }
-                    o.started = true;
-                }
-                if let Some((wi, wir)) = &cur_wir {
-                    if o.wafer_written != Some(*wi) {
-                        o.buf.extend_from_slice(wir);
-                        o.wafer_written = Some(*wi);
-                        o.wafer_cnt = (0, 0);
+                let o = open_out(
+                    &mut outs,
+                    &mut order,
+                    &name,
+                    out_dir,
+                    &stem,
+                    &header,
+                    cur_wir.as_ref(),
+                );
+                if opts.renumber {
+                    // the written parts count 1, 2, 3… in file order
+                    prr.part_id = (o.parts + 1).to_string();
+                    if let Some(last) = block.last_mut() {
+                        *last = Record::PRR(prr.clone()).encode(endian);
                     }
                 }
                 for r in &block {
@@ -400,19 +462,40 @@ pub fn split_with_assignment(
                 o.flush(false)?;
             }
             _ => {
-                if !seen_part {
+                // datalog and other records follow the last PRR before them, as the loader
+                // counts them; before the first PRR they belong to every output's header
+                if prr_k == 0 {
                     header.push(raw.clone());
-                } else if !blocks.is_empty() {
-                    for b in blocks.values_mut() {
-                        b.push(raw.clone());
-                    }
-                } else {
-                    for o in outs.values_mut() {
+                } else if let Some(name) = &last_out {
+                    if let Some(o) = outs.get_mut(name) {
                         o.buf.extend_from_slice(&raw);
                     }
                 }
             }
         }
+    }
+
+    // parts cut off before their PRR come last in the dataset, in (head, site) order
+    let mut cut: Vec<((u8, u8), Vec<Vec<u8>>)> = blocks.into_iter().collect();
+    cut.sort_by_key(|(k, _)| *k);
+    for (j, (_, block)) in cut.iter().enumerate() {
+        let Some(name) = assignment.get(prr_k + j).cloned().flatten() else {
+            continue;
+        };
+        let o = open_out(
+            &mut outs,
+            &mut order,
+            &name,
+            out_dir,
+            &stem,
+            &header,
+            cur_wir.as_ref(),
+        );
+        for r in block {
+            o.buf.extend_from_slice(r);
+        }
+        o.parts += 1;
+        o.flush(false)?;
     }
 
     let mut result = vec![];
@@ -505,7 +588,15 @@ pub fn split_with_assignment(
             good: o.good,
         });
     }
-    if prr_k != assignment.len() {
+    if prr_k + cut.len() != assignment.len() {
+        if opts.strict {
+            bail!(
+                "the dataset has {} parts but the file has {} PRRs and {} parts cut off – was the dataset de-duplicated?",
+                assignment.len(),
+                prr_k,
+                cut.len()
+            );
+        }
         eprintln!(
             "warning: dataset has {} parts but file has {} PRRs – was the dataset de-duplicated?",
             assignment.len(),

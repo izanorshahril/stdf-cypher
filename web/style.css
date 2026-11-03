@@ -334,3 +334,6 @@ input[type=checkbox], input[type=radio], input[type=range] { accent-color: var(-
 .flag-warn { color: var(--warn); font-weight: 600; }
 tr.row-fail td { background: color-mix(in srgb, var(--fail) 9%, transparent); }
 tr.row-warn td { background: color-mix(in srgb, var(--warn) 9%, transparent); }
+/* Edit & trim: the part list is picked by click, so its text is not selected by a drag or shift-click */
+.trim-list tbody tr { user-select: none; }
+.trim-list th, .trim-list td { font-size: 12px; }

@@ -19,5 +19,6 @@ pub mod sample;
 pub mod server;
 pub mod split;
 pub mod stdf;
+pub mod trim;
 pub mod viz;
 pub mod xlsx;
