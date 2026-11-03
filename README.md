@@ -53,7 +53,7 @@ When double-clicked, Windows briefly shows a console window before the app hides
 | **PRR / parts** | Part table with part ID, head, site, X/Y, hard/soft bin, pass/fail flags, test time, wafer and first failing test. Retests can be deduplicated (`--dedup first\|last`). |
 | **Filter language** | One expression syntax works everywhere: `site in (1,2) and hbin != 5`, `t[1000] > 0.35`, `wafer ~ "W0[1-3]"`, `part_id in @ids.txt`. |
 | **Split / extract** | Split by any part field (part_id, hbin, sbin, site, head, pass, wafer, xy) or by named filter groups. Records are copied **byte-for-byte**. Limits are re-attached when the limit-carrying first PTR/MPR went to another output, and HBR/SBR/PCR/WRR summaries are regenerated so counts match each output. |
-| **Edit & trim** | Keep or remove parts by part ID or by row, with ranges and lists (`1-3,5,2000-2012`), by a filter, or any mix. In the dashboard, click, Ctrl+click and Shift+click pick parts from the list. Part IDs are kept as they are, or backfilled to run 1…N. Written byte-for-byte to a new file (`.stdf` or `.stdf.gz`). A part cut off before its PRR is kept when it is selected. |
+| **Edit & trim** | Keep or remove parts by part ID or by row, with ranges and lists (`1-3,5,2000-2012`), by a filter, or any mix. In the dashboard, click, Ctrl+click and Shift+click pick parts from the list. Part IDs are kept as they are, or backfilled to run 1…N. Written byte-for-byte to a new file (`.stdf` or `.stdf.gz`). A part cut off before its PRR is kept when it is selected. The dashboard shows the yield of each site, and selects parts by result (good or bad), by site and, with the experiment on, by touchdown; these combine. |
 | **Compare A vs B** | Every test gets: mean/median shift in σ and in % of limit range, σ ratio, Welch t-test, Kolmogorov–Smirnov, Benjamini–Hochberg q-values, and a SHIFT/SPREAD flag. You also get bin and site-yield deltas. Works file-vs-file or **group vs rest within one file**. |
 | **Correlation** | **Unit correlation:** the same parts on two testers (or a retest) are matched by part ID or wafer+X/Y, and each test is classified CORRELATED / OFFSET / UNCORRELATED. A bin-agreement matrix is included. **Test-to-test:** Pearson/Spearman matrix with the strongest pairs. **Target:** tests ranked by correlation with fail or with another test. |
 | **ANOVA** | One-way ANOVA (F, p, η²), Kruskal–Wallis and Brown–Forsythe/Levene for every test, against site, head, wafer, file/lot, bin, X, Y… BH-corrected. |
@@ -116,6 +116,7 @@ Tabular commands print the top rows; add `-o file.csv` for the full table.
 | `app [FILES…]` | Desktop app (what a double-click does) |
 | `serve [FILES…] [--port 8765] [--merge] [--no-open]` | Dashboard as a local web server (e.g. on a shared machine) |
 | `sample OUT [--wafers --sites --tests --shift --meas-noise --tester-offset --big-endian --final-test]` | Synthetic STDF |
+| `sample OUT --touchdowns N [--sites 8] [--dut-pool 8] [--empty 0.05] [--no-pir-runs]` | Dummy touchdown file for the touchdown and loop experiment: N touchdowns of up to `--sites` parts, the DUTs of `--dut-pool` back on every loop (0 = new DUTs), one test time per touchdown, site 3 yields less. `--no-pir-runs` writes no PIR runs |
 
 ### Examples
 
@@ -188,7 +189,8 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
 * **Machine learning**: random-forest drivers, PCA + clustering
 * **Records**: the part table (PRR, with part text and alarms) with per-part test drill-down and the part's raw PIR…PRR records; a **record viewer** for every record type in the file (paged, PTR/MPR/FTR/TSR filterable by test number)
 * **Merge, split & export**: merge pieces of one lot into one STDF, HTML report, CSV, extract selection to STDF, split by a PRR field (incl. part text), by the value of a PTR test (one file per value), by a pasted list of parts, or by custom groups (part sets such as `$match` work here)
-* **Edit & trim**: every part of the file is listed. Pick parts by click, Ctrl+click or Shift+click, by typed IDs or row numbers (`1-3,5,2000-2012`), or by a filter; keep or remove them; choose whether the part IDs stay or are backfilled 1…N; then save a new STDF. The view shows how many parts will be written, how many are good and where the IDs will run
+* **Edit & trim**: every part of the file is listed. Pick parts by click, Ctrl+click or Shift+click, by typed IDs or row numbers (`1-3,5,2000-2012`), or by a filter; keep or remove them; choose whether the part IDs stay or are backfilled 1…N; then save a new STDF. The view shows how many parts will be written, how many are good and where the IDs will run. A yield table per site shows which site to leave out; select by result, site and touchdown
+* **Experiments** (Settings, off by default): touchdown and loop per part. Records shows a touchdown summary and two columns; Edit & trim shows the columns and selects by touchdown. Estimated and not validated on real tester files: see Design notes
 
 ## Design notes
 
@@ -197,6 +199,7 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
 * **Limits:** taken from the first PTR/MPR that carries them, honouring OPT_FLAG (bits 4–7 invalid/no limit, bits 2–3 spec). A PTR whose own limits differ from the test's keeps them per part, and the trend draws them as per-part limit lines.
 * **Datalog:** GDR and DTR records are kept in file order with the part they follow, and listed in the Overview.
 * **Pass/fail:** from PRR PART_FLG. A per-test fail comes from TEST_FLG bit 7 or is out of limits.
+* **Touchdown and loop (experiment):** STDF does not name the touchdown, so it is estimated. Where the file has runs of PIR records (one run per touchdown, written before the results) the runs are used. Otherwise the parts are cut by site order (a touchdown's sites rise, so a site that does not rise starts a new touchdown) and by test time (the parts of a touchdown finish together, and TEST_T is whole milliseconds). Loop: how often the same part ID (or part text) has come up before in the file, e.g. one DUT set tested again on every loop. Numbering starts at 1 unless set to 0. Off by default: switch it on under Settings, Experiments.
 * **Splitting** is a two-pass process. First the dataset is loaded, so a filter can use test values. Then raw records are streamed and each PIR…PRR block is copied unchanged. TSR records are dropped from split and trim outputs because they can't be recomputed exactly. Records between two parts (datalog) follow the last part before them, so they are dropped with a dropped part. A part cut off before its PRR is copied as it is, without bin or verdict.
 * **Parallel reading:** a chunk of records is built from an empty state. Where it needs the state before it (a test named by an earlier chunk, a per-part limit, a multi-pin record, a TSR), it is read again on one thread, and a window that mostly needs this stops the parallel reading for the rest of the file.
 * **Statistics** are validated against SciPy: Welch t, Mann–Whitney, KS, Pearson/Spearman, one-way ANOVA, Kruskal–Wallis, Levene.
@@ -210,6 +213,7 @@ src/analysis/    stats, summary, compare, correlation, anova, anomaly
 src/ml/          feature matrix, PCA, k-means, random forest, isolation forest
 src/split.rs     raw pass-through splitter
 src/trim.rs      edit & trim: part selection by ID or row, keep or remove, backfilled IDs
+src/touch.rs     touchdown and loop estimate (experiment): PIR runs, site order and test time, loops
 src/xlsx.rs      Excel workbook export (one sheet per record kind, no spreadsheet crate)
 src/viz.rs       Plotly figure builders (theme-token colours)
 src/api.rs       JSON operations used by the dashboard

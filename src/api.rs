@@ -35,6 +35,8 @@ pub struct Registry {
     pub items: RwLock<Vec<Option<Entry>>>,
     pub session: crate::desktop::Session,
     pub matches: RwLock<Vec<MatchLink>>,
+    /// touchdown estimates (experiment) by dataset id, computed on first use
+    pub touch: RwLock<std::collections::HashMap<usize, Arc<crate::touch::Touches>>>,
 }
 
 impl Registry {
@@ -46,6 +48,7 @@ impl Registry {
                 ..Default::default()
             },
             matches: RwLock::new(vec![]),
+            touch: RwLock::new(std::collections::HashMap::new()),
         }
     }
     pub fn add(&self, name: String, paths: Vec<String>, ds: Dataset) -> usize {
@@ -86,6 +89,21 @@ impl Registry {
     }
     pub fn rows(&self, id: usize, ds: &Dataset, src: &str) -> Result<Vec<usize>> {
         Ok(self.filter(id, ds, src)?.select_all(ds))
+    }
+    /// The touchdown estimate of dataset `id`, computed on first use.
+    pub fn touches(
+        &self,
+        id: usize,
+        ds: &Dataset,
+        paths: &[String],
+    ) -> Result<Arc<crate::touch::Touches>> {
+        if let Some(t) = self.touch.read().unwrap().get(&id).cloned() {
+            return Ok(t);
+        }
+        let path = (paths.len() == 1).then(|| std::path::Path::new(&paths[0]));
+        let t = Arc::new(crate::touch::touches(path, ds)?);
+        self.touch.write().unwrap().insert(id, t.clone());
+        Ok(t)
     }
     fn put_set(&self, id: usize, name: &str, flags: Vec<bool>) {
         if let Some(Some(e)) = self.items.write().unwrap().get_mut(id) {
@@ -635,6 +653,73 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
                 (!prefix.is_empty()).then_some(prefix.as_str()),
             )?;
             Ok(json!({"outputs": res, "out_dir": out_dir}))
+        }
+        "touch_estimate" => {
+            // touchdown and loop of every part (experiment); numbers start at `base` (0 or 1)
+            let id = pp.usize("ds", 0);
+            let (ds, paths) = reg.get(id)?;
+            let base = pp.usize("base", 1);
+            if base > 1 {
+                bail!("touchdown numbers start at 0 or 1");
+            }
+            let base = base as u32;
+            let t = reg.touches(id, &ds, &paths)?;
+            let (key, loops) = crate::touch::loops(&ds, &pp.str_or("key", "auto"))?;
+            let touchdowns: Vec<crate::touch::TouchSummary> =
+                crate::touch::summary(&ds, &t.touch, &loops)
+                    .into_iter()
+                    .map(|mut s| {
+                        s.touch += base;
+                        s.loop_min += base;
+                        s.loop_max += base;
+                        s
+                    })
+                    .collect();
+            Ok(json!({
+                "method": t.method.name(),
+                "loop_key": key,
+                "n_touchdowns": t.n,
+                "max_sites": t.max_sites,
+                "touch": t.touch.iter().map(|&k| k + base).collect::<Vec<_>>(),
+                "loop": loops.iter().map(|&k| k + base).collect::<Vec<_>>(),
+                "touchdowns": touchdowns,
+            }))
+        }
+        "site_yield" => {
+            // parts, good, bad and cut-off parts of every site, and the yield of the tested parts
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            let mut by: std::collections::BTreeMap<u8, [u64; 4]> = Default::default();
+            for p in &ds.parts {
+                let c = by.entry(p.site).or_default();
+                c[0] += 1;
+                if p.partial {
+                    c[3] += 1;
+                } else if let Some(ok) = p.passed {
+                    c[if ok { 1 } else { 2 }] += 1;
+                }
+            }
+            let row = |site: Option<u8>, c: [u64; 4]| {
+                let tested = c[1] + c[2];
+                json!({
+                    "site": site,
+                    "parts": c[0],
+                    "good": c[1],
+                    "bad": c[2],
+                    "cut_off": c[3],
+                    "yield_pct": (tested > 0).then(|| c[1] as f64 * 100.0 / tested as f64),
+                })
+            };
+            let mut total = [0u64; 4];
+            for c in by.values() {
+                for (t, v) in total.iter_mut().zip(c.iter()) {
+                    *t += *v;
+                }
+            }
+            Ok(json!({
+                "sites": by.iter().map(|(&s, &c)| row(Some(s), c)).collect::<Vec<_>>(),
+                "total": row(None, total),
+            }))
         }
         "trim_list" => {
             // every part as one compact row for the Edit & trim view: index, part ID, part text,

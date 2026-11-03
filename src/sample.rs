@@ -616,3 +616,190 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
     w.finish()?;
     Ok(part_no)
 }
+
+/// A dummy multi-site file for the touchdown and loop estimate: touchdowns of up
+/// to `sites` parts, the parts of a touchdown in site order, some site slots left
+/// empty, one test time per touchdown (its sites finish together) and a DUT pool
+/// that comes back on every loop. Final-test style: no wafer and no X/Y.
+#[derive(Debug, Clone)]
+pub struct TouchSpec {
+    pub lot_id: String,
+    pub sites: u8,
+    pub touchdowns: usize,
+    /// DUTs in the pool. Touchdown j tests the DUTs of its site slots from j * sites
+    /// on, so the same DUTs come back on every loop of the pool. 0 = new DUTs in every
+    /// touchdown (no loops).
+    pub dut_pool: usize,
+    /// share of site slots left empty in a touchdown
+    pub empty: f64,
+    /// pass rate of every site except `weak_site`
+    pub yield_rate: f64,
+    /// one site (site number, pass rate) that yields less
+    pub weak_site: Option<(u8, f64)>,
+    /// the PIRs of a touchdown written together (true), or one PIR just before each
+    /// part's results (false: no PIR runs)
+    pub pir_runs: bool,
+    pub seed: u64,
+}
+
+impl Default for TouchSpec {
+    fn default() -> Self {
+        Self {
+            lot_id: "LOTA".into(),
+            sites: 8,
+            touchdowns: 30,
+            dut_pool: 8,
+            empty: 0.05,
+            yield_rate: 0.95,
+            weak_site: Some((3, 0.6)),
+            pir_runs: true,
+            seed: 7,
+        }
+    }
+}
+
+/// Write a touchdown file. Returns the touchdown (0-based, in file order) of every part
+/// written: the planted truth that the estimate is checked against.
+pub fn touchdown_file(path: impl AsRef<Path>, spec: &TouchSpec) -> Result<Vec<u32>> {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(spec.seed);
+    let n01 = Normal::new(0.0f64, 1.0).unwrap();
+    let e = Endian::Little;
+    let mut w = StdfWriter::create(path, e)?;
+    w.write(&Record::FAR(Far {
+        cpu_type: e.cpu_type(),
+        stdf_ver: 4,
+    }))?;
+    let t0 = 1_760_000_000u32;
+    w.write(&Record::MIR(Box::new(Mir {
+        setup_t: t0,
+        start_t: t0,
+        stat_num: 1,
+        mode_cod: 'P',
+        rtst_cod: ' ',
+        prot_cod: ' ',
+        cmod_cod: ' ',
+        lot_id: spec.lot_id.clone(),
+        part_typ: "CYPHER01".into(),
+        node_nam: "TESTER01".into(),
+        tstr_typ: "SYNTH".into(),
+        job_nam: "TOUCH01".into(),
+        job_rev: "1.0".into(),
+        sblot_id: format!("{}.1", spec.lot_id),
+        test_cod: "FT".into(),
+        tst_temp: "25".into(),
+        exec_typ: "stdf-cypher-sample".into(),
+        ..Default::default()
+    })))?;
+    // test number, name, units, lo, hi, nominal, sigma
+    let tests: [(u32, &str, &str, f64, f64, f64, f64); 2] = [
+        (1000, "VDD", "V", 0.9, 1.1, 1.0, 0.01),
+        (2000, "IDD", "uA", 0.0, 100.0, 40.0, 5.0),
+    ];
+    let slots = spec.sites.max(1) as usize;
+    let mut tested = 0usize;
+    let mut truth: Vec<u32> = vec![];
+    let mut touch_no = 0u32;
+    for j in 0..spec.touchdowns {
+        // (site, DUT) of the parts in this touchdown, in site order
+        let mut active: Vec<(u8, usize)> = vec![];
+        for s in 0..slots {
+            if rng.gen_bool(spec.empty.clamp(0.0, 1.0)) {
+                continue;
+            }
+            let dut = if spec.dut_pool == 0 {
+                tested
+            } else {
+                (j * slots + s) % spec.dut_pool
+            };
+            tested += 1;
+            active.push(((s + 1) as u8, dut));
+        }
+        if active.is_empty() {
+            continue;
+        }
+        // one test time per touchdown, the parts of it differ by a fraction of a ms
+        let base_ms: f64 = rng.gen_range(100.0..160.0);
+        let times: Vec<u32> = active
+            .iter()
+            .map(|_| (base_ms + 0.5 * n01.sample(&mut rng)).round().max(1.0) as u32)
+            .collect();
+        let pass: Vec<bool> = active
+            .iter()
+            .map(|(site, _)| {
+                let y = match spec.weak_site {
+                    Some((ws, wy)) if ws == *site => wy,
+                    _ => spec.yield_rate,
+                };
+                rng.gen_bool(y.clamp(0.0, 1.0))
+            })
+            .collect();
+        if spec.pir_runs {
+            for (site, _) in &active {
+                w.write(&Record::PIR(Pir {
+                    head_num: 1,
+                    site_num: *site,
+                }))?;
+            }
+        }
+        for (k, &(site, _)) in active.iter().enumerate() {
+            if !spec.pir_runs {
+                w.write(&Record::PIR(Pir {
+                    head_num: 1,
+                    site_num: site,
+                }))?;
+            }
+            for (i, &(num, name, unit, lo, hi, nominal, sigma)) in tests.iter().enumerate() {
+                // the first test fails a part that does not pass
+                let fail = !pass[k] && i == 0;
+                let result = if fail {
+                    hi + 0.15
+                } else {
+                    nominal + sigma * n01.sample(&mut rng)
+                };
+                w.write(&Record::PTR(Ptr {
+                    test_num: num,
+                    head_num: 1,
+                    site_num: site,
+                    test_flg: if fail { 0x80 } else { 0 },
+                    parm_flg: 0,
+                    result: result as f32,
+                    test_txt: name.into(),
+                    alarm_id: String::new(),
+                    opt_flag: Some(0x0C),
+                    res_scal: 0,
+                    llm_scal: 0,
+                    hlm_scal: 0,
+                    lo_limit: Some(lo as f32),
+                    hi_limit: Some(hi as f32),
+                    units: Some(unit.into()),
+                    ..Default::default()
+                }))?;
+            }
+        }
+        for (k, &(site, dut)) in active.iter().enumerate() {
+            w.write(&Record::PRR(Prr {
+                head_num: 1,
+                site_num: site,
+                part_flg: if pass[k] { 0 } else { 0x08 },
+                num_test: tests.len() as u16,
+                hard_bin: if pass[k] { 1 } else { 30 },
+                soft_bin: if pass[k] { 1 } else { 30 },
+                x_coord: -32768,
+                y_coord: -32768,
+                test_t: times[k],
+                part_id: (dut + 1).to_string(),
+                part_txt: format!("{}-DUT{:03}", spec.lot_id, dut + 1),
+                ..Default::default()
+            }))?;
+            truth.push(touch_no);
+        }
+        touch_no += 1;
+    }
+    w.write(&Record::MRR(Mrr {
+        finish_t: t0 + 86400,
+        disp_cod: ' ',
+        ..Default::default()
+    }))?;
+    w.finish()?;
+    Ok(truth)
+}

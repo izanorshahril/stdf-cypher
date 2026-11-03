@@ -362,6 +362,20 @@ enum Cmd {
         /// high limit (a run 1 before a retest fails them; repeatable)
         #[arg(long)]
         latent_test: Vec<u32>,
+        /// write a touchdown file instead: this many touchdowns of --sites parts each
+        /// (dummy data for the touchdown and loop experiment)
+        #[arg(long)]
+        touchdowns: Option<usize>,
+        /// DUTs in the pool of a touchdown file; the same DUTs come back on every loop
+        /// (0 = new DUTs in every touchdown)
+        #[arg(long, default_value_t = 8)]
+        dut_pool: usize,
+        /// share of empty site slots in a touchdown file
+        #[arg(long, default_value_t = 0.05)]
+        empty: f64,
+        /// no PIR runs in a touchdown file (one PIR just before each part's results)
+        #[arg(long)]
+        no_pir_runs: bool,
     },
 }
 
@@ -1551,7 +1565,34 @@ fn run() -> Result<()> {
             band_test,
             extra_test,
             latent_test,
+            touchdowns,
+            dut_pool,
+            empty,
+            no_pir_runs,
         } => {
+            if let Some(touchdowns) = touchdowns {
+                let n = sample::touchdown_file(
+                    &out,
+                    &sample::TouchSpec {
+                        lot_id: lot,
+                        sites,
+                        touchdowns,
+                        dut_pool,
+                        empty,
+                        pir_runs: !no_pir_runs,
+                        seed,
+                        ..Default::default()
+                    },
+                )?
+                .len();
+                eprintln!(
+                    "wrote {} parts in up to {} touchdowns to {}",
+                    n,
+                    touchdowns,
+                    out.display()
+                );
+                return Ok(());
+            }
             let spec = sample::SampleSpec {
                 lot_id: lot,
                 wafers,

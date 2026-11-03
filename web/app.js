@@ -5,7 +5,7 @@ const { h, plot, fmt, fmtP, pct, kpi, chartBox, badge, table } = SC;
 const S = { datasets: [], ds: 0, filter: "", view: "overview", testsCache: {}, scope: "all", co: { range: "both", dim: "2d", opacity: 0.6, hist: "pct" } };
 try { Object.assign(S.co, JSON.parse(localStorage.getItem("sc-chart") || "{}")); S.scope = localStorage.getItem("sc-scope") || "all"; } catch (e) {}
 // settings kept in this browser profile (Settings page); `sc-sort` predates it
-const CFG_DEFAULT = { sort: "time", dedup: "", merge: false, key: "part_txt", lbTest: "5100", ignoreIds: true, wxy: "80149", rev: "", others: [], card: ["part_txt", "wxy", "wxy_t"] };
+const CFG_DEFAULT = { sort: "time", dedup: "", merge: false, key: "part_txt", lbTest: "5100", ignoreIds: true, wxy: "80149", rev: "", others: [], card: ["part_txt", "wxy", "wxy_t"], touch: { on: false, base: 1, key: "auto" } };
 const WCAL_DEFAULT = { w: "80100", x: "80101", y: "80102", ox: "80103", oy: "80104", mode: "add", fx: false, fy: false };
 S.cfg = Object.assign({}, CFG_DEFAULT);
 try {
@@ -1175,11 +1175,13 @@ async function recParts(el) {
   loading(out);
   try {
     const d = await api("parts", P({ limit: 20000 }));
+    const est = touchOn() ? await touchEstimate(S.ds) : null;
+    if (est) d.rows.forEach((r) => { r.touchdown = est.touch[r.index]; r.loop = est.loop[r.index]; });
     const detail = h("div");
     const tb = h("div");
-    out.replaceChildren(h("p", { class: "muted" }, `${d.total.toLocaleString()} parts` + (d.total > d.rows.length ? ` (first ${d.rows.length} listed)` : "")), tb, detail);
+    out.replaceChildren(h("p", { class: "muted" }, `${d.total.toLocaleString()} parts` + (d.total > d.rows.length ? ` (first ${d.rows.length} listed)` : "")), ...(est ? [touchCard(est)] : []), tb, detail);
     const hasTxt = d.rows.some((r) => r.part_txt);
-    table(tb, [{ key: "index", label: "#", num: true }, { key: "part_id", label: "Part ID" }, hasTxt ? { key: "part_txt", label: "Part text" } : null, { key: "wafer", label: "Wafer" }, { key: "x", label: "X", num: true }, { key: "y", label: "Y", num: true }, { key: "head", label: "Head", num: true }, { key: "site", label: "Site", num: true }, { key: "hbin", label: "HBin", num: true }, { key: "sbin", label: "SBin", num: true }, { key: "pass", label: "Result", render: (v) => (v === null ? badge("n/a", "neutral") : v ? badge("good", "good") : badge("bad", "bad")) }, { key: "alarm", label: "Alarm", render: (v) => (v ? badge("alarm", "warn") : "") }, { key: "first_fail", label: "First fail" }, { key: "test_t", label: "Test time ms", num: true }].filter(Boolean), d.rows, {
+    table(tb, [{ key: "index", label: "#", num: true }, { key: "part_id", label: "Part ID" }, hasTxt ? { key: "part_txt", label: "Part text" } : null, { key: "wafer", label: "Wafer" }, { key: "x", label: "X", num: true }, { key: "y", label: "Y", num: true }, { key: "head", label: "Head", num: true }, { key: "site", label: "Site", num: true }, { key: "hbin", label: "HBin", num: true }, { key: "sbin", label: "SBin", num: true }, { key: "pass", label: "Result", render: (v) => (v === null ? badge("n/a", "neutral") : v ? badge("good", "good") : badge("bad", "bad")) }, { key: "alarm", label: "Alarm", render: (v) => (v ? badge("alarm", "warn") : "") }, { key: "first_fail", label: "First fail" }, { key: "test_t", label: "Test time ms", num: true }, ...(est ? [{ key: "touchdown", label: "Touchdown", num: true }, { key: "loop", label: "Loop", num: true }] : [])].filter(Boolean), d.rows, {
       onClick: (row) => partDetail(detail, S.ds, row.index),
       onClear: () => detail.replaceChildren(),
     });
@@ -3170,23 +3172,51 @@ function viewDatalog(el) {
   drawList();
   drawTests();
 }
+// ---- Experiments (Settings, "Experiments"): touchdown and loop per part; off unless switched on
+function touchOn() { return !!(S.cfg.touch && S.cfg.touch.on); }
+function touchCfg() { return Object.assign({ base: 1, key: "auto" }, S.cfg.touch || {}); }
+function setTouch(patch) { S.cfg.touch = Object.assign({ on: false, base: 1, key: "auto" }, S.cfg.touch, patch); saveCfg(); }
+function touchEstimate(ds) { const c = touchCfg(); return api("touch_estimate", { ds, base: Number(c.base), key: c.key }); }
+const LOOP_NAMES = { Id: "part ID", Text: "part text", Off: "no repeats" };
+/** Numbers and ranges such as "3-5,9", as a set. */
+function numSet(text) {
+  const out = new Set();
+  for (const tok of String(text).split(/[,;\s]+/).filter(Boolean)) {
+    const m = tok.match(/^(\d+)\s*-\s*(\d+)$/);
+    if (m) { for (let k = Number(m[1]); k <= Number(m[2]); k++) out.add(k); } else if (/^\d+$/.test(tok)) out.add(Number(tok));
+  }
+  return out;
+}
+/** The touchdown summary of an estimate, for the Records view. */
+function touchCard(est) {
+  const rows = est.touchdowns.map((t) => ({ touch: t.touch, sites: t.sites.join(", "), parts: t.parts, good: t.good, bad: t.bad, cut_off: t.cut_off, test_ms: t.test_ms_median == null ? "" : t.test_ms_median.toFixed(0), loops: t.loop_min === t.loop_max ? String(t.loop_min) : `${t.loop_min}–${t.loop_max}` }));
+  const tb = h("div");
+  table(tb, [{ key: "touch", label: "Touchdown", num: true }, { key: "sites", label: "Sites" }, { key: "parts", label: "Parts", num: true }, { key: "good", label: "Good", num: true }, { key: "bad", label: "Bad", num: true }, { key: "cut_off", label: "Cut off", num: true }, { key: "test_ms", label: "Test time ms", num: true }, { key: "loops", label: "Loops", num: true }], rows, { search: rows.length > 15, maxHeight: "360px" });
+  return h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "Touchdowns (experiment)"),
+    h("p", { class: "muted small" }, `${est.n_touchdowns} touchdown(s) of up to ${est.max_sites} sites, found from ${est.method}. Loops are counted by ${LOOP_NAMES[est.loop_key] || est.loop_key}: a sample tested again on each loop. Estimated, not read from the tester: check it against your own records before you rely on it.`),
+    tb);
+}
+
 // ---- Edit & trim: pick parts by ID or row, keep or remove them, number the rest, save a new STDF
 const TRIM_PAGE = 200;
 function viewTrim(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
   el.append(h("h1", {}, "Edit & trim"), h("p", { class: "lead" }, `Choose the parts of ${ds ? ds.name : "the dataset"} to keep or remove, number the parts that stay if you like, and save a new STDF file. The file you opened is not changed.`));
   if (!ds) { el.append(h("p", { class: "muted" }, "Open an STDF file first.")); return; }
-  if (!S.trim || S.trim.ds !== S.ds) S.trim = { ds: S.ds, sel: new Set(), anchor: null, page: 0, q: "", show: "all", action: "keep", renumber: false, by: "id", text: "", filter: "" };
+  if (!S.trim || S.trim.ds !== S.ds) S.trim = { ds: S.ds, sel: new Set(), anchor: null, page: 0, q: "", show: "all", action: "keep", renumber: false, by: "id", text: "", filter: "", result: "any", sites: new Set(), touchText: "" };
   const body = h("div");
   el.append(body);
   loading(body, "Reading the parts…");
-  api("trim_list", { ds: S.ds }).then((data) => drawTrim(body, ds, data)).catch((e) => showErr(body, e));
+  Promise.all([api("trim_list", { ds: S.ds }), api("site_yield", { ds: S.ds }), touchOn() ? touchEstimate(S.ds) : null])
+    .then(([data, yields, est]) => drawTrim(body, ds, data, yields, est))
+    .catch((e) => showErr(body, e));
 }
-function drawTrim(body, ds, data) {
+function drawTrim(body, ds, data, yields, est) {
   body.replaceChildren();
   if (!data.editable) { body.append(h("div", { class: "card pad" }, "Trimming works on a dataset opened from one STDF file. This dataset was combined or made in the app: open its file on its own to trim it.")); return; }
   const st = S.trim, sel = st.sel, rows = data.rows, n = rows.length;
-  // row: [index, part ID, part text, wafer, X, Y, site, hbin, sbin, pass, cut off, first fail]
+  // row: [index, part ID, part text, wafer, X, Y, site, hbin, sbin, pass, cut off, first fail], then touchdown and loop when estimated
+  if (est) rows.forEach((r, i) => r.push(est.touch[i], est.loop[i]));
   const hay = rows.map((r) => `${r[1]} ${r[2]} ${r[3]} ${r[4] ?? ""} ${r[5] ?? ""}`.toLowerCase());
   const msg = h("div", { class: "muted small" });
   const listBody = h("tbody");
@@ -3194,7 +3224,11 @@ function drawTrim(body, ds, data) {
   const sumLine = h("div", { class: "row tight", style: { flexWrap: "wrap" } });
   const writeLine = h("div", { class: "muted" });
   const idLine = h("div", { class: "muted small" });
+  const matchLine = h("span", { class: "muted small" });
   const out = h("div");
+  const tn = () => (est && st.touchText.trim() ? numSet(st.touchText) : null);
+  const okResult = (r) => st.result === "any" || (!r[10] && (st.result === "good" ? r[9] === true : r[9] === false));
+  const isMatch = (r) => okResult(r) && (!st.sites.size || st.sites.has(r[6])) && (!tn() || tn().has(r[12]));
   const shown = () => {
     const q = st.q.trim().toLowerCase(), list = [];
     for (let i = 0; i < n; i++) {
@@ -3222,6 +3256,15 @@ function drawTrim(body, ds, data) {
     }
     paint();
   };
+  // pick the parts a rule names: `set` replaces the selection, `add` adds to it
+  const pickWhere = (pred, mode) => {
+    if (mode === "set") sel.clear();
+    let k = 0;
+    rows.forEach((r, i) => { if (pred(r, i)) { sel.add(i); k++; } });
+    st.anchor = null;
+    msg.textContent = `${k.toLocaleString()} part(s) ${mode === "set" ? "selected" : "added to the selection"}`;
+    paint();
+  };
   const prev = h("button", { class: "ghost small", onclick: () => { st.page--; paint(); } }, "‹ Previous");
   const next = h("button", { class: "ghost small", onclick: () => { st.page++; paint(); } }, "Next ›");
   const paint = () => {
@@ -3231,16 +3274,18 @@ function drawTrim(body, ds, data) {
     const at = st.page * TRIM_PAGE;
     listBody.replaceChildren(...list.slice(at, at + TRIM_PAGE).map((i) => {
       const r = rows[i];
-      return h("tr", { class: sel.has(i) ? "clickable sel" : "clickable", onclick: (e) => click(i, list, e) },
-        h("td", { class: "num" }, i + 1), h("td", {}, r[1]), h("td", {}, r[2]), h("td", {}, r[3]),
+      const cells = [h("td", { class: "num" }, i + 1), h("td", {}, r[1]), h("td", {}, r[2]), h("td", {}, r[3]),
         h("td", { class: "num" }, r[4]), h("td", { class: "num" }, r[5]), h("td", { class: "num" }, r[6]),
         h("td", { class: "num" }, r[7]), h("td", { class: "num" }, r[8]),
-        h("td", {}, r[10] ? "cut off" : r[9] === null ? "n/a" : r[9] ? "good" : "bad"), h("td", {}, r[11]));
+        h("td", {}, r[10] ? "cut off" : r[9] === null ? "n/a" : r[9] ? "good" : "bad"), h("td", {}, r[11])];
+      if (est) cells.push(h("td", { class: "num" }, r[12]), h("td", { class: "num" }, r[13]));
+      return h("tr", { class: sel.has(i) ? "clickable sel" : "clickable", onclick: (e) => click(i, list, e) }, ...cells);
     }));
     prev.disabled = st.page === 0;
     next.disabled = st.page >= pages - 1;
     pageLbl.textContent = `page ${st.page + 1} of ${pages.toLocaleString()} · ${list.length.toLocaleString()} part(s) listed`;
     sumLine.replaceChildren(h("b", {}, `${sel.size.toLocaleString()} selected`), h("span", { class: "muted small" }, `of ${n.toLocaleString()} parts`));
+    matchLine.textContent = `${matchCount().toLocaleString()} part(s) match`;
     const w = written(), removed = n - w.length;
     const good = w.filter((i) => rows[i][9] === true).length, cut = w.filter((i) => rows[i][10]).length;
     writeLine.textContent = w.length
@@ -3252,6 +3297,7 @@ function drawTrim(body, ds, data) {
       : `Part IDs keep their numbers, ${idOf(w[0])} … ${idOf(w[w.length - 1])}${removed ? ", with gaps where parts were removed" : ""}.`;
     saveBtn.disabled = !w.length;
   };
+  const matchCount = () => { let k = 0; for (const r of rows) if (isMatch(r)) k++; return k; };
   const runPick = async (params, mode) => {
     try {
       const r = await api("trim_resolve", Object.assign({ ds: S.ds }, params));
@@ -3265,11 +3311,14 @@ function drawTrim(body, ds, data) {
       paint();
     } catch (e) { toast(e.message, "bad"); }
   };
-  // 1 · choose parts: numbers, ranges and IDs typed; or a filter; the list below picks by click
+  // 1 · choose parts: numbers, ranges and IDs typed; or a filter; or the result and sites below
   const numbers = h("input", { type: "text", value: st.text, placeholder: "e.g. 1-3,5,2000-2012", style: { minWidth: "300px" }, oninput: (e) => (st.text = e.target.value),
     onkeydown: (e) => { if (e.key === "Enter") runPick({ text: numbers.value, by: byEl.value }, "set"); } });
   const byEl = select([["id", "part IDs"], ["row", "row numbers (1 = first part)"]], st.by, (v) => (st.by = v));
   const filterIn = h("input", { type: "text", value: st.filter, placeholder: "or a filter, e.g. hbin = 1 and not pass", style: { minWidth: "300px" }, oninput: (e) => (st.filter = e.target.value) });
+  const resultSel = select([["any", "good and bad"], ["good", "good only"], ["bad", "bad only"]], st.result, (v) => { st.result = v; paint(); });
+  const siteBoxes = (yields.sites || []).map((s) => h("label", { class: "chk" }, h("input", { type: "checkbox", checked: st.sites.has(s.site), onchange: (e) => { if (e.target.checked) st.sites.add(s.site); else st.sites.delete(s.site); paint(); } }), `site ${s.site}`));
+  const touchIn = est ? h("input", { type: "text", value: st.touchText, placeholder: "e.g. 3-5,9", style: { minWidth: "180px" }, oninput: (e) => { st.touchText = e.target.value; paint(); } }) : null;
   // 2 · the list: click, Ctrl+click, Shift+click
   const search = h("input", { type: "text", value: st.q, placeholder: "search ID, text, wafer, X/Y", style: { minWidth: "240px" }, oninput: (e) => { st.q = e.target.value; st.page = 0; paint(); } });
   const showSel = select([["all", "all parts"], ["selected", "selected only"], ["not", "not selected"]], st.show, (v) => { st.show = v; st.page = 0; paint(); });
@@ -3290,18 +3339,41 @@ function drawTrim(body, ds, data) {
   const sep = srcDir.includes("\\") ? "\\" : "/";
   const [pathBox, pathF] = pathField("save", srcDir ? srcDir + sep + base + "_trim.stdf" : "", { title: "Save trimmed STDF", name: base + "_trim.stdf", ext: "stdf" });
 
-  const pickBtns = [
-    h("button", { class: "primary", onclick: () => runPick({ text: numbers.value, by: byEl.value }, "set") }, "Select these"),
-    h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "add") }, "Add"),
-    h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "take") }, "Take out"),
-  ];
+  // yield by site: the figures to decide which site to leave out
+  const flagLow = (y, total) => y !== null && total !== null && y < total - 10;
+  const totalYield = yields.total.yield_pct;
+  const yieldTable = h("div", { class: "tbl-wrap" }, h("table", {},
+    h("thead", {}, h("tr", {}, ...["Site", "Parts", "Good", "Bad", "Cut off", "Yield", ""].map((c) => h("th", { class: ["Parts", "Good", "Bad", "Cut off", "Yield"].includes(c) ? "num" : "" }, c)))),
+    h("tbody", {}, ...(yields.sites || []).map((s) => h("tr", {},
+      h("td", { class: "num" }, s.site),
+      h("td", { class: "num" }, s.parts.toLocaleString()),
+      h("td", { class: "num" }, s.good.toLocaleString()),
+      h("td", { class: "num" }, s.bad.toLocaleString()),
+      h("td", { class: "num" }, s.cut_off ? s.cut_off.toLocaleString() : ""),
+      h("td", { class: `num ${flagLow(s.yield_pct, totalYield) ? "flag-fail" : ""}` }, s.yield_pct === null ? "–" : `${s.yield_pct.toFixed(1)} %`),
+      h("td", {},
+        h("button", { class: "ghost small", title: "add this site's parts to the selection", onclick: () => pickWhere((r) => r[6] === s.site, "add") }, "Select"),
+        h("button", { class: "ghost small", title: "select only this site's parts", onclick: () => pickWhere((r) => r[6] === s.site, "set") }, "Only this site"))))),
+    h("tfoot", {}, h("tr", {}, h("td", {}, "All"), h("td", { class: "num" }, yields.total.parts.toLocaleString()), h("td", { class: "num" }, yields.total.good.toLocaleString()), h("td", { class: "num" }, yields.total.bad.toLocaleString()), h("td", { class: "num" }, yields.total.cut_off ? yields.total.cut_off.toLocaleString() : ""), h("td", { class: "num" }, totalYield === null ? "–" : `${totalYield.toFixed(1)} %`), h("td", {})))));
+
   body.append(
+    h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "Yield by site"),
+      h("p", { class: "muted small" }, "Yield is good ÷ (good + bad), cut-off parts left out. A site more than 10 points below the file's yield is flagged red: select its parts and set Selected parts to remove to leave it out."),
+      yieldTable),
     h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "1 · Choose parts"),
-      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, numbers, byEl, ...pickBtns),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, numbers, byEl,
+        h("button", { class: "primary", onclick: () => runPick({ text: numbers.value, by: byEl.value }, "set") }, "Select these"),
+        h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "add") }, "Add"),
+        h("button", { onclick: () => runPick({ text: numbers.value, by: byEl.value }, "take") }, "Take out")),
       h("p", { class: "muted small" }, "Numbers and ranges (1-3,5,2000-2012) or part IDs, separated by commas or lines. Select these replaces the selection; Add and Take out change it. Ranges work on part IDs and on row numbers."),
       h("div", { class: "row tight", style: { flexWrap: "wrap" } }, filterIn,
         h("button", { onclick: () => runPick({ filter: filterIn.value }, "set") }, "Select matches"),
         h("button", { onclick: () => runPick({ filter: filterIn.value }, "add") }, "Add matches")),
+      h("h3", {}, est ? "By result, site and touchdown" : "By result and site"),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, field("Result", resultSel), touchIn ? field("Touchdown", touchIn) : null),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, h("span", { class: "muted small" }, "Sites (none ticked = all):"), ...siteBoxes),
+      h("div", { class: "row tight", style: { flexWrap: "wrap" } }, h("button", { class: "primary", onclick: () => pickWhere((r) => isMatch(r), "set") }, "Select matches"),
+        h("button", { onclick: () => pickWhere((r) => isMatch(r), "add") }, "Add matches"), matchLine),
       msg),
     h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "2 · Parts in the file"),
       h("div", { class: "row tight", style: { flexWrap: "wrap" } }, search, showSel,
@@ -3310,7 +3382,7 @@ function drawTrim(body, ds, data) {
         h("button", { onclick: () => { sel.clear(); st.anchor = null; paint(); } }, "Clear selection")),
       sumLine,
       h("div", { class: "tbl-wrap trim-list" }, h("table", {},
-        h("thead", {}, h("tr", {}, ...["#", "Part ID", "Part text", "Wafer", "X", "Y", "Site", "HBin", "SBin", "Result", "First fail"].map((c, k) => h("th", { class: k >= 4 && k <= 8 ? "num" : "" }, c)))),
+        h("thead", {}, h("tr", {}, ...["#", "Part ID", "Part text", "Wafer", "X", "Y", "Site", "HBin", "SBin", "Result", "First fail", ...(est ? ["Touchdown", "Loop"] : [])].map((c, k) => h("th", { class: (k >= 4 && k <= 8) || c === "Touchdown" || c === "Loop" ? "num" : "" }, c)))),
         listBody)),
       h("div", { class: "row tight" }, prev, pageLbl, next),
       h("p", { class: "muted small" }, "Click a part to select only it. Ctrl+click adds or removes one part, Shift+click selects the range from the last part clicked. All parts of the file are listed; the filter at the top does not apply here.")),
@@ -3374,6 +3446,12 @@ function viewSettings(el) {
       h("h3", {}, "Other trace"),
       h("div", { class: "controls" }, field("Test program revision test", traced("rev", cfgIn("rev", "none"))), field("Loadboard test", traced("lb", lb))),
       field("Other IDs", othersBox)),
+    sec("Experiments", "Off unless switched on. Experimental features are not validated on real tester files; they show only while switched on here.",
+      h("div", { class: "controls" },
+        h("label", { class: "chk" }, h("input", { type: "checkbox", checked: touchOn(), onchange: (e) => setTouch({ on: e.target.checked }) }), "Touchdown and loop per part"),
+        field("Touchdown numbers start at", select([["1", "1"], ["0", "0"]], String(touchCfg().base), (v) => setTouch({ base: Number(v) }))),
+        field("Count loops by", select([["auto", "whichever repeats more"], ["id", "part ID"], ["text", "part text"], ["off", "no loops"]], touchCfg().key, (v) => setTouch({ key: v })))),
+      h("p", { class: "muted small" }, "Touchdown: the parts tested together. Estimated from the PIR records of each touchdown when the file has them, otherwise from the site order and the test times (the parts of one touchdown finish together). Loop: how often the same part ID or part text has come up before in the file, e.g. one DUT set tested again on every loop. Records lists both per part, and Edit & trim lists them and can select by touchdown.")),
     sec("Look", "Colour theme for the whole app; ◐ at the top switches light and dark. Each histogram also has its own bin-size slider above the chart.", h("div", { class: "controls" }, field("Theme", skin), field("Axis range", range), field("Histogram", hist))),
     h("div", { class: "row" }, h("button", { onclick: reset }, "Reset to defaults")));
 }
