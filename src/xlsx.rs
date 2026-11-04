@@ -17,6 +17,44 @@ pub const MAX_ROWS: u64 = 1_048_575;
 /// Longest text Excel keeps in one cell.
 const MAX_TEXT: usize = 32_767;
 
+/// Cell styles of the workbook's stylesheet.
+pub(crate) mod style {
+    pub const BOLD: u32 = 1;
+    /// a column title: bold on grey, centred
+    pub const TITLE: u32 = 2;
+    /// the row label column: grey
+    pub const LABEL: u32 = 3;
+    /// a failing result: dark red on pink
+    pub const FAIL: u32 = 4;
+    /// the first of the group title colours
+    pub const GROUP: u32 = 5;
+    /// how many group title colours there are
+    pub const GROUPS: u32 = 6;
+}
+
+const STYLES: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
+    r#"<fonts count="3"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font><font><sz val="11"/><color rgb="FF9C0006"/><name val="Calibri"/></font></fonts>"#,
+    r#"<fills count="10"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill>"#,
+    r#"<fill><patternFill patternType="solid"><fgColor rgb="FFD9D9D9"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFC7CE"/></patternFill></fill>"#,
+    r#"<fill><patternFill patternType="solid"><fgColor rgb="FFC6E0B4"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE2EFDA"/></patternFill></fill>"#,
+    r#"<fill><patternFill patternType="solid"><fgColor rgb="FFBDD7EE"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFDDEBF7"/></patternFill></fill>"#,
+    r#"<fill><patternFill patternType="solid"><fgColor rgb="FFFFE699"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF8CBAD"/></patternFill></fill></fills>"#,
+    r#"<borders count="2"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color auto="1"/></left><right style="thin"><color auto="1"/></right><top style="thin"><color auto="1"/></top><bottom style="thin"><color auto="1"/></bottom><diagonal/></border></borders>"#,
+    r#"<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>"#,
+    r#"<cellXfs count="11"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>"#,
+    r#"<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>"#,
+    r#"<xf numFmtId="0" fontId="0" fillId="2" borderId="1" xfId="0" applyFill="1" applyBorder="1"/>"#,
+    r#"<xf numFmtId="0" fontId="2" fillId="3" borderId="0" xfId="0" applyFont="1" applyFill="1"/>"#,
+    r#"<xf numFmtId="0" fontId="1" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>"#,
+    r#"<xf numFmtId="0" fontId="1" fillId="5" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>"#,
+    r#"<xf numFmtId="0" fontId="1" fillId="6" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>"#,
+    r#"<xf numFmtId="0" fontId="1" fillId="7" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>"#,
+    r#"<xf numFmtId="0" fontId="1" fillId="8" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf>"#,
+    r#"<xf numFmtId="0" fontId="1" fillId="9" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center"/></xf></cellXfs>"#,
+    r#"<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#,
+);
+
 /// What an export wrote.
 pub struct Summary {
     /// records read from the file
@@ -26,11 +64,11 @@ pub struct Summary {
 }
 
 /// One worksheet, streamed to a temporary file.
-struct Sheet {
-    name: String,
-    rows: u64,
-    path: PathBuf,
-    out: BufWriter<File>,
+pub(crate) struct Sheet {
+    pub(crate) name: String,
+    pub(crate) rows: u64,
+    pub(crate) path: PathBuf,
+    pub(crate) out: BufWriter<File>,
 }
 
 /// The sheets of one record kind, and its columns: the fields of the kind's first record, with
@@ -56,7 +94,7 @@ pub fn export_with(input: &Path, out: &Path, max_rows: u64) -> Result<Summary> {
     result
 }
 
-fn scratch_dir() -> Result<PathBuf> {
+pub(crate) fn scratch_dir() -> Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -123,7 +161,7 @@ fn write_book(input: &Path, out: &Path, dir: &Path, max_rows: u64) -> Result<Sum
         s.out.write_all(b"</sheetData></worksheet>")?;
         s.out.flush()?;
     }
-    write_zip(out, &sheets)?;
+    write_zip(out, &sheets, "")?;
     Ok(Summary {
         records,
         sheets: sheets.into_iter().map(|s| (s.name, s.rows)).collect(),
@@ -138,25 +176,32 @@ fn new_sheet(
     cols: &[String],
     letters: &[String],
 ) -> Result<Sheet> {
-    let path = dir.join(format!("sheet{id}.xml"));
-    let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
-    let mut out = BufWriter::new(file);
-    out.write_all(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
-            r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">"#,
-            r#"<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>"#,
-            "<sheetData>"
-        )
-        .as_bytes(),
+    let mut sheet = open_sheet(
+        dir,
+        id,
+        name,
+        r#"<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>"#,
     )?;
+    let out = &mut sheet.out;
     if !cols.is_empty() {
         out.write_all(b"<row r=\"1\">")?;
         for (col, letter) in cols.iter().zip(letters) {
-            write_text(&mut out, letter, 1, col, true)?;
+            write_text(out, letter, 1, col, true)?;
         }
         out.write_all(b"</row>")?;
     }
+    Ok(sheet)
+}
+
+/// A sheet opened up to its first row: `head` is what goes before the data (views, columns).
+pub(crate) fn open_sheet(dir: &Path, id: usize, name: String, head: &str) -> Result<Sheet> {
+    let path = dir.join(format!("sheet{id}.xml"));
+    let file = File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+    let mut out = BufWriter::new(file);
+    write!(
+        out,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{head}<sheetData>"#
+    )?;
     Ok(Sheet {
         name,
         rows: 0,
@@ -198,11 +243,23 @@ fn write_text(
     text: &str,
     bold: bool,
 ) -> io::Result<()> {
-    let style = if bold { " s=\"1\"" } else { "" };
-    write!(
-        out,
-        "<c r=\"{letter}{row}\" t=\"inlineStr\"{style}><is><t xml:space=\"preserve\">"
-    )?;
+    write_styled(out, letter, row, text, u32::from(bold))
+}
+
+/// A text cell with a style of the workbook's stylesheet (`style::`, 0 = none).
+pub(crate) fn write_styled(
+    out: &mut impl Write,
+    letter: &str,
+    row: u64,
+    text: &str,
+    style: u32,
+) -> io::Result<()> {
+    if style == 0 {
+        write!(out, "<c r=\"{letter}{row}\" t=\"inlineStr\"")?;
+    } else {
+        write!(out, "<c r=\"{letter}{row}\" t=\"inlineStr\" s=\"{style}\"")?;
+    }
+    out.write_all(b"><is><t xml:space=\"preserve\">")?;
     let mut buf = [0u8; 4];
     for c in text.chars().filter(|c| xml_char(*c)).take(MAX_TEXT) {
         match c {
@@ -221,7 +278,7 @@ fn xml_char(c: char) -> bool {
 }
 
 /// Column letters of a 0-based column: 0 is A, 25 is Z, 26 is AA.
-fn column_letters(mut i: usize) -> String {
+pub(crate) fn column_letters(mut i: usize) -> String {
     let mut s = Vec::new();
     loop {
         s.push(b'A' + (i % 26) as u8);
@@ -236,7 +293,8 @@ fn column_letters(mut i: usize) -> String {
 
 /// The workbook package: the parts every .xlsx has, then one part per sheet. Sheets are deflated at
 /// level 1: the sheets are large and repetitive, and a faster level keeps the export quick.
-fn write_zip(out: &Path, sheets: &[Sheet]) -> Result<()> {
+/// `names` is the workbook's <definedNames> element, or empty.
+pub(crate) fn write_zip(out: &Path, sheets: &[Sheet], names: &str) -> Result<()> {
     let file = File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let mut zip = zip::ZipWriter::new(BufWriter::new(file));
     let opts = zip::write::SimpleFileOptions::default()
@@ -275,7 +333,7 @@ fn write_zip(out: &Path, sheets: &[Sheet]) -> Result<()> {
         (
             "xl/workbook.xml",
             format!(
-                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{book}</sheets></workbook>"#
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{book}</sheets>{names}</workbook>"#
             ),
         ),
         (
@@ -286,8 +344,7 @@ fn write_zip(out: &Path, sheets: &[Sheet]) -> Result<()> {
         ),
         (
             "xl/styles.xml",
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>"#
-                .to_string(),
+            STYLES.to_string(),
         ),
     ];
     for (name, body) in parts {

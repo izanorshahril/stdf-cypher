@@ -1071,6 +1071,8 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "signature" => signature_op(reg, &pp),
         "retest_trace" => retest_op(reg, &pp),
         "merge_candidates" => merge_candidates_op(reg),
+        "part_trace_detect" => part_trace_detect_op(reg, &pp),
+        "part_trace_export" => part_trace_export_op(reg, &pp),
         // part datalog: search parts, then write the chosen tests' results
         "find_parts" => {
             let id = pp.usize("ds", 0);
@@ -4119,6 +4121,100 @@ fn id_list(v: Option<&Value>) -> Vec<usize> {
 /// order, with the physical parts any two of them share (by wafer + X/Y when
 /// every file has die coordinates, else by part text). Pieces of one test
 /// share none; files that do (retests) can still be merged.
+/// Which open files hold the same parts. Datasets made in the app are left out: they are subsets of
+/// a file that is open anyway, so they would always look linked to it.
+fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::parttrace::{detect, Candidate};
+    use data::matching::KeySpec;
+    let key = pp.str_or("key", "part_txt");
+    let filter = pp.str("filter");
+    let open: Vec<(usize, String, Arc<Dataset>)> = {
+        let v = reg.items.read().unwrap();
+        v.iter()
+            .enumerate()
+            .filter_map(|(id, e)| {
+                let e = e.as_ref()?;
+                (!e.paths.is_empty()).then(|| (id, e.name.clone(), e.ds.clone()))
+            })
+            .collect()
+    };
+    let cands: Vec<Candidate> = open
+        .iter()
+        .map(|(id, _, ds)| {
+            Ok(Candidate {
+                ds,
+                key: KeySpec::parse(&key, ds)?,
+                rows: reg.rows(*id, ds, &filter)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let d = detect(&cands);
+    let files: Vec<Value> = open
+        .iter()
+        .zip(&d.files)
+        .map(|((id, name, ds), st)| {
+            let s = ds.sources.first().cloned().unwrap_or_default();
+            json!({"id": id, "name": name, "start_t": s.start_t, "lot": s.lot_id, "tester": s.node_nam, "ids": st})
+        })
+        .collect();
+    let id = |i: usize| open[i].0;
+    Ok(json!({
+        "files": files,
+        "pairs": d.pairs.iter().map(|p| json!({"a": id(p.a), "b": id(p.b), "shared": p.shared})).collect::<Vec<_>>(),
+        "groups": d.groups.iter().map(|g| g.iter().map(|&i| id(i)).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        "in_several": d.in_several,
+    }))
+}
+
+/// Writes the part trace workbook: `runs` is [{ds, name}] in the order of the report.
+fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::parttrace::{export, Run};
+    use data::matching::KeySpec;
+    let out = pp.str("path");
+    if out.is_empty() {
+        bail!("choose where to save the report");
+    }
+    let empty = vec![];
+    let list = pp.0.get("runs").and_then(|v| v.as_array()).unwrap_or(&empty);
+    let picked: Vec<(usize, String, bool)> = list
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            let last = r.get("last_only").and_then(|l| l.as_bool()).unwrap_or(false);
+            Some((r.get("ds")?.as_u64()? as usize, name.to_string(), last))
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    if !picked.iter().all(|(id, _, _)| seen.insert(*id)) {
+        bail!("each file can be in the report once");
+    }
+    let dss: Vec<Arc<Dataset>> = picked
+        .iter()
+        .map(|(id, _, _)| reg.get(*id).map(|d| d.0))
+        .collect::<Result<_>>()?;
+    let key = pp.str_or("key", "part_txt");
+    let filter = pp.str("filter");
+    let runs: Vec<Run> = picked
+        .iter()
+        .zip(&dss)
+        .map(|((id, name, last_only), ds)| {
+            Ok(Run {
+                name: if name.is_empty() {
+                    reg.name(*id)
+                } else {
+                    name.clone()
+                },
+                ds,
+                key: KeySpec::parse(&key, ds)?,
+                rows: reg.rows(*id, ds, &filter)?,
+                last_only: *last_only,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let s = export(&runs, std::path::Path::new(&out), &filter)?;
+    Ok(json!({"path": out, "summary": s}))
+}
+
 fn merge_candidates_op(reg: &Registry) -> Result<Value> {
     use data::matching::KeySpec;
     use std::collections::HashSet;

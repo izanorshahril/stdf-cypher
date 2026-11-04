@@ -78,6 +78,26 @@ enum Cmd {
         #[arg(short, long)]
         out: PathBuf,
     },
+    /// Trace parts across files in an Excel workbook: one row per part, one column group per file
+    PartTrace {
+        /// the files, in the order of the report's columns
+        files: Vec<PathBuf>,
+        /// the workbook to write (.xlsx)
+        #[arg(short, long)]
+        out: PathBuf,
+        /// how parts are identified: part_txt, part_id, xy, wafer_xy or tests:NUM[,NUM…]
+        #[arg(long, default_value = "part_txt")]
+        key: String,
+        /// a name for each file's columns, e.g. "V93K first,V93K retest" (default: file names)
+        #[arg(long, value_delimiter = ',')]
+        names: Vec<String>,
+        /// keep only the last test of a part a file holds more than once: all, or file numbers
+        /// such as 1,3 (default: every test, one more row per extra test)
+        #[arg(long, default_value = "")]
+        last_only: String,
+        #[command(flatten)]
+        l: LoadArgs,
+    },
     /// Part results table (PRR) – prints or writes CSV
     Prr {
         files: Vec<PathBuf>,
@@ -688,6 +708,89 @@ fn run() -> Result<()> {
             println!("{} records -> {}", s.records, out.display());
             for (name, rows) in &s.sheets {
                 println!("  {name:<24} {rows:>12} rows");
+            }
+        }
+        Cmd::PartTrace {
+            files,
+            out,
+            key,
+            names,
+            last_only,
+            l,
+        } => {
+            use stdf_cypher::data::matching::KeySpec;
+            use stdf_cypher::parttrace::{self, Candidate, Run};
+            if files.is_empty() {
+                bail!("no input files");
+            }
+            if !names.is_empty() && names.len() != files.len() {
+                bail!(
+                    "--names gives {} name(s) for {} file(s)",
+                    names.len(),
+                    files.len()
+                );
+            }
+            let dss: Vec<Dataset> = files
+                .iter()
+                .map(|f| load(std::slice::from_ref(f), &l))
+                .collect::<Result<_>>()?;
+            let last = parttrace::parse_last_only(&last_only, files.len())?;
+            let mut runs = Vec::with_capacity(dss.len());
+            for (i, ds) in dss.iter().enumerate() {
+                let name = names.get(i).cloned().unwrap_or_else(|| {
+                    files[i]
+                        .file_name()
+                        .map_or(ds.name.clone(), |n| n.to_string_lossy().to_string())
+                });
+                runs.push(Run {
+                    name,
+                    ds,
+                    key: KeySpec::parse(&key, ds)?,
+                    rows: rows(ds, &l.filter)?,
+                    last_only: last[i],
+                });
+            }
+            let cands: Vec<Candidate> = runs
+                .iter()
+                .map(|r| Candidate {
+                    ds: r.ds,
+                    key: r.key.clone(),
+                    rows: r.rows.clone(),
+                })
+                .collect();
+            let found = parttrace::detect(&cands);
+            if files.len() > 1 && found.groups.is_empty() {
+                eprintln!("no two files share a part by this ID");
+            }
+            for (i, f) in found
+                .files
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| f.repeats > 0)
+            {
+                let what = if last[i] {
+                    "keeping each part's last test"
+                } else {
+                    "each takes one more row; --last-only keeps each part's last test"
+                };
+                eprintln!(
+                    "warning: {} tests a part more than once ({} extra tests): {what}",
+                    runs[i].name, f.repeats
+                );
+            }
+            let s = parttrace::export(&runs, &out, &l.filter)?;
+            println!(
+                "{} parts, {} in more than one file, {} rows -> {}",
+                s.parts,
+                s.in_several,
+                s.rows,
+                out.display()
+            );
+            for r in &s.runs {
+                println!(
+                    "  {:<32} {:>8} parts {:>8} good {:>8} in an earlier file {:>8} tested again {:>8} no ID",
+                    r.name, r.parts, r.good, r.in_earlier, r.repeats, r.no_id
+                );
             }
         }
         Cmd::Dump { file, rec, limit } => {

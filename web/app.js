@@ -323,6 +323,7 @@ const VIEWS = {
   candidates: { label: "Bad candidates", fn: viewCandidates },
   signature: { label: "Signature check", fn: viewSignature },
   retest: { label: "Retest trace", fn: viewRetest },
+  parttrace: { label: "Part trace", fn: viewPartTrace },
   correlation: { label: "Correlation", fn: viewCorrelation },
   anova: { label: "ANOVA", fn: viewAnova },
   anomaly: { label: "Abnormal parts", fn: viewAnomaly },
@@ -2792,6 +2793,17 @@ async function viewHome(el) {
           h("button", { class: "ghost", title: "Close this dataset", onclick: async () => { await api("remove", { ds: d.id }); toast(`Closed ${d.name}`); await refreshDatasets(); go("home"); } }, "Close"))));
     }
     left.append(cards);
+    if (S.datasets.filter((d) => !d.derived).length > 1) {
+      const shared = h("div");
+      left.append(shared);
+      api("part_trace_detect", { key: "part_txt" }).then((r) => {
+        if (!r.groups.length) return;
+        const n = r.groups.reduce((a, g) => a + g.length, 0);
+        shared.replaceChildren(h("div", { class: "card pad", style: { marginTop: "10px" } }, h("div", { class: "row tight" },
+          h("span", {}, `${n} open files share part text: ${r.in_several.toLocaleString()} parts are in more than one file.`),
+          h("button", { onclick: () => go("parttrace") }, "Trace them in Part trace"))));
+      }).catch(() => {});
+    }
   }
 
   // recent files
@@ -2823,6 +2835,7 @@ async function viewHome(el) {
     ["candidates", "Bad candidates", "Good parts that went bad, and which tests set them apart"],
     ["signature", "Signature check", "Learn rules from bad candidates, check them on good parts"],
     ["retest", "Retest trace", "Follow parts through up to 8 runs, by site and value"],
+    ["parttrace", "Part trace", "Each part's history across files, as an Excel report"],
     ["correlation", "Correlation", "Tester-to-tester correlation, test-to-test matrix"],
     ["anova", "ANOVA", "Which tests differ by site, wafer or lot"],
     ["anomaly", "Abnormal parts", "PAT, robust z, wafer NNR, Isolation Forest"],
@@ -3049,6 +3062,111 @@ function mergeCard() {
   if (files().length > 1) api("merge_candidates").then(draw).catch((e) => showErr(box, e));
   else draw([]);
   return card;
+}
+// ---- Part trace: each part's history across files, written to an Excel workbook
+function viewPartTrace(el) {
+  el.append(h("h1", {}, "Part trace"), h("p", { class: "lead" }, "One row per part and one group of columns per file: part ID, hard bin, site, first and last failing test. Files that hold the same parts are found and ticked for you. They can be in any order and from any lot: a part shows in every file that holds it, and the other columns stay blank."));
+  const st = S.pt || (S.pt = { order: [], on: {}, names: {}, last: {}, seen: [], path: "" });
+  const live = S.datasets.map((d) => d.id);
+  st.order = [...st.order.filter((id) => live.includes(id)), ...live.filter((id) => !st.order.includes(id))];
+  S.mk = S.mk || {};
+  if (!S.mk.pt) S.mk.pt = "part_txt";
+  const kp = keyPicker("pt");
+  let info = null;
+  const fileInfo = (id) => info && info.files.find((f) => f.id === id);
+  const label = (id) => st.names[id] ?? dsName(id);
+  const ticked = () => st.order.filter((id) => st.on[id]);
+  const note = h("div", { class: "muted small" });
+  const dupes = h("div");
+  const list = h("div", { class: "tbl-wrap" });
+  const move = (i, j) => { [st.order[i], st.order[j]] = [st.order[j], st.order[i]]; draw(); };
+  const groupOf = (id) => (info ? info.groups.findIndex((g) => g.includes(id)) : -1);
+  const shareText = (f) => {
+    if (!f) return "made in the app";
+    const parts = [`${f.ids.shared.toLocaleString()} of ${f.ids.distinct.toLocaleString()} IDs in other files`];
+    if (f.ids.no_id) parts.push(`${f.ids.no_id.toLocaleString()} parts without an ID (left out)`);
+    if (f.ids.placeholder) parts.push(`${f.ids.placeholder.toLocaleString()} placeholder IDs`);
+    return parts.join(" · ");
+  };
+  function draw() {
+    const many = info && info.groups.length > 1;
+    list.replaceChildren(h("table", {},
+      h("thead", {}, h("tr", {}, ["", "Order", "Column", "Name in the report", "Same part again", "File", "Lot", "Tester", "Parts", "Shared parts"].map((t) => h("th", {}, t)))),
+      h("tbody", {}, st.order.map((id, i) => {
+        const f = fileInfo(id), g = groupOf(id);
+        const on = st.on[id];
+        return h("tr", {},
+          h("td", {}, h("input", { type: "checkbox", checked: !!on, title: "Include this file in the report", onchange: (e) => { st.on[id] = e.target.checked; draw(); } })),
+          h("td", { style: { whiteSpace: "nowrap" } },
+            h("button", { class: "ghost", title: "Move up", disabled: i === 0, onclick: () => move(i, i - 1) }, "↑"),
+            h("button", { class: "ghost", title: "Move down", disabled: i === st.order.length - 1, onclick: () => move(i, i + 1) }, "↓")),
+          h("td", {}, on ? String(ticked().indexOf(id) + 1) : ""),
+          h("td", {}, h("input", { type: "text", value: label(id), style: { width: "180px" }, title: "The name over this file's columns", oninput: (e) => (st.names[id] = e.target.value) })),
+          h("td", { style: { whiteSpace: "nowrap" } }, f && f.ids.repeats ? [
+            badge(`${f.ids.repeats.toLocaleString()} extra`, "warn"), " ",
+            h("label", { class: "chk", style: { display: "inline-flex" }, title: "Keep only the last test of each part in this file. Leave it off to show every test, one more row per extra test." }, h("input", { type: "checkbox", checked: !!st.last[id], onchange: (e) => { st.last[id] = e.target.checked; draw(); } }), "Last test only"),
+          ] : ""),
+          h("td", {}, dsName(id)),
+          h("td", {}, f ? f.lot : ""),
+          h("td", {}, f ? f.tester : ""),
+          h("td", {}, f ? f.ids.parts.toLocaleString() : ""),
+          h("td", { class: "small" }, many && g >= 0 ? [badge(`group ${String.fromCharCode(65 + g)}`, "neutral"), " "] : "", f && !f.ids.shared ? badge("no shared parts", "warn") : "", f && !f.ids.shared ? " " : "", shareText(f)));
+
+      }))));
+    if (!info) return dupes.replaceChildren();
+    const open = ticked().map(fileInfo).filter((f) => f && f.ids.repeats && !st.last[f.id]);
+    dupes.replaceChildren(...(open.length ? [h("div", { class: "row tight small", style: { margin: "8px 0" } }, badge("same part again", "warn"),
+      `${open.map((f) => `${dsName(f.id)}: ${f.ids.repeats.toLocaleString()} extra tests`).join(" · ")}. Each extra test takes one more row. If the repeats are intended, tick Last test only for that file.`)] : []));
+    const pairs = info.pairs.map((x) => `${dsName(x.a)} and ${dsName(x.b)}: ${x.shared.toLocaleString()}`).join(" · ");
+    note.textContent = info.groups.length ? `${info.in_several.toLocaleString()} parts are in more than one file. Shared parts by pair: ${pairs}.` : "No two open files share a part by this ID. Tick files to report them anyway, or try another ID.";
+  }
+  const detect = async () => {
+    note.textContent = "Looking for shared parts…";
+    try {
+      info = await api("part_trace_detect", { key: kp.value(), filter: scoped(S.filter) });
+      // a file seen for the first time is ticked when it shares parts; after that the tick is the user's
+      for (const f of info.files) {
+        if (st.seen.includes(f.id)) continue;
+        st.seen.push(f.id);
+        st.on[f.id] = groupOf(f.id) >= 0;
+      }
+      draw();
+    } catch (e) { info = null; note.textContent = ""; toast(e.message, "bad"); draw(); }
+  };
+  kp.el.addEventListener("change", detect);
+  const startOf = (id) => { const f = fileInfo(id); return f && f.start_t ? f.start_t : Infinity; };
+  const sorts = h("div", { class: "row tight" },
+    h("button", { title: "Earliest test start (MIR) first", onclick: () => { st.order.sort((a, b) => startOf(a) - startOf(b)); draw(); } }, "Sort by test start time"),
+    h("button", { onclick: () => { st.order.sort((a, b) => dsName(a).localeCompare(dsName(b), undefined, { numeric: true })); draw(); } }, "Sort by file name"),
+    h("button", { title: "Name the ticked files STDF_1, STDF_2… in their current order", onclick: () => { ticked().forEach((id, i) => (st.names[id] = `STDF_${i + 1}`)); draw(); } }, "Name by order"),
+    h("button", { title: "Back to each file's own name", onclick: () => { st.names = {}; draw(); } }, "Reset names"));
+  const first = S.datasets.find((d) => d.paths && d.paths.length);
+  if (!st.path && first) { const dir = dirname(first.paths[0]); st.path = dir + (dir.includes("\\") ? "\\" : "/") + "part_trace.xlsx"; }
+  const [path, pf] = pathField("save", st.path, { title: "Save part trace", name: "part_trace.xlsx", ext: "xlsx" });
+  path.addEventListener("change", () => (st.path = path.value));
+  const res = h("div");
+  const save = async () => {
+    const ids = ticked();
+    if (!ids.length) return toast("Tick at least one file", "bad");
+    if (!path.value) return toast("Choose where to save the report", "bad");
+    st.path = path.value;
+    busy("Writing the part trace…");
+    try {
+      const r = await api("part_trace_export", { runs: ids.map((id) => ({ ds: id, name: label(id), last_only: !!st.last[id] })), key: kp.value(), filter: scoped(S.filter), path: path.value });
+      const s = r.summary;
+      const left = s.runs.reduce((a, x) => a + x.left_out, 0);
+      res.replaceChildren(resultLine(`Saved ${r.path}: ${s.parts.toLocaleString()} parts, ${s.in_several.toLocaleString()} in more than one file, ${s.rows.toLocaleString()} rows${left ? `, ${left.toLocaleString()} earlier tests left out` : ""}`, r.path));
+    } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+  };
+  const scope = scoped(S.filter);
+  el.append(h("div", { class: "card pad section" },
+    h("div", { class: "row" }, field("Identify parts by", kp.el)),
+    scope ? h("div", { class: "row tight small" }, badge("part filter on", "warn"), `Only parts matching ${scope} are traced.`) : "",
+    sorts, list, dupes, note,
+    h("div", { class: "row", style: { marginTop: "10px" } }, pf, h("button", { class: "primary", onclick: save }, "Export to Excel")),
+    res));
+  draw();
+  detect();
 }
 // ---- Part datalog: pick parts, pick tests, write their results
 const DL_MODES = [["part_id", "Part ID"], ["xy", "X/Y"], ["part_txt", "Part text"], ["test_xy", "Die X/Y from tests"]];
