@@ -1072,6 +1072,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "retest_trace" => retest_op(reg, &pp),
         "merge_candidates" => merge_candidates_op(reg),
         "part_trace_detect" => part_trace_detect_op(reg, &pp),
+        "part_trace_audit" => part_trace_audit_op(reg, &pp),
         "part_trace_export" => part_trace_export_op(reg, &pp),
         // part datalog: search parts, then write the chosen tests' results
         "find_parts" => {
@@ -4124,8 +4125,7 @@ fn id_list(v: Option<&Value>) -> Vec<usize> {
 /// Which open files hold the same parts. Datasets made in the app are left out: they are subsets of
 /// a file that is open anyway, so they would always look linked to it.
 fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
-    use crate::parttrace::{detect, Candidate};
-    use data::matching::KeySpec;
+    use crate::parttrace::{detect, key_for, Candidate};
     let key = pp.str_or("key", "part_txt");
     let filter = pp.str("filter");
     let open: Vec<(usize, String, Arc<Dataset>)> = {
@@ -4138,12 +4138,15 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
             })
             .collect()
     };
+    let keys: Vec<(data::matching::KeySpec, bool)> =
+        open.iter().map(|(_, _, ds)| key_for(&key, ds)).collect();
     let cands: Vec<Candidate> = open
         .iter()
-        .map(|(id, _, ds)| {
+        .zip(&keys)
+        .map(|((id, _, ds), (key, _))| {
             Ok(Candidate {
                 ds,
-                key: KeySpec::parse(&key, ds)?,
+                key: key.clone(),
                 rows: reg.rows(*id, ds, &filter)?,
             })
         })
@@ -4152,9 +4155,10 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
     let files: Vec<Value> = open
         .iter()
         .zip(&d.files)
-        .map(|((id, name, ds), st)| {
+        .zip(&keys)
+        .map(|(((id, name, ds), st), (_, missing))| {
             let s = ds.sources.first().cloned().unwrap_or_default();
-            json!({"id": id, "name": name, "start_t": s.start_t, "lot": s.lot_id, "tester": s.node_nam, "ids": st})
+            json!({"id": id, "name": name, "start_t": s.start_t, "lot": s.lot_id, "tester": s.node_nam, "ids": st, "key_missing": missing})
         })
         .collect();
     let id = |i: usize| open[i].0;
@@ -4166,10 +4170,67 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
     }))
 }
 
+/// The identity tests the page sends as `ids`, for the ID audit.
+fn part_trace_ids(pp: &P) -> Option<crate::parttrace::IdTests> {
+    let ids = pp.0.get("ids")?;
+    let text = |k: &str| ids.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let on = |k: &str| ids.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    Some(crate::parttrace::IdTests {
+        wxy: text("wxy"),
+        w: text("w"),
+        x: text("x"),
+        y: text("y"),
+        offsets: on("die").then(|| (text("ox"), text("oy"))),
+        subtract: on("sub"),
+    })
+}
+
+/// Whether part text, WXY and wafer, X, Y agree over the files `ds`, in that order.
+fn part_trace_audit_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::parttrace::{audit, AuditFile};
+    let ids = id_list(pp.0.get("ds"));
+    let tests = part_trace_ids(pp).unwrap_or_default();
+    let filter = pp.str("filter");
+    let dss: Vec<Arc<Dataset>> = ids
+        .iter()
+        .map(|&id| reg.get(id).map(|d| d.0))
+        .collect::<Result<_>>()?;
+    let files: Vec<AuditFile> = ids
+        .iter()
+        .zip(&dss)
+        .map(|(&id, ds)| {
+            Ok(AuditFile {
+                ds,
+                rows: reg.rows(id, ds, &filter)?,
+            })
+        })
+        .collect::<Result<_>>()?;
+    let a = audit(&files, &tests);
+    // the page lists the first few; the workbook has them all
+    let first: Vec<Value> = a
+        .findings
+        .iter()
+        .take(20)
+        .map(|f| {
+            let files: std::collections::BTreeSet<usize> = f.rows.iter().map(|r| r.run).collect();
+            json!({"kind": f.kind, "text": f.text(), "files": files.iter().map(|&k| ids[k]).collect::<Vec<_>>()})
+        })
+        .collect();
+    let of = |k: &str| a.findings.iter().filter(|f| f.kind == k).count();
+    Ok(json!({
+        "problems": a.findings.len(),
+        "wxy_differs": of("wxy_differs"),
+        "id_differs": of("id_differs"),
+        "parts": a.flagged.len(),
+        "compared": a.compared,
+        "rounded": a.rounded,
+        "first": first,
+    }))
+}
+
 /// Writes the part trace workbook: `runs` is [{ds, name}] in the order of the report.
 fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
-    use crate::parttrace::{export, Run};
-    use data::matching::KeySpec;
+    use crate::parttrace::{audit, export_audited, key_for, AuditFile, Audit, Run};
     let out = pp.str("path");
     if out.is_empty() {
         bail!("choose where to save the report");
@@ -4205,13 +4266,26 @@ fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
                     name.clone()
                 },
                 ds,
-                key: KeySpec::parse(&key, ds)?,
+                key: key_for(&key, ds).0,
                 rows: reg.rows(*id, ds, &filter)?,
                 last_only: *last_only,
             })
         })
         .collect::<Result<_>>()?;
-    let s = export(&runs, std::path::Path::new(&out), &filter)?;
+    let found = match part_trace_ids(pp) {
+        Some(tests) => {
+            let files: Vec<AuditFile> = runs
+                .iter()
+                .map(|r| AuditFile {
+                    ds: r.ds,
+                    rows: r.rows.clone(),
+                })
+                .collect();
+            audit(&files, &tests)
+        }
+        None => Audit::default(),
+    };
+    let s = export_audited(&runs, std::path::Path::new(&out), &filter, &found)?;
     Ok(json!({"path": out, "summary": s}))
 }
 

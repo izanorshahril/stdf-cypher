@@ -353,3 +353,10 @@ tr.row-warn td { background: color-mix(in srgb, var(--warn) 9%, transparent); }
 .trim-panel[hidden] { display: none; }
 .quota-ask { margin: 8px 0; border-color: var(--warn); }
 .quota-ask[hidden] { display: none; }
+/* Settings: the order of part IDs */
+.id-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 10px 0; border-top: 1px solid var(--border); }
+.id-row:first-child { border-top: 0; }
+.id-rank { width: 20px; font-weight: 600; color: var(--muted); }
+.id-what { flex: 1 1 220px; min-width: 0; }
+.id-tests { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; flex: 2 1 320px; }
+.id-move { margin-left: auto; }

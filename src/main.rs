@@ -85,7 +85,8 @@ enum Cmd {
         /// the workbook to write (.xlsx)
         #[arg(short, long)]
         out: PathBuf,
-        /// how parts are identified: part_txt, part_id, xy, wafer_xy or tests:NUM[,NUM…]
+        /// how parts are identified: part_txt, tests:80149, tests:80100,80101,80102 (a combination),
+        /// part_id, wafer_xy or xy
         #[arg(long, default_value = "part_txt")]
         key: String,
         /// a name for each file's columns, e.g. "V93K first,V93K retest" (default: file names)
@@ -95,6 +96,15 @@ enum Cmd {
         /// such as 1,3 (default: every test, one more row per extra test)
         #[arg(long, default_value = "")]
         last_only: String,
+        /// the WXY test the ID audit compares with part text and wafer, X, Y
+        #[arg(long, default_value = "80149")]
+        wxy_test: String,
+        /// the wafer, X and Y tests the ID audit compares
+        #[arg(long, value_delimiter = ',', default_values_t = ["80100".to_string(), "80101".to_string(), "80102".to_string()])]
+        wxy_tests: Vec<String>,
+        /// X and Y offset tests, when die X and Y are the tests with these added
+        #[arg(long, value_delimiter = ',')]
+        offset_tests: Vec<String>,
         #[command(flatten)]
         l: LoadArgs,
     },
@@ -716,9 +726,11 @@ fn run() -> Result<()> {
             key,
             names,
             last_only,
+            wxy_test,
+            wxy_tests,
+            offset_tests,
             l,
         } => {
-            use stdf_cypher::data::matching::KeySpec;
             use stdf_cypher::parttrace::{self, Candidate, Run};
             if files.is_empty() {
                 bail!("no input files");
@@ -742,10 +754,16 @@ fn run() -> Result<()> {
                         .file_name()
                         .map_or(ds.name.clone(), |n| n.to_string_lossy().to_string())
                 });
+                let (spec, missing) = parttrace::key_for(&key, ds);
+                if missing {
+                    eprintln!(
+                        "warning: {name} does not log {key}: its parts have no ID and are left out"
+                    );
+                }
                 runs.push(Run {
                     name,
                     ds,
-                    key: KeySpec::parse(&key, ds)?,
+                    key: spec,
                     rows: rows(ds, &l.filter)?,
                     last_only: last[i],
                 });
@@ -766,6 +784,17 @@ fn run() -> Result<()> {
                 .files
                 .iter()
                 .enumerate()
+                .filter(|(_, f)| f.rounded > 0)
+            {
+                eprintln!(
+                    "warning: {} has {} IDs above 16,777,216: STDF stores results as 32-bit floats, so these are rounded and different parts can share one",
+                    runs[i].name, f.rounded
+                );
+            }
+            for (i, f) in found
+                .files
+                .iter()
+                .enumerate()
                 .filter(|(_, f)| f.repeats > 0)
             {
                 let what = if last[i] {
@@ -778,7 +807,39 @@ fn run() -> Result<()> {
                     runs[i].name, f.repeats
                 );
             }
-            let s = parttrace::export(&runs, &out, &l.filter)?;
+            if wxy_tests.len() != 3 {
+                bail!("--wxy-tests takes the wafer, X and Y tests");
+            }
+            if !offset_tests.is_empty() && offset_tests.len() != 2 {
+                bail!("--offset-tests takes the X and Y offset tests");
+            }
+            let tests = parttrace::IdTests {
+                wxy: wxy_test,
+                w: wxy_tests[0].clone(),
+                x: wxy_tests[1].clone(),
+                y: wxy_tests[2].clone(),
+                offsets: (offset_tests.len() == 2)
+                    .then(|| (offset_tests[0].clone(), offset_tests[1].clone())),
+                subtract: false,
+            };
+            let audit_files: Vec<parttrace::AuditFile> = runs
+                .iter()
+                .map(|r| parttrace::AuditFile {
+                    ds: r.ds,
+                    rows: r.rows.clone(),
+                })
+                .collect();
+            let id_audit = parttrace::audit(&audit_files, &tests);
+            for f in id_audit.findings.iter().take(20) {
+                eprintln!("warning: IDs do not agree: {}", f.text());
+            }
+            if id_audit.findings.len() > 20 {
+                eprintln!(
+                    "warning: {} more ID problems: see the ID audit sheet",
+                    id_audit.findings.len() - 20
+                );
+            }
+            let s = parttrace::export_audited(&runs, &out, &l.filter, &id_audit)?;
             println!(
                 "{} parts, {} in more than one file, {} rows -> {}",
                 s.parts,
