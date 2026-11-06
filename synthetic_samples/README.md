@@ -29,12 +29,25 @@ stdf-cypher gives the same Qualification drift results on both sets.
 * SDR with the handler or prober, probe card, loadboard, DIB and socket IDs.
 * GDR.MIR_ADD and GDR.AUTOMATION, and GDR.REF_DIE after each WIR in wafer sort.
 * One soft and one hard bin per test number, with a name for every bin.
+* The STDF V4 records the profile does not make mandatory too, so a reader meets every record type: ATR (the command that wrote the file), BPS and EPS around the tests of each touchdown, DTR (lot and wafer start, instrument alarms), and RDR in the retest file.
+* Instrument alarms: a PTR whose alarm flag (TEST_FLG bit 0) is set gets an alarm record with its site, test, instrument, code, severity and message, in three vendor styles in turn: a DTR of `KEY=value` pairs (`INST_ALARM SITE=2 TEST=1110 INSTR=DIGITAL16 CODE=0x1456 SEVERITY=WARN MSG=...`), a GDR of the same fields, and a DTR of free text (`WARN: instrument alarm on site 4, test 1010, resource DCVI6: settling timeout (code 0x13F2)`).
 
 The GDR field layout is an assumption: the profile summary used here names these GDRs and what they carry, not their fields.
 Each is written as its name (`C*n`) followed by `KEY=value` text fields, for example `REF_DIE`, `X_DIST=0`, `Y_DIST=0`, `X=0`, `Y=0`.
 Check them against the full profile document before relying on them.
 
-Not generated: ATR (no post-processing), RDR (no offline retest of selected bins), the high-parallelism site encoding (more than 255 sites), the V4-2007.1 scan-diagnosis records, the R&R and PAT/SPL file types (MIR PROC_ID `RR` and `PAT`), and the profile's lowercase file-name layouts.
+Not generated: the high-parallelism site encoding (more than 255 sites), the V4-2007.1 scan-diagnosis records, the R&R and PAT/SPL file types (MIR PROC_ID `RR` and `PAT`), and the profile's lowercase file-name layouts.
+
+## STDF V4 record coverage
+
+| Records | plain | tc_profile |
+|---|---|---|
+| FAR, MIR, MRR, SDR, PIR, PRR, PTR, MPR, FTR, PMR, HBR, SBR, PCR, TSR | yes | yes, per site and summary |
+| WIR, WRR, WCR | wafer sort | wafer sort |
+| RDR | retest file | retest file |
+| PGR, PLR, ATR, BPS, EPS, GDR, DTR | no | yes |
+
+All 25 record types of STDF V4 are in `tc_profile`: 24 in every wafer-sort file and RDR in the retest file.
 
 ## demo
 
@@ -45,8 +58,10 @@ Wafer sort, 3 wafers, 4 sites, 40 tests, 1,443 parts per file.
 | `synthetic_demo_lotA.stdf` | Lot SYNTH_A, the reference lot |
 | `synthetic_demo_lotB_shifted.stdf` | Lot SYNTH_B: other parts, every test mean shifted by 0.6 sigma |
 | `synthetic_demo_lotA_tester2.stdf` | Lot SYNTH_A's parts again on a second tester: re-measurement noise of 0.3 sigma and an offset of 1.5 sigma on every 3rd test |
+| `synthetic_demo_lotA_retest_bins2_3.stdf` | Offline retest of lot SYNTH_A's hard bins 2 and 3: only the 51 parts the first run put in them, with their part IDs, an RDR naming the bins and MIR CMOD_COD `F`, re-measured with 0.3 sigma noise |
 
-Use them for Compare (lot A against lot B), Correlation and Match (lot A against its second-tester run), ANOVA and Wafer maps.
+Use them for Compare (lot A against lot B), Correlation and Match (lot A against its second-tester run), Retest trace (lot A and its retest), ANOVA and Wafer maps.
+In `tc_profile`, Overview lists the instrument alarms stdf-cypher decodes from the GDR and DTR records.
 
 ## qual
 
@@ -73,6 +88,7 @@ For the `tc_profile` set, add `--profile tc` and write to `tc_profile/` instead 
 stdf-cypher synthetic-sample plain/demo/synthetic_demo_lotA.stdf --lot SYNTH_A
 stdf-cypher synthetic-sample plain/demo/synthetic_demo_lotB_shifted.stdf --lot SYNTH_B --seed 2 --shift 0.6
 stdf-cypher synthetic-sample plain/demo/synthetic_demo_lotA_tester2.stdf --lot SYNTH_A --meas-noise 0.3 --tester-offset 1.5
+stdf-cypher synthetic-sample plain/demo/synthetic_demo_lotA_retest_bins2_3.stdf --lot SYNTH_A --retest-bins 2,3 --meas-noise 0.3 --meas-seed 1
 stdf-cypher synthetic-sample plain/qual/synthetic_endurance_4site_1200loops.stdf --lot SYNTH_LOOP --touchdowns 1200 --sites 4 --dut-pool 4 --empty 0 --seed 3
 stdf-cypher synthetic-sample plain/qual/synthetic_loop_old_tp.stdf --lot SYNTH_LOOP --touchdowns 40 --sites 4 --dut-pool 4 --empty 0 --seed 3
 stdf-cypher synthetic-sample plain/qual/synthetic_loop_new_tp.stdf --lot SYNTH_LOOP --touchdowns 40 --sites 4 --dut-pool 4 --empty 0.05 --seed 4

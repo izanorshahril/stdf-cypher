@@ -1982,6 +1982,7 @@ mod tests {
             alarms: vec![],
             fails: vec![],
             partial: false,
+            inst_alarms: 0,
         }
     }
 

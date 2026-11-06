@@ -122,7 +122,7 @@ Tabular commands print the top rows; add `-o file.csv` for the full table.
 | `report FILES… -o report.html [--offline] [--title T]` | Self-contained interactive report |
 | `app [FILES…]` | Desktop app (what a double-click does) |
 | `serve [FILES…] [--port 8765] [--merge] [--no-open]` | Dashboard as a local web server (e.g. on a shared machine) |
-| `synthetic-sample OUT [--profile plain\|tc] [--wafers --sites --tests --shift --meas-noise --tester-offset --big-endian --final-test]` | Synthetic STDF (made-up data, not from a tester); `--profile tc` follows the custom test-cell profile |
+| `synthetic-sample OUT [--profile plain\|tc] [--wafers --sites --tests --shift --meas-noise --tester-offset --big-endian --final-test] [--retest-bins 2,3]` | Synthetic STDF (made-up data, not from a tester); `--retest-bins` writes an offline retest of those hard bins (RDR, CMOD F); `--profile tc` follows the custom test-cell profile |
 | `synthetic-sample OUT --touchdowns N [--profile plain\|tc] [--sites 8] [--dut-pool 8] [--empty 0.05] [--no-pir-runs]` | Dummy touchdown file for the touchdown and loop experiment: N touchdowns of up to `--sites` parts, the DUTs of `--dut-pool` back on every loop (0 = new DUTs), one test time per touchdown, site 3 yields less. `--no-pir-runs` writes no PIR runs |
 
 ### Examples
@@ -161,13 +161,13 @@ stdf-cypher ml explain lot.stdf --target hbin
 
 | Syntax | Example |
 |---|---|
-| Fields | `part_id file head site x y xy hbin sbin pass fail wafer lot sublot num_test test_t part_txt index retest alarm first_fail n_fails` |
+| Fields | `part_id file head site x y xy hbin sbin pass fail wafer lot sublot num_test test_t part_txt index retest alarm inst_alarm first_fail n_fails` |
 | Test values | `t[1000]` (test number), `t["VDD_LEAK"]` (name), `t["1000:VDD_LEAK"]` (key) |
 | Comparison | `=  ==  !=  <  <=  >  >=` |
 | Sets / ranges | `hbin in (2, 5..9)`, `site not in (3)`, `t[1000] between 0.1 and 0.4` |
 | Regex | `wafer ~ "W0[1-3]$"`, `part_txt !~ "RETEST"` |
 | List file | `part_id in @ids.txt` (one value per line, `#` comments allowed) |
-| Boolean | `and or not ( )`, also `&& || !`; bare `pass` / `fail` / `retest` / `alarm` (any test with the TEST_FLG alarm bit) |
+| Boolean | `and or not ( )`, also `&& || !`; bare `pass` / `fail` / `retest` / `alarm` (any test with the TEST_FLG alarm bit) / `inst_alarm` (an instrument alarm in a GDR or DTR record) |
 | Failed tests | `fail(1013)` (failed test 1013: tester flag or outside limits), `fail(1013, 1020)`, `first_fail = 1013`, `fail(1013) and n_fails = 1` (failed only that test) |
 | Part sets | `$match`, `not $match and pass`: parts matched to another file in *Match, merge & trace* (dashboard only) |
 
@@ -237,7 +237,8 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
 * **Memory model:** column-major `f32` test matrix (parts × tests). 100k parts × 1,000 tests ≈ 400 MB. Records you don't need are skipped without decoding.
 * **Test identity:** `"<num>:<name>"`. A PTR with an empty TEST_TXT inherits the last name used for that number. MPR pins become `"<num>:<name>[<pin>]"`.
 * **Limits:** taken from the first PTR/MPR that carries them, honouring OPT_FLAG (bits 4–7 invalid/no limit, bits 2–3 spec). A PTR whose own limits differ from the test's keeps them per part, and the trend draws them as per-part limit lines.
-* **Datalog:** GDR and DTR records are kept in file order with the part they follow, and listed in the Overview.
+* **Datalog:** GDR and DTR records are kept in file order with the part they follow, and listed in the Overview; a GDR shows as its fields joined by `; ` (text as it is, numbers as numbers, bytes in hex).
+* **Instrument alarms:** STDF V4 has no alarm record, so testers set the TEST_FLG alarm bit and some vendors write the details as a DTR or GDR. A record whose text has the word ALARM (`ALARM`, `INST_ALARM`, `Alarm:`, but not `NO ALARM`) is read as one: site, head, test, instrument (instrument, resource, board, channel or pin), code, severity and message come from `KEY=value` pairs (`SITE=2 TEST=1030 INSTR=PPMU12 CODE=0x1203 SEVERITY=WARN MSG=...`) or, where a key is missing, from free text (`site 3`, `site#3`, `test 1010`, `resource DCVI6`, `pin VDD1`, `(code 0x2201)`, ERROR/WARN). An alarm with a site is tied to the part tested on that site when it was logged: the first part of that site whose PRR follows the record. Overview lists them with their part, and the filter field `inst_alarm` selects those parts.
 * **Pass/fail:** from PRR PART_FLG. A per-test fail comes from TEST_FLG bit 7 or is out of limits.
 * **Touchdown and loop (experiment):** STDF does not name the touchdown, so it is estimated. Where the file has runs of PIR records (one run per touchdown, written before the results) the runs are used. Otherwise the parts are cut by site order (a touchdown's sites rise, so a site that does not rise starts a new touchdown) and by test time (the parts of a touchdown finish together, and TEST_T is whole milliseconds). Loop: how often the same part ID (or part text) has come up before in the file, e.g. one DUT set tested again on every loop. Numbering starts at 1 unless set to 0. Off by default: switch it on under Settings, Experiments.
 * **Splitting** is a two-pass process. First the dataset is loaded, so a filter can use test values. Then raw records are streamed and each PIR…PRR block is copied unchanged. TSR records are dropped from split and trim outputs because they can't be recomputed exactly. Records between two parts (datalog) follow the last part before them, so they are dropped with a dropped part. A part cut off before its PRR is copied as it is, without bin or verdict.

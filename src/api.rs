@@ -990,6 +990,41 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             let (ds, _) = reg.get(id)?;
             Ok(json!(ds.datalog))
         }
+        "inst_alarms" => {
+            // the instrument alarms the GDR and DTR records report, with the part each was on
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            let rows: Vec<Value> = ds
+                .datalog
+                .iter()
+                .filter_map(|e| {
+                    let a = e.alarm.as_ref()?;
+                    let p = a.row.map(|r| &ds.parts[r]);
+                    let test_name = a
+                        .test
+                        .and_then(|n| ds.tests.iter().find(|t| t.num == n))
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default();
+                    Some(json!({
+                        "kind": e.kind,
+                        "after_part": e.after_part,
+                        "row": a.row,
+                        "part_id": p.map(|p| p.part_id.clone()).unwrap_or_default(),
+                        "head": a.head,
+                        "site": a.site,
+                        "test": a.test,
+                        "test_name": test_name,
+                        "instrument": a.instrument,
+                        "code": a.code,
+                        "severity": a.severity,
+                        "message": a.message,
+                        "text": e.text,
+                    }))
+                })
+                .collect();
+            let parts = ds.parts.iter().filter(|p| p.inst_alarms > 0).count();
+            Ok(json!({"alarms": rows, "parts": parts}))
+        }
         "overview" => {
             let id = pp.usize("ds", 0);
             let (ds, _) = reg.get(id)?;

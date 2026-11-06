@@ -201,9 +201,14 @@ fn gdr(w: &mut StdfWriter, name: &str, fields: &[(&str, String)]) -> Result<()> 
     Ok(())
 }
 
+/// Instrument alarms written so far: picks the next vendor style.
+fn tally_alarms(t: &Tally) -> usize {
+    t.tests.values().map(|x| x.alarm as usize).sum()
+}
+
 /// The MIR fields a TC-profile file fills in, on top of the ones every file has.
-fn tc_mir(mir: &mut Mir, flow: &str, retest: bool, final_test: bool) {
-    mir.cmod_cod = if retest { 'R' } else { 'T' };
+fn tc_mir(mir: &mut Mir, flow: &str, cmod: char, final_test: bool) {
+    mir.cmod_cod = cmod;
     mir.flow_id = flow.to_string();
     mir.oper_nam = "synthetic".into();
     mir.exec_ver = "1.0".into();
@@ -318,6 +323,9 @@ pub struct SampleSpec {
     pub latent_tests: Vec<u32>,
     /// the STDF profile the file follows
     pub profile: Profile,
+    /// an offline retest of these hard bins: only the parts the first run (same spec, no
+    /// meas_seed) put in them, after an RDR; set meas_seed for another draw of their values
+    pub retest_bins: Vec<u16>,
 }
 
 /// Uniform 0..1 from a die position and a salt (splitmix64), independent of
@@ -359,6 +367,7 @@ impl Default for SampleSpec {
             extra_tests: vec![],
             latent_tests: vec![],
             profile: Profile::Plain,
+            retest_bins: vec![],
         }
     }
 }
@@ -386,7 +395,80 @@ fn limit_factor(spec: &SampleSpec, wi: usize) -> f64 {
     }
 }
 
+/// Writes a synthetic wafer-sort (or final-test) file. With `retest_bins` it is an offline
+/// retest of those hard bins: the first run is made first, and only the parts it put in those
+/// bins are written, after an RDR naming the bins.
 pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
+    if spec.retest_bins.is_empty() {
+        return generate_inner(path.as_ref(), spec, None);
+    }
+    let first = SampleSpec {
+        meas_seed: 0,
+        retest_bins: vec![],
+        ..spec.clone()
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let tmp = std::env::temp_dir().join(format!(
+        "stdf-cypher-first-run-{}-{nanos}.stdf",
+        std::process::id()
+    ));
+    let bins = generate_inner(&tmp, &first, None).and_then(|_| first_run_bins(&tmp));
+    let _ = std::fs::remove_file(&tmp);
+    let keep: Vec<bool> = bins?.iter().map(|b| spec.retest_bins.contains(b)).collect();
+    generate_inner(path.as_ref(), spec, Some(&keep))
+}
+
+/// The hard bin of every part of a file, in file order.
+fn first_run_bins(path: &Path) -> Result<Vec<u16>> {
+    let mut rdr = StdfReader::open(path)?;
+    let mut bins = vec![];
+    while let Some((_, rec)) = rdr.next_record()? {
+        if let Record::PRR(p) = rec {
+            bins.push(p.hard_bin);
+        }
+    }
+    Ok(bins)
+}
+
+/// An instrument alarm on `site` during test `num`, as a vendor might log it: alternately a DTR
+/// of `KEY=value` pairs, a GDR of the same fields, and a DTR of free text.
+fn alarm_record(w: &mut StdfWriter, k: usize, site: u8, num: u32, name: &str) -> Result<()> {
+    let instr = ["PPMU", "DPS", "DCVI", "DIGITAL"][k % 4];
+    let unit = 1 + (num / 10) % 16;
+    let code = format!("0x{:04X}", 0x1000 + (num % 0x1000));
+    let msg = ["clamp current reached", "over current", "settling timeout", "fail-safe trip"][k % 4];
+    let sev = if k % 5 == 4 { "ERROR" } else { "WARN" };
+    match k % 3 {
+        0 => w.write(&Record::DTR(Dtr {
+            text_dat: format!(
+                "INST_ALARM SITE={site} TEST={num} INSTR={instr}{unit} CODE={code} SEVERITY={sev} MSG={msg} ({name})"
+            ),
+        }))?,
+        1 => gdr(
+            w,
+            "INST_ALARM",
+            &[
+                ("HEAD", "1".into()),
+                ("SITE", site.to_string()),
+                ("TEST", num.to_string()),
+                ("INSTR", format!("{instr}{unit}")),
+                ("CODE", code),
+                ("SEVERITY", sev.into()),
+                ("MSG", msg.into()),
+            ],
+        )?,
+        _ => w.write(&Record::DTR(Dtr {
+            text_dat: format!(
+                "{sev}: instrument alarm on site {site}, test {num}, resource {instr}{unit}: {msg} (code {code})"
+            ),
+        }))?,
+    }
+    Ok(())
+}
+
+fn generate_inner(path: &Path, spec: &SampleSpec, keep: Option<&[bool]>) -> Result<usize> {
     let mut rng = rand::rngs::StdRng::seed_from_u64(spec.seed);
     let defs_rng = &mut rand::rngs::StdRng::seed_from_u64(42); // same test program for every file
     let names = [
@@ -466,6 +548,17 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
     let mut tally = Tally::default();
     // a retest (meas_seed) starts later, so files sort by test time
     let t0 = 1_760_000_000u32 + spec.meas_seed as u32 * 7200;
+    if tc {
+        // V4: a program that writes or changes a file records itself in an ATR
+        w.write(&Record::ATR(Atr {
+            mod_tim: t0,
+            cmd_line: format!(
+                "stdf-cypher synthetic-sample --profile tc --lot {} --seed {} ({SYNTHETIC_NOTE})",
+                spec.lot_id, spec.seed
+            ),
+        }))?;
+    }
+    let retest_bins = !spec.retest_bins.is_empty();
     let mut mir = Box::new(Mir {
         setup_t: t0,
         start_t: t0,
@@ -491,13 +584,33 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
         ..Default::default()
     });
     let step = if spec.final_test { "FT" } else { "WS1" };
+    // CMOD: T a first run, R a 100% retest, F a retest of rejects (selected bins)
+    let cmod = if retest_bins {
+        'F'
+    } else if spec.meas_seed != 0 {
+        'R'
+    } else {
+        'T'
+    };
     if tc {
-        tc_mir(&mut mir, step, spec.meas_seed != 0, spec.final_test);
+        tc_mir(&mut mir, step, cmod, spec.final_test);
+    }
+    if retest_bins {
+        mir.cmod_cod = 'F';
+        mir.rtst_cod = 'Y';
     }
     w.write(&Record::MIR(mir))?;
+    if retest_bins {
+        w.write(&Record::RDR(Rdr {
+            rtst_bin: spec.retest_bins.clone(),
+        }))?;
+    }
     if tc {
         w.write(&Record::SDR(Box::new(tc_sdr(spec.sites, spec.final_test, spec.loadboard))))?;
         tc_gdrs(&mut w, step, spec.final_test)?;
+        w.write(&Record::DTR(Dtr {
+            text_dat: format!("LOT START {} {step} ({SYNTHETIC_NOTE})", spec.lot_id),
+        }))?;
     } else {
         w.write(&Record::SDR(Box::new(Sdr {
             head_num: 1,
@@ -558,6 +671,7 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
     let mut first_mpr = true;
     let mut first_log = true;
     let mut part_no = 0usize;
+    let mut written = 0usize;
     let r = spec.radius;
     let n_wafers = if spec.final_test { 1 } else { spec.wafers };
     for wi in 0..n_wafers {
@@ -581,6 +695,9 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                         ("Y", "0".into()),
                     ],
                 )?;
+                w.write(&Record::DTR(Dtr {
+                    text_dat: format!("WAFER START {wafer_id}"),
+                }))?;
             }
         }
         let mut dies = vec![];
@@ -600,8 +717,14 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
         let wafer_off: f64 = n01.sample(&mut rng) * 0.3;
         let (mut wgood, mut wcnt) = (0u32, 0u32);
         for chunk in dies.chunks(spec.sites as usize) {
+            // the parts of this touchdown a retest of selected bins writes (all, otherwise)
+            let base = part_no;
+            let kept = |site: u8| keep.is_none_or(|k| k.get(base + site as usize - 1).copied().unwrap_or(false));
             // open all sites (multi-site touchdown)
             for (si, _) in chunk.iter().enumerate() {
+                if !kept(si as u8 + 1) {
+                    continue;
+                }
                 w.write(&Record::PIR(Pir {
                     head_num: 1,
                     site_num: si as u8 + 1,
@@ -675,8 +798,15 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                 }
                 results.push((site, x, y, vals, fail_test, latent));
             }
+            let any_kept = (1..=chunk.len() as u8).any(kept);
+            if tc && any_kept {
+                w.write(&Record::BPS(Bps {
+                    seq_name: "MAIN".into(),
+                }))?;
+            }
             // interleave test records site by site (as testers typically do)
             for (ti, d) in defs.iter().enumerate() {
+                let mut wrote = false;
                 // stored = shown / 10^RES_SCAL (e.g. 12 uA logged as 1.2e-5 A, RES_SCAL 6)
                 let (scale, base) = crate::analysis::candidates::unit_scale(d.units);
                 let (scale, units, res_scal) = if base_units && scale != 1.0 {
@@ -691,7 +821,14 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     let with_lim = full || spec.dynamic_limits;
                     let f = limit_factor(spec, wi);
                     let alarm = arng.gen_bool(0.002);
+                    if !kept(*site) {
+                        continue;
+                    }
+                    wrote = true;
                     tally.result(d.num, 'P', &d.name, *site, &[f64::from(v as f32)], fail, alarm);
+                    if alarm && tc {
+                        alarm_record(&mut w, tally_alarms(&tally), *site, d.num, &d.name)?;
+                    }
                     w.write(&Record::PTR(Ptr {
                         test_num: d.num,
                         head_num: 1,
@@ -711,7 +848,9 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                         ..Default::default()
                     }))?;
                 }
-                first_ptr[ti] = false;
+                if wrote {
+                    first_ptr[ti] = false;
+                }
             }
             // MPR: 4-pin continuity
             for ri in 0..results.len() {
@@ -725,6 +864,13 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     .collect();
                 let fail = rs.iter().any(|&v| !(0.2..=0.7).contains(&v));
                 let pins: Vec<f64> = rs.iter().map(|&v| f64::from(v)).collect();
+                let ffail = rng.gen_bool(0.01);
+                if ffail && results[ri].4.is_none() {
+                    results[ri].4 = Some(usize::MAX);
+                }
+                if !kept(*site) {
+                    continue;
+                }
                 tally.result(100, 'M', "CONTINUITY", *site, &pins, fail, false);
                 w.write(&Record::MPR(Mpr {
                     test_num: 100,
@@ -747,8 +893,8 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     hi_spec: first_mpr.then_some(0.0),
                     ..Default::default()
                 }))?;
+                first_mpr = false;
                 // functional test
-                let ffail = rng.gen_bool(0.01);
                 tally.result(9000, 'F', "FUNC_MAIN", *site, &[], ffail, false);
                 w.write(&Record::FTR(Box::new(Ftr {
                     test_num: 9000,
@@ -759,14 +905,13 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     vect_nam: "pat_main".into(),
                     ..Default::default()
                 })))?;
-                if ffail && results[ri].4.is_none() {
-                    results[ri].4 = Some(usize::MAX);
-                }
             }
-            first_mpr = false;
             // traceability datalog: a unique wafer+X/Y code, then wafer and the die
             // position inside its 4x4 reticle plus the reticle offset (X = raw + offset)
             for (site, x, y, _, _, _) in &results {
+                if !kept(*site) {
+                    continue;
+                }
                 let code =
                     (wi as f64 + 1.0) * 10000.0 + (*x as f64 + 50.0) * 100.0 + (*y as f64 + 50.0);
                 let (ox, oy) = (x.div_euclid(4) * 4, y.div_euclid(4) * 4);
@@ -803,8 +948,16 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                 }
                 first_log = false;
             }
+            if tc && any_kept {
+                w.write(&Record::EPS)?;
+            }
             for (site, x, y, _, fail_test, _) in &results {
                 part_no += 1;
+                let test_t = 120 + rng.gen_range(0..30);
+                if !kept(*site) {
+                    continue;
+                }
+                written += 1;
                 let (hb, sb) = match fail_test {
                     None => (1u16, 1u16),
                     Some(usize::MAX) => (6, 60),
@@ -843,7 +996,7 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
                     soft_bin: sb,
                     x_coord: if spec.final_test { -32768 } else { *x },
                     y_coord: if spec.final_test { -32768 } else { *y },
-                    test_t: 120 + rng.gen_range(0..30),
+                    test_t,
                     part_id: part_no.to_string(),
                     part_txt: if !tc {
                         format!("{}-W{:02}-X{}Y{}", spec.lot_id, wi + 1, x, y)
@@ -882,7 +1035,7 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
             ..Default::default()
         }))?;
         w.finish()?;
-        return Ok(part_no);
+        return Ok(written);
     }
     for (ti, d) in defs.iter().enumerate() {
         let _ = ti;
@@ -954,7 +1107,7 @@ pub fn generate(path: impl AsRef<Path>, spec: &SampleSpec) -> Result<usize> {
         ..Default::default()
     }))?;
     w.finish()?;
-    Ok(part_no)
+    Ok(written)
 }
 
 /// A dummy multi-site file for the touchdown and loop estimate: touchdowns of up
@@ -1015,6 +1168,15 @@ pub fn touchdown_file(path: impl AsRef<Path>, spec: &TouchSpec) -> Result<Vec<u3
     let tc = spec.profile == Profile::Tc;
     let mut tally = Tally::default();
     let t0 = 1_760_000_000u32;
+    if tc {
+        w.write(&Record::ATR(Atr {
+            mod_tim: t0,
+            cmd_line: format!(
+                "stdf-cypher synthetic-sample --profile tc --touchdowns {} --lot {} --seed {} ({SYNTHETIC_NOTE})",
+                spec.touchdowns, spec.lot_id, spec.seed
+            ),
+        }))?;
+    }
     let mut mir = Box::new(Mir {
         setup_t: t0,
         start_t: t0,
@@ -1036,12 +1198,15 @@ pub fn touchdown_file(path: impl AsRef<Path>, spec: &TouchSpec) -> Result<Vec<u3
         ..Default::default()
     });
     if tc {
-        tc_mir(&mut mir, "FT", false, true);
+        tc_mir(&mut mir, "FT", 'T', true);
     }
     w.write(&Record::MIR(mir))?;
     if tc {
         w.write(&Record::SDR(Box::new(tc_sdr(spec.sites.max(1), true, None))))?;
         tc_gdrs(&mut w, "FT", true)?;
+        w.write(&Record::DTR(Dtr {
+            text_dat: format!("LOT START {} FT ({SYNTHETIC_NOTE})", spec.lot_id),
+        }))?;
     }
     // test number, name, units, lo, hi, nominal, sigma
     let tests: [(u32, &str, &str, f64, f64, f64, f64); 2] = [
@@ -1094,6 +1259,11 @@ pub fn touchdown_file(path: impl AsRef<Path>, spec: &TouchSpec) -> Result<Vec<u3
                 }))?;
             }
         }
+        if tc {
+            w.write(&Record::BPS(Bps {
+                seq_name: "MAIN".into(),
+            }))?;
+        }
         for (k, &(site, _)) in active.iter().enumerate() {
             if !spec.pir_runs {
                 w.write(&Record::PIR(Pir {
@@ -1135,6 +1305,9 @@ pub fn touchdown_file(path: impl AsRef<Path>, spec: &TouchSpec) -> Result<Vec<u3
                     ..Default::default()
                 }))?;
             }
+        }
+        if tc {
+            w.write(&Record::EPS)?;
         }
         for (k, &(site, dut)) in active.iter().enumerate() {
             let bin = if pass[k] { 1 } else { 30 };

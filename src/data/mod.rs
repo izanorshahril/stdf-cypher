@@ -1,6 +1,7 @@
 //! In-memory analytic model of one or more STDF files:
 //! a part table (one row per PRR) and a column-major test matrix.
 
+pub mod alarm;
 pub mod filter;
 pub mod loader;
 pub mod matching;
@@ -112,6 +113,8 @@ pub struct Part {
     pub fails: Vec<u32>,
     /// the file ends before this part's PRR (see SourceInfo::partial_parts): kept, without bin or verdict
     pub partial: bool,
+    /// instrument alarms the GDR and DTR records report on this part (see `alarm`)
+    pub inst_alarms: u16,
 }
 
 impl Part {
@@ -184,6 +187,8 @@ pub struct DatalogEntry {
     pub kind: String,
     pub after_part: usize,
     pub text: String,
+    /// the instrument alarm the record reports, if it is one
+    pub alarm: Option<alarm::InstAlarm>,
 }
 
 /// The limits of one test, one entry per part (NaN = no limit for that part).
@@ -238,6 +243,7 @@ pub const PART_FIELDS: &[&str] = &[
     "xy",
     "retest",
     "alarm",
+    "inst_alarm",
     "first_fail",
     "n_fails",
     "loadboard",
@@ -379,6 +385,7 @@ impl Dataset {
             "index" | "row" => FieldValue::Num(row as f64),
             "retest" => FieldValue::Bool(p.part_flg & 0x03 != 0),
             "alarm" => FieldValue::Bool(!p.alarms.is_empty()),
+            "inst_alarm" => FieldValue::Bool(p.inst_alarms > 0),
             "first_fail" => p
                 .first_fail
                 .map(|f| FieldValue::Num(self.tests[f as usize].num as f64))
@@ -677,6 +684,10 @@ impl Dataset {
             for e in d.datalog {
                 out.datalog.push(DatalogEntry {
                     after_part: e.after_part + n_before,
+                    alarm: e.alarm.map(|a| alarm::InstAlarm {
+                        row: a.row.map(|r| r + n_before),
+                        ..a
+                    }),
                     ..e
                 });
             }

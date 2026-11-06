@@ -431,6 +431,18 @@ async function viewOverview(el) {
       table(dl.lastChild, [{ key: "kind", label: "Kind" }, { key: "after_part", label: "After part", num: true }, { key: "text", label: "Text" }], rows, { search: true });
     });
     body.append(dl);
+    // instrument alarms some testers log as GDR or DTR records, decoded and tied to their parts
+    const al = h("div");
+    body.append(al);
+    api("inst_alarms", { ds: S.ds }).then((r) => {
+      if (!r.alarms.length) return;
+      al.append(h("h2", {}, "Instrument alarms"),
+        h("p", { class: "lead" }, `${r.alarms.length.toLocaleString()} alarm records in the GDR and DTR records, on ${r.parts.toLocaleString()} parts. Site, test, instrument, code and severity are read from KEY=value pairs or the record's text; an alarm is tied to the part of its site tested when it was logged. The part filter field inst_alarm selects these parts.`),
+        h("div", { class: "row" }, h("button", { onclick: () => useFilter(S.ds, andF(S.filter, "inst_alarm")) }, "Filter to parts with an instrument alarm")));
+      const t = h("div");
+      al.append(t);
+      table(t, [{ key: "kind", label: "Record" }, { key: "part_id", label: "Part ID" }, { key: "site", label: "Site", num: true }, { key: "test", label: "Test", num: true }, { key: "test_name", label: "Test name" }, { key: "instrument", label: "Instrument" }, { key: "code", label: "Code" }, { key: "severity", label: "Severity" }, { key: "message", label: "Message" }, { key: "after_part", label: "After part", num: true }], r.alarms, { search: true });
+    }).catch(() => {});
     table(src, [{ key: "path", label: "File" }, { key: "lot_id", label: "Lot" }, { key: "sublot_id", label: "Sublot" }, { key: "part_typ", label: "Product" }, { key: "job_nam", label: "Program" }, { key: "node_nam", label: "Node" }, { key: "test_cod", label: "Step" }, { key: "tst_temp", label: "Temp" }, { key: "endian", label: "Endian" }], d.sources, { search: false });
   } catch (e) { showErr(body, e); }
 }

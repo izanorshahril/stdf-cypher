@@ -474,6 +474,10 @@ enum Cmd {
         /// high limit (a run 1 before a retest fails them; repeatable)
         #[arg(long)]
         latent_test: Vec<u32>,
+        /// an offline retest of these hard bins (e.g. 2,3): only the parts the first run put
+        /// in them, after an RDR; add --meas-seed for another draw of their values
+        #[arg(long, value_delimiter = ',')]
+        retest_bins: Vec<u16>,
         /// write a touchdown file instead: this many touchdowns of --sites parts each
         /// (dummy data for the touchdown and loop experiment)
         #[arg(long)]
@@ -1932,6 +1936,7 @@ fn run() -> Result<()> {
             band_test,
             extra_test,
             latent_test,
+            retest_bins,
             touchdowns,
             dut_pool,
             empty,
@@ -1985,6 +1990,7 @@ fn run() -> Result<()> {
                 band_tests: band_test,
                 extra_tests: extra_test,
                 latent_tests: latent_test,
+                retest_bins,
                 profile: synthetic_sample::Profile::parse(&profile)?,
                 ..Default::default()
             };

@@ -528,17 +528,20 @@ impl<'o> Builder<'o> {
                     alarms: pend.alarms,
                     fails: pend.fails,
                     partial: false,
+                    inst_alarms: 0,
                 });
             }
             Record::GDR(g) => self.datalog.push(DatalogEntry {
                 kind: "GDR".into(),
                 after_part: self.ds.parts.len(),
-                text: format!("{:?}", g.gen_data),
+                text: gen_text(&g.gen_data),
+                alarm: None,
             }),
             Record::DTR(x) => self.datalog.push(DatalogEntry {
                 kind: "DTR".into(),
                 after_part: self.ds.parts.len(),
                 text: x.text_dat.trim_end().to_string(),
+                alarm: None,
             }),
             _ => {}
         }
@@ -674,6 +677,7 @@ impl<'o> Builder<'o> {
                 alarms: pend.alarms,
                 fails: pend.fails,
                 partial: true,
+                inst_alarms: 0,
             });
             self.src.partial_parts += 1;
         }
@@ -962,8 +966,35 @@ impl<'o> Builder<'o> {
         self.ds.datalog = self.datalog;
         self.ds.wafers = self.wafer_ids.into_keys().collect();
         self.ds.sources.push(self.src);
+        super::alarm::attach(&mut self.ds);
         self.ds
     }
+}
+
+/// The fields of a GDR as text: text fields as they are, numbers as numbers, bytes in hex,
+/// joined by "; " (pad bytes left out).
+fn gen_text(fields: &[crate::stdf::codec::GenData]) -> String {
+    use crate::stdf::codec::GenData as G;
+    fields
+        .iter()
+        .filter_map(|f| {
+            Some(match f {
+                G::Pad => return None,
+                G::U1(v) | G::N1(v) => v.to_string(),
+                G::U2(v) => v.to_string(),
+                G::U4(v) => v.to_string(),
+                G::I1(v) => v.to_string(),
+                G::I2(v) => v.to_string(),
+                G::I4(v) => v.to_string(),
+                G::R4(v) => v.to_string(),
+                G::R8(v) => v.to_string(),
+                G::Cn(s) => s.trim_end().to_string(),
+                G::Bn(b) => b.iter().map(|x| format!("{x:02X}")).collect(),
+                other => format!("{other:?}"),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Load one STDF file into a dataset.

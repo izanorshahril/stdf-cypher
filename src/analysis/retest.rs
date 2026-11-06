@@ -796,6 +796,7 @@ mod tests {
                     alarms: vec![],
                     fails: vec![],
                     partial: false,
+                    inst_alarms: 0,
                 })
                 .collect(),
             ..Default::default()
