@@ -4,7 +4,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use stdf_cypher::analysis::{anomaly, anova, compare, correlation};
 use stdf_cypher::data::{self, Dataset, Filter, LoadOptions};
-use stdf_cypher::sample::{generate, SampleSpec};
+use stdf_cypher::synthetic_sample::{generate, SampleSpec};
 use stdf_cypher::stdf::{Endian, Record, StdfReader};
 use stdf_cypher::{api, ml, report, split};
 

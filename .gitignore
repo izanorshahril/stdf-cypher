@@ -10,9 +10,11 @@
 *.std
 *.std.gz
 !tests/data/*.stdf
-# synthetic files made by `stdf-cypher sample` (see samples/README.md)
-!samples/demo/*.stdf
-!samples/qual/*.stdf
+# synthetic files made by `stdf-cypher synthetic-sample` (see synthetic_samples/README.md)
+!synthetic_samples/plain/demo/*.stdf
+!synthetic_samples/plain/qual/*.stdf
+!synthetic_samples/tc_profile/demo/*.stdf
+!synthetic_samples/tc_profile/qual/*.stdf
 stdf_report.html
 *_report.html
 split_out/

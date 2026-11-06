@@ -5,7 +5,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use stdf_cypher::api;
 use stdf_cypher::data::{self, Dataset, LoadOptions};
-use stdf_cypher::sample::{generate, SampleSpec};
+use stdf_cypher::synthetic_sample::{generate, SampleSpec};
 use stdf_cypher::trim::{self, Action, By};
 
 /// Keep tests away from the user's real settings/cache folders.
@@ -289,9 +289,9 @@ fn quota_takes_the_target_from_each_site_and_names_the_short_ones() {
     isolate();
     let d = tempfile::tempdir().unwrap();
     let p = d.path().join("quota.stdf");
-    stdf_cypher::sample::touchdown_file(
+    stdf_cypher::synthetic_sample::touchdown_file(
         &p,
-        &stdf_cypher::sample::TouchSpec {
+        &stdf_cypher::synthetic_sample::TouchSpec {
             touchdowns: 30,
             ..Default::default()
         },

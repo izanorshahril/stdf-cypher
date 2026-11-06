@@ -5,7 +5,7 @@ use std::sync::Arc;
 use stdf_cypher::analysis::{anomaly, anova, compare, correlation, summary};
 use stdf_cypher::data::{self, loader::DedupMode, Dataset, Filter, LoadOptions};
 use stdf_cypher::stdf::{record_code, StdfReader};
-use stdf_cypher::{api, ml, report, sample, server, split, trim, xlsx};
+use stdf_cypher::{api, ml, report, server, split, synthetic_sample, trim, xlsx};
 
 #[derive(Parser)]
 #[command(
@@ -416,9 +416,14 @@ enum Cmd {
         #[command(flatten)]
         l: LoadArgs,
     },
-    /// Generate a synthetic STDF file (demo / testing)
-    Sample {
+    /// Generate a synthetic STDF file: made-up data for demos and tests, not real tester data
+    #[command(name = "synthetic-sample", alias = "synthetic_sample")]
+    SyntheticSample {
         out: PathBuf,
+        /// STDF profile: plain, or tc (the custom test-cell profile: per-site and summary
+        /// PCR/HBR/SBR/TSR, PGR/PLR, base units, name_value part text, GDR records)
+        #[arg(long, default_value = "plain", value_parser = ["plain", "tc"])]
+        profile: String,
         #[arg(long, default_value = "LOTA")]
         lot: String,
         #[arg(long, default_value_t = 3)]
@@ -1905,8 +1910,9 @@ fn run() -> Result<()> {
                 .build()?;
             rt.block_on(server::serve(reg, &host, port, !no_open))?;
         }
-        Cmd::Sample {
+        Cmd::SyntheticSample {
             out,
+            profile,
             lot,
             wafers,
             radius,
@@ -1932,9 +1938,9 @@ fn run() -> Result<()> {
             no_pir_runs,
         } => {
             if let Some(touchdowns) = touchdowns {
-                let n = sample::touchdown_file(
+                let n = synthetic_sample::touchdown_file(
                     &out,
-                    &sample::TouchSpec {
+                    &synthetic_sample::TouchSpec {
                         lot_id: lot,
                         sites,
                         touchdowns,
@@ -1942,6 +1948,7 @@ fn run() -> Result<()> {
                         empty,
                         pir_runs: !no_pir_runs,
                         seed,
+                        profile: synthetic_sample::Profile::parse(&profile)?,
                         ..Default::default()
                     },
                 )?
@@ -1954,7 +1961,7 @@ fn run() -> Result<()> {
                 );
                 return Ok(());
             }
-            let spec = sample::SampleSpec {
+            let spec = synthetic_sample::SampleSpec {
                 lot_id: lot,
                 wafers,
                 radius,
@@ -1978,9 +1985,10 @@ fn run() -> Result<()> {
                 band_tests: band_test,
                 extra_tests: extra_test,
                 latent_tests: latent_test,
+                profile: synthetic_sample::Profile::parse(&profile)?,
                 ..Default::default()
             };
-            let n = sample::generate(&out, &spec)?;
+            let n = synthetic_sample::generate(&out, &spec)?;
             eprintln!("wrote {} parts to {}", n, out.display());
         }
     }

@@ -5,7 +5,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use stdf_cypher::api;
 use stdf_cypher::data::{self, Dataset, LoadOptions};
-use stdf_cypher::sample::{touchdown_file, TouchSpec};
+use stdf_cypher::synthetic_sample::{touchdown_file, TouchSpec};
 use stdf_cypher::touch::{self, Method};
 
 fn isolate() {

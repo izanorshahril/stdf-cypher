@@ -17,7 +17,7 @@ pub mod ml;
 pub mod parttrace;
 pub mod qual;
 pub mod report;
-pub mod sample;
+pub mod synthetic_sample;
 pub mod server;
 pub mod split;
 pub mod stdf;
