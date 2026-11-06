@@ -2805,7 +2805,7 @@ async function viewHome(el) {
     h("img", { src: "/static/icon.png", alt: "", width: 64, height: 64 }),
     h("div", { class: "dz-title" }, has ? "Add more files" : "Drop STDF files or folders here"),
     h("div", { class: "muted" }, FILE_HINT),
-    h("div", { class: "dz-actions" }, browse, folder, h("button", { onclick: (e) => { e.stopPropagation(); openSamples(); } }, "Try sample data")));
+    h("div", { class: "dz-actions" }, browse, folder));
   el.append(h("div", { class: "home-head" },
     h("div", {}, h("h1", {}, has ? "Your data" : "Welcome to STDF Cypher"),
       h("p", { class: "lead" }, has ? "Pick a dataset to analyse, or add more files." : "Fast, private STDF v4 analysis on your own PC: yield, bins, wafer maps, lot and tester comparison, correlation, ANOVA, outlier screening and machine learning.")),
@@ -2908,15 +2908,6 @@ async function openFolder() {
     const r = await api("pick_folder", { title: "Open every STDF file in a folder" });
     if (r.path) await loadPaths([r.path]);
   } catch (e) { toast(e.message, "bad"); }
-}
-async function openSamples() {
-  busy("Creating sample data…");
-  try {
-    const r = await api("sample");
-    S.optMerge = false;
-    await loadPaths(r.paths, { quiet: true });
-    toast("Loaded 3 demo files: lot A, a shifted lot B, and lot A re-tested on a 2nd tester. Try Compare and Correlation!", "good", 8000);
-  } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
 }
 async function loadPaths(paths, opts) {
   opts = opts || {};

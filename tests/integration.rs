@@ -413,9 +413,22 @@ fn desktop_ops() {
     isolate();
     let d = tempfile::tempdir().unwrap();
     let reg = api::Registry::app();
-    // sample data, load, recent list
-    let paths = api::run(&reg, "sample", &json!({})).unwrap()["paths"].clone();
-    assert_eq!(paths.as_array().unwrap().len(), 3);
+    // three files, load, recent list
+    let paths: Vec<String> = (1..=3u64)
+        .map(|seed| {
+            let p = d.path().join(format!("lot{seed}.stdf"));
+            generate(
+                &p,
+                &SampleSpec {
+                    seed,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            p.to_string_lossy().to_string()
+        })
+        .collect();
+    let paths = json!(paths);
     let bad = d.path().join("not_stdf.stdf");
     std::fs::write(&bad, b"hello").unwrap();
     let mut all = paths.as_array().unwrap().clone();

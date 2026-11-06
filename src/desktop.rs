@@ -544,49 +544,6 @@ pub fn fatal(msg: &str) {
     }
 }
 
-/// Create the three demo files (wafer sort lot A, shifted lot B, lot A on a second tester).
-pub fn make_samples() -> Result<Vec<String>> {
-    use crate::sample::{generate, SampleSpec};
-    let dir = cache_dir().join("samples");
-    std::fs::create_dir_all(&dir)?;
-    let specs = [
-        (
-            "DEMO_lotA.stdf",
-            SampleSpec {
-                lot_id: "DEMO_A".into(),
-                ..Default::default()
-            },
-        ),
-        (
-            "DEMO_lotB_shifted.stdf",
-            SampleSpec {
-                lot_id: "DEMO_B".into(),
-                seed: 2,
-                shift: 0.6,
-                ..Default::default()
-            },
-        ),
-        (
-            "DEMO_lotA_tester2.stdf",
-            SampleSpec {
-                lot_id: "DEMO_A".into(),
-                meas_noise: 0.3,
-                tester_offset: 1.5,
-                ..Default::default()
-            },
-        ),
-    ];
-    let mut out = vec![];
-    for (name, spec) in specs {
-        let p = dir.join(name);
-        if !p.exists() {
-            generate(&p, &spec)?;
-        }
-        out.push(p.to_string_lossy().to_string());
-    }
-    Ok(out)
-}
-
 /// Remove stale uploaded copies from previous sessions.
 pub fn clean_uploads() {
     let dir = cache_dir().join("uploads");

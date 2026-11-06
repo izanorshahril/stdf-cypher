@@ -18,7 +18,7 @@ stdf-cypher split lot1.stdf --by hbin -o out/
 * **Open files:** use **＋ Open files** (Ctrl+O, native Windows dialog), drag files anywhere onto the window, pick one from **Recent files**, or drop STDF files onto the `.exe` icon. Folders work too (dropped, on the `.exe`, or **Open folder…**): every STDF file in them and their subfolders is opened and other files are skipped. **Order of opened files** on the home page sorts them by test start time (default) or file name, which sets the run order in Retest trace. You can also set it as the "Open with" program for `.stdf`.
 * **Incomplete files:** a file cut off inside a part (or an incomplete tmp file) keeps that part, with its results but no bin and no pass/fail verdict. The overview shows a **Cut off** count and the CLI prints a warning, so a lost PRR is never silent.
 * **Several at once:** each launch (double-click, or files dropped on the `.exe`) opens its own window with its own files and views, so you can keep different jobs side by side. Selecting several files and choosing "Open with" still opens them together in one window. Recent files and saved cases are shared between windows.
-* **Try it without data:** **Try sample data** loads three demo files: a wafer-sort lot, a shifted lot, and the same lot re-tested on a second tester.
+* **Try it without data:** open the files in [`samples/`](samples/): three wafer-sort demo files (a lot, a shifted lot, and the same lot re-tested on a second tester) and looped final-test files for Qualification drift. The same files work in other STDF tools for comparison.
 * **Local only:** the dashboard answers requests made to its own address (127.0.0.1 or localhost, on the port it started on) and only from its own page.
   Each launch makes a new token that the page sends with every request, so other websites and other PCs cannot read or drive it.
   Requests with a foreign Host or Origin, or without the token, get 403 or 401.
@@ -43,7 +43,7 @@ stdf-cypher split lot1.stdf --by hbin -o out/
 * **Split & export:** save an offline HTML report, export a CSV, extract the filtered parts to a new STDF, or split a file by bin, site, wafer, part ID or your own groups. Output paths default to the folder of the source file.
 * **Edit & trim:** keep or remove chosen parts of one file and save the result as a new STDF; the source file is never changed. See the feature table and the `trim` command.
 * **Quit:** close the window. The app exits by itself a few seconds later.
-* **Settings and recent files** live in `%APPDATA%\stdf-cypher`. Temporary copies of dragged-in files and the sample data live in `%LOCALAPPDATA%\stdf-cypher`.
+* **Settings and recent files** live in `%APPDATA%\stdf-cypher`. Temporary copies of dragged-in files live in `%LOCALAPPDATA%\stdf-cypher`.
 
 When double-clicked, Windows briefly shows a console window before the app hides it. Run from a terminal, the exe behaves as a normal CLI (`stdf-cypher --help`). If neither Edge nor Chrome is installed, the app opens in your default browser and works the same way.
 
@@ -175,7 +175,7 @@ stdf-cypher ml explain lot.stdf --target hbin
 
 These are the same views in the desktop app and in `stdf-cypher serve` (which serves `http://127.0.0.1:8765` for a browser). All analysis runs in Rust and the page only renders the results. The **part filter** in the header applies to every view.
 
-* **Home**: open files (dialog, drag and drop, recent files, by path), sample data, open datasets (analyse / close). Opening files from Home keeps you on Home, so you choose the page yourself
+* **Home**: open files (dialog, drag and drop, recent files, by path), open datasets (analyse / close). Opening files from Home keeps you on Home, so you choose the page yourself
 * **Overview**: KPIs, hard/soft-bin pareto, yield by site/wafer/file, stacked bin map, fail pareto (click a test to open it), bins, source files
 * **Chart options** (every chart view): axis range *within limits*, *results* or *both (adaptive)*; 2D or 3D (overlaid histograms become bar layers, series get their own depth lane, test-value wafer maps become surfaces); opacity for overlapping layers. Parts can be coloured good/bad, by alarm, by test site, bin, wafer or file.
 * **Test explorer**: searchable test list (Cpk amber below 1.33 and red below 1.00, failing tests in red); histogram, box, CDF and trend coloured by any factor; per-group stats; scatter against a second test
@@ -257,6 +257,7 @@ src/touch.rs     touchdown and loop estimate (experiment): PIR runs, site order 
 src/xlsx.rs      Excel workbook export (one sheet per record kind, no spreadsheet crate)
 src/parttrace.rs part trace workbook (one row per part across files), detection of shared parts
 src/qual.rs      qualification drift workbooks: endurance check and 25x loop compare, per test and site
+samples/         synthetic STDF files (demo lots, looped files for qualification drift) and how to make them
 src/viz.rs       Plotly figure builders (theme-token colours)
 src/api.rs       JSON operations used by the dashboard
 src/server.rs    axum server (dashboard, uploads, window event stream)

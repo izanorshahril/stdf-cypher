@@ -539,7 +539,6 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             crate::desktop::reveal(&pp.str("path"))?;
             Ok(json!({}))
         }
-        "sample" => Ok(json!({"paths": crate::desktop::make_samples()?})),
         "split" => {
             let id = pp.usize("ds", 0);
             let (ds, paths) = reg.get(id)?;
