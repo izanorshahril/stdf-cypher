@@ -102,7 +102,7 @@ Tabular commands print the top rows; add `-o file.csv` for the full table.
 | `dump FILE [--rec PRR,PTR] [-n N]` | Records as JSON lines |
 | `xlsx FILE -o out.xlsx` | Every record in an Excel workbook: one sheet per record kind, the fields as columns (sheets continue past 1,048,575 rows) |
 | `part-trace FILES… -o out.xlsx [--key part_txt\|tests:80149\|tests:80100,80101,80102] [--names A,B,…] [--last-only all\|1,3] [--wxy-test 80149] [--wxy-tests 80100,80101,80102] [--offset-tests 80103,80104]` | Each part's history across files in an Excel workbook: one row per part, one group of columns per file, in the order given |
-| `endurance FILE -o out.xlsx [--runs 25] [--drift 5] [--yield 95] [--cpk 1.33] [--pick clean\|raw] [--skip 0] [--max-loops 1000] [--max-minutes 90]` | Endurance check of a looped file: mean drift of each test on each site, first vs last loops |
+| `endurance FILE -o out.xlsx [--runs 25] [--drift 5] [--yield 95] [--cpk 1.33] [--pick clean\|raw] [--skip 0] [--max-loops 1000] [--max-minutes 90] [--trim off|ends|any] [--max-trim 20] [--trimmed-stdf out.stdf]` | Endurance check of a looped file: mean drift of each test on each site, first vs last loops; optional auto trim and the trimmed trial as STDF |
 | `loop-compare OLD NEW -o out.xlsx [--names "Rev 1,Rev 2"] [--runs 25] [--take first\|last] [--skip 0] [--drift 5] [--cpk 1.33]` | 25x loop compare of an old and a new test program: mean drift of each test on each site |
 | `prr FILES… [-o csv]` | Part (PRR) table incl. first failing test |
 | `tests FILES… [-o csv]` | Per-test N, mean, σ, min/max, Cpk, fails |
@@ -209,7 +209,11 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
   *Raw* takes the loops as they are, and they must all pass.
   The trial window can skip warm-up loops and end after a number of loops (1,000) or minutes (90), so loops of a run left going too long, where the unit degrades, are left out; the time of a part is estimated from its place between the file's start and finish times.
   A site that ran fewer loops and minutes than the trial target is dropped as a short trial; with a time target, this needs the file's start and finish times, and without them the length is not judged.
-  The workbook has a Drift sheet (one row per test and site), a Sites sheet (loops, window, yield, estimated minutes, the loop numbers compared and why a site was dropped) and a Summary sheet.
+  **Auto trim** leaves out loops so the sites reach the yield threshold. A loop is the k-th part of every site (one touchdown), and a loop left out goes for every site.
+  *Ends* leaves out the loops at the start and end in which any site fails (an unstable start, a degraded end); *Ends, then bad loops between* also leaves out failing loops between, the loop failing on the most sites still below the yield first, until every site reaches it.
+  The trim leaves out at most 20% of the window's loops by default (0 = no limit): a site that cannot reach the yield within that, such as a broken site, is dropped instead and the trim runs again without it, so it never decides what the other sites lose.
+  **Save trimmed STDF** writes the compared sites from their first to last compared loop, without the trimmed loops, as a new STDF; the source file is not changed.
+  The workbook has a Drift sheet (one row per test and site), a Sites sheet (loops, window, yield, loops trimmed and the yield of the kept loops, estimated minutes, the loop numbers compared and why a site was dropped) and a Summary sheet.
   **25x loop compare** (two files, old and new test program): each site takes its first (or last) 25 good loops from each file, and a site without 25 good loops in both files (unstable or inactive) is dropped, so no site removal or trimming is needed by hand.
   Tests pair by number and name, else by number and pin, so renamed tests still pair; drift uses the old file's limits, and Cp and Cpk each file's own.
   Units that differ only by an SI prefix (mV and V) are converted, and the new statistics are shown in the old unit; other unit changes get no drift and a comment.

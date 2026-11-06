@@ -41,6 +41,31 @@ impl Pick {
     }
 }
 
+/// Which loops the endurance check may leave out, so the sites reach the yield threshold. A loop is
+/// the k-th loop of every site (one touchdown): a loop left out goes for every site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Trim {
+    /// no loop is left out
+    #[default]
+    Off,
+    /// leading and trailing loops in which any site fails
+    Ends,
+    /// as Ends, then failing loops between, until every site reaches the yield
+    Any,
+}
+
+impl Trim {
+    pub fn parse(s: &str) -> Result<Trim> {
+        match s.trim() {
+            "" | "off" => Ok(Trim::Off),
+            "ends" => Ok(Trim::Ends),
+            "any" => Ok(Trim::Any),
+            o => bail!("trim '{o}': use off, ends or any"),
+        }
+    }
+}
+
 /// Which good loops of each site the loop compare takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -84,6 +109,11 @@ pub struct EnduranceOpts {
     /// the trial window ends after this many minutes from the start of the file (0 = no cut); the
     /// time of a part is estimated from its place between the file's start and finish times
     pub max_minutes: f64,
+    /// loops the check may leave out to reach the yield
+    pub trim: Trim,
+    /// the most loops the trim may leave out, in % of the window (0 = no limit); a site that needs
+    /// more is dropped instead
+    pub max_trim_pct: f64,
 }
 
 impl Default for EnduranceOpts {
@@ -97,6 +127,8 @@ impl Default for EnduranceOpts {
             skip: 0,
             max_loops: 0,
             max_minutes: 0.0,
+            trim: Trim::Off,
+            max_trim_pct: 20.0,
         }
     }
 }
@@ -349,6 +381,11 @@ pub struct EnduranceSite {
     /// good loops in the window
     pub good: usize,
     pub window_yield: Option<f64>,
+    /// loops of the window the auto trim left out, and the loops (and good ones) it kept
+    pub trimmed: usize,
+    pub kept: usize,
+    pub kept_good: usize,
+    pub kept_yield: Option<f64>,
     /// loops from the first compared loop to the last, and the good ones among them
     pub span: usize,
     pub span_good: usize,
@@ -372,6 +409,9 @@ pub struct EnduranceSite {
     pub first: Vec<usize>,
     #[serde(skip)]
     pub last: Vec<usize>,
+    /// rows from the first compared loop to the last of a compared site, without trimmed loops
+    #[serde(skip)]
+    pub kept_rows: Vec<usize>,
 }
 
 /// One test of one site.
@@ -401,6 +441,17 @@ pub struct Endurance {
     /// rows with fewer values than the loops compared
     pub short_rows: usize,
     pub heads: bool,
+    pub trim: TrimInfo,
+}
+
+impl Endurance {
+    /// The rows of the trimmed trial: every compared site from its first compared loop to its
+    /// last, without the loops the trim left out, in file order.
+    pub fn kept_rows(&self) -> Vec<usize> {
+        let mut v: Vec<usize> = self.sites.iter().flat_map(|s| s.kept_rows.iter().copied()).collect();
+        v.sort_unstable();
+        v
+    }
 }
 
 /// Estimated minutes from the start of its file to the end of every part of `ds`, when the file
@@ -426,6 +477,173 @@ fn minutes(ds: &Dataset) -> Vec<Option<f64>> {
         .collect()
 }
 
+/// One site's loops and its trial window, before the trim.
+struct Win<'a> {
+    rs: &'a [usize],
+    /// the window is loops start..end (0-based, per site)
+    start: usize,
+    end: usize,
+    complete: Option<bool>,
+}
+
+/// What the auto trim left out. Loop k is the k-th loop of every site (one touchdown).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TrimInfo {
+    pub mode: Trim,
+    /// the most loops it may leave out, % of the window (0 = no limit)
+    pub max_pct: f64,
+    /// the sites the trim worked for; the others did not decide which loops go
+    pub sites: Vec<String>,
+    /// loops left out at the start, at the end and between
+    pub start: usize,
+    pub end: usize,
+    pub between: usize,
+    /// 1-based numbers of the loops left out, as ranges
+    pub loops: String,
+    #[serde(skip)]
+    pub removed: Vec<bool>,
+    /// per site (in window order): the trim kept it; a site it left out is dropped. Empty when the
+    /// trim is off.
+    #[serde(skip)]
+    pub eligible: Vec<bool>,
+}
+
+/// Loops of the windows left out by the auto trim. Leading and trailing loops in which any of the
+/// trimmed sites fails go first; with `Trim::Any`, loops between follow, the loop failing on the
+/// most sites still below the yield first, until every trimmed site reaches it. A site that still
+/// misses the yield or the good loops it needs is left out of the trim (it will be dropped), and the
+/// trim starts again without it, so one broken site never removes every loop.
+fn auto_trim(ds: &Dataset, wins: &[Win], opts: &EnduranceOpts) -> TrimInfo {
+    let len = wins.iter().map(|w| w.end).max().unwrap_or(0);
+    let mut info = TrimInfo {
+        mode: opts.trim,
+        max_pct: opts.max_trim_pct,
+        removed: vec![false; len],
+        ..Default::default()
+    };
+    if opts.trim == Trim::Off {
+        return info;
+    }
+    info.eligible = vec![false; wins.len()];
+    if len == 0 {
+        return info;
+    }
+    let need = 2 * opts.runs;
+    let fails = |w: &Win, i: usize| i >= w.start && i < w.end && !is_good(ds, w.rs[i]);
+    // (good, loops) of a site over the loops not removed
+    let count = |w: &Win, removed: &[bool]| {
+        (w.start..w.end).filter(|&i| !removed[i]).fold((0usize, 0usize), |(g, t), i| {
+            (g + usize::from(is_good(ds, w.rs[i])), t + 1)
+        })
+    };
+    let below = |w: &Win, removed: &[bool]| {
+        let (g, t) = count(w, removed);
+        t == 0 || (g as f64 * 100.0 / t as f64) < opts.yield_pct
+    };
+    let mut sites: Vec<usize> = (0..wins.len())
+        .filter(|&k| {
+            let w = &wins[k];
+            w.complete != Some(false) && count(w, &info.removed).0 >= need
+        })
+        .collect();
+    while !sites.is_empty() {
+        let lo = sites.iter().map(|&k| wins[k].start).min().unwrap_or(0);
+        let hi = sites.iter().map(|&k| wins[k].end).max().unwrap_or(0);
+        let clean = |i: usize| sites.iter().all(|&k| !fails(&wins[k], i));
+        let a = (lo..hi).find(|&i| clean(i)).unwrap_or(hi);
+        let b = (lo..hi).rev().find(|&i| clean(i)).map_or(a, |b| b + 1);
+        let mut removed = vec![false; len];
+        for (i, r) in removed.iter_mut().enumerate() {
+            *r = i < a || i >= b;
+        }
+        let mut between = 0;
+        let window = hi - lo;
+        let cap = (opts.max_trim_pct > 0.0).then(|| (window as f64 * opts.max_trim_pct / 100.0).floor() as usize);
+        let gone = |removed: &[bool]| (lo..hi).filter(|&i| removed[i]).count();
+        if opts.trim == Trim::Any {
+            loop {
+                if cap.is_some_and(|c| gone(&removed) >= c) {
+                    break;
+                }
+                let low: Vec<usize> = sites
+                    .iter()
+                    .copied()
+                    .filter(|&k| below(&wins[k], &removed))
+                    .collect();
+                if low.is_empty() {
+                    break;
+                }
+                let best = (a..b)
+                    .filter(|&i| !removed[i])
+                    .map(|i| {
+                        let on_low = low.iter().filter(|&&k| fails(&wins[k], i)).count();
+                        let on_all = sites.iter().filter(|&&k| fails(&wins[k], i)).count();
+                        (on_low, on_all, std::cmp::Reverse(i))
+                    })
+                    .filter(|x| x.0 > 0)
+                    .max();
+                let Some((_, _, std::cmp::Reverse(i))) = best else {
+                    break;
+                };
+                removed[i] = true;
+                between += 1;
+            }
+        }
+        // the site furthest from making it is left out of the trim, and the trim runs again
+        let short = |k: usize| {
+            let w = &wins[k];
+            let (g, t) = count(w, &removed);
+            let enough = match opts.pick {
+                Pick::Clean => g >= need,
+                // raw compares the first and last loops kept as they are: they must all pass
+                Pick::Raw => {
+                    let kept: Vec<usize> = (w.start..w.end).filter(|&i| !removed[i]).collect();
+                    kept.len() >= need
+                        && kept[..opts.runs]
+                            .iter()
+                            .chain(&kept[kept.len() - opts.runs..])
+                            .all(|&i| is_good(ds, w.rs[i]))
+                }
+            };
+            (below(w, &removed) || !enough).then(|| if t == 0 { 0.0 } else { g as f64 / t as f64 })
+        };
+        // over the limit, the site with the lowest yield before the trim goes first
+        let window_yield = |k: usize| {
+            let (g, t) = count(&wins[k], &vec![false; len]);
+            if t == 0 { 0.0 } else { g as f64 / t as f64 }
+        };
+        // the limit holds for the last site too: it is dropped rather than trimmed past it
+        let worst = if cap.is_some_and(|c| gone(&removed) > c) {
+            sites
+                .iter()
+                .map(|&k| (window_yield(k), k))
+                .min_by(|x, y| x.0.total_cmp(&y.0))
+        } else {
+            sites
+                .iter()
+                .filter_map(|&k| short(k).map(|y| (y, k)))
+                .min_by(|x, y| x.0.total_cmp(&y.0))
+        };
+        match worst {
+            Some((_, k)) => sites.retain(|&s| s != k),
+            None => {
+                info.start = (lo..a.min(hi)).count();
+                info.end = (b.max(lo)..hi).count();
+                info.between = between;
+                let gone: Vec<usize> = (lo..hi).filter(|&i| removed[i]).map(|i| i + 1).collect();
+                info.loops = ranges(&gone);
+                info.removed = removed;
+                info.sites = sites.iter().map(|k| k.to_string()).collect();
+                for &k in &sites {
+                    info.eligible[k] = true;
+                }
+                return info;
+            }
+        }
+    }
+    info
+}
+
 /// The endurance check of `rows` of `ds` (one file).
 pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<Endurance> {
     let n = opts.runs;
@@ -433,14 +651,16 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
     let mins = minutes(ds);
     let groups = by_site(ds, rows);
     let heads = groups.keys().map(|k| k.0).collect::<HashSet<_>>().len() > 1;
-    let mut sites = vec![];
+    // the trial window of every site
+    let mut wins = vec![];
+    let mut meta = vec![];
     for (&(head, site), rs) in &groups {
         let loops = rs.len();
         let mut end = loops;
         let mut cut_by = String::new();
         if opts.max_loops > 0 && loops > opts.max_loops {
             end = opts.max_loops;
-            cut_by = "loops".into();
+            cut_by = "loops".to_string();
         }
         if opts.max_minutes > 0.0 {
             if let Some(i) = rs[..end]
@@ -448,7 +668,7 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
                 .position(|&r| mins[r].is_some_and(|m| m > opts.max_minutes))
             {
                 end = i;
-                cut_by = "time".into();
+                cut_by = "time".to_string();
             }
         }
         let site_minutes = rs.last().and_then(|&r| mins[r]);
@@ -464,19 +684,47 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
         } else {
             None
         };
-        let start = opts.skip.min(end);
-        let win = &rs[start..end];
-        let good_pos: Vec<usize> = (0..win.len()).filter(|&i| is_good(ds, win[i])).collect();
+        wins.push(Win {
+            rs,
+            start: opts.skip.min(end),
+            end,
+            complete,
+        });
+        meta.push((head, site, cut_by, site_minutes));
+    }
+    let mut trim = auto_trim(ds, &wins, opts);
+    trim.sites = trim
+        .sites
+        .iter()
+        .filter_map(|k| k.parse::<usize>().ok())
+        .map(|k| site_label(meta[k].0, meta[k].1, heads))
+        .collect();
+    let mut sites = vec![];
+    for (k, (w, (head, site, cut_by, site_minutes))) in wins.iter().zip(meta).enumerate() {
+        let loops = w.rs.len();
+        let complete = w.complete;
+        let window = w.end - w.start;
+        let window_good = (w.start..w.end).filter(|&i| is_good(ds, w.rs[i])).count();
+        // the loops of the window the trim kept: (loop index, row)
+        let win: Vec<(usize, usize)> = (w.start..w.end)
+            .filter(|&i| !trim.removed.get(i).copied().unwrap_or(false))
+            .map(|i| (i, w.rs[i]))
+            .collect();
+        let good_pos: Vec<usize> = (0..win.len()).filter(|&i| is_good(ds, win[i].1)).collect();
         let good = good_pos.len();
         let mut s = EnduranceSite {
             head,
             site,
             label: site_label(head, site, heads),
             loops,
-            window: win.len(),
+            window,
             cut_by,
-            good,
-            window_yield: pct(good, win.len()),
+            good: window_good,
+            window_yield: pct(window_good, window),
+            trimmed: window - win.len(),
+            kept: win.len(),
+            kept_good: good,
+            kept_yield: pct(good, win.len()),
             span: 0,
             span_good: 0,
             span_yield: None,
@@ -492,18 +740,17 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
             status: String::new(),
             first: vec![],
             last: vec![],
+            kept_rows: vec![],
         };
-        // positions in the window of the compared loops
+        let what = if opts.trim == Trim::Off { "in the window" } else { "after the trim" };
+        // positions in `win` of the compared loops
         let picked: Option<(Vec<usize>, Vec<usize>)> = match opts.pick {
             Pick::Clean if good >= 2 * n => Some((
                 good_pos[..n].to_vec(),
                 good_pos[good - n..].to_vec(),
             )),
             Pick::Clean => {
-                s.status = format!(
-                    "Dropped: {good} good loops in the window, {} needed",
-                    2 * n
-                );
+                s.status = format!("Dropped: {good} good loops {what}, {} needed", 2 * n);
                 None
             }
             Pick::Raw if win.len() >= 2 * n => Some((
@@ -511,11 +758,7 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
                 (win.len() - n..win.len()).collect(),
             )),
             Pick::Raw => {
-                s.status = format!(
-                    "Dropped: {} loops in the window, {} needed",
-                    win.len(),
-                    2 * n
-                );
+                s.status = format!("Dropped: {} loops {what}, {} needed", win.len(), 2 * n);
                 None
             }
         };
@@ -526,10 +769,10 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
             s.span_yield = pct(s.span_good, s.span);
             s.skipped_lead = a;
             s.skipped_tail = win.len() - 1 - b;
-            s.first = fp.iter().map(|&i| win[i]).collect();
-            s.last = lp.iter().map(|&i| win[i]).collect();
-            s.first_loops = ranges(&fp.iter().map(|&i| start + i + 1).collect::<Vec<_>>());
-            s.last_loops = ranges(&lp.iter().map(|&i| start + i + 1).collect::<Vec<_>>());
+            s.first = fp.iter().map(|&i| win[i].1).collect();
+            s.last = lp.iter().map(|&i| win[i].1).collect();
+            s.first_loops = ranges(&fp.iter().map(|&i| win[i].0 + 1).collect::<Vec<_>>());
+            s.last_loops = ranges(&lp.iter().map(|&i| win[i].0 + 1).collect::<Vec<_>>());
             s.first_all_pass = s.first.iter().all(|&r| is_good(ds, r));
             s.last_all_pass = s.last.iter().all(|&r| is_good(ds, r));
             let y = s.span_yield.unwrap_or(0.0);
@@ -537,6 +780,8 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
             let bad_last = s.last.iter().filter(|&&r| !is_good(ds, r)).count();
             s.status = if complete == Some(false) {
                 format!("Dropped: short trial: {}", short_trial(loops, site_minutes, opts))
+            } else if trim.eligible.get(k) == Some(&false) {
+                trim_dropped(opts)
             } else if bad_first > 0 {
                 format!("Dropped: {bad_first} failing loops in the first {n}")
             } else if bad_last > 0 {
@@ -548,7 +793,12 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
                 )
             } else {
                 s.ok = true;
-                "Compared".into()
+                s.kept_rows = win[a..=b].iter().map(|x| x.1).collect();
+                if s.trimmed > 0 {
+                    format!("Compared after trimming {} loops", s.trimmed)
+                } else {
+                    "Compared".to_string()
+                }
             };
         }
         sites.push(s);
@@ -622,7 +872,45 @@ pub fn endurance(ds: &Dataset, rows: &[usize], opts: &EnduranceOpts) -> Result<E
         rows: out,
         tests: seen_tests,
         heads,
+        trim,
     })
+}
+
+/// Why the auto trim left a site out.
+fn trim_dropped(o: &EnduranceOpts) -> String {
+    let limit = if o.max_trim_pct > 0.0 {
+        format!(" within the trim limit of {}% of the loops", o.max_trim_pct)
+    } else {
+        String::new()
+    };
+    match o.pick {
+        Pick::Clean => format!(
+            "Dropped: cannot reach {}% yield with {} good loops{limit}",
+            o.yield_pct,
+            2 * o.runs
+        ),
+        Pick::Raw => format!(
+            "Dropped: cannot reach {}% yield with passing first and last {} loops{limit}",
+            o.yield_pct, o.runs
+        ),
+    }
+}
+
+/// The auto trim in words, for the title lines and the Summary sheet.
+fn trim_text(t: &TrimInfo) -> String {
+    match t.mode {
+        Trim::Off => "off".to_string(),
+        _ if t.start + t.end + t.between == 0 => "on: no loop left out".to_string(),
+        m => format!(
+            "{} (at most {}): {} loops left out at the start, {} at the end, {} between (loops {})",
+            if m == Trim::Ends { "ends" } else { "ends and between" },
+            if t.max_pct > 0.0 { format!("{}% of the loops", t.max_pct) } else { "no limit".to_string() },
+            t.start,
+            t.end,
+            t.between,
+            t.loops
+        ),
+    }
 }
 
 /// "300 loops, 20 min, below 1000 loops or 90 min"
@@ -1216,6 +1504,7 @@ fn write_endurance_in(
             },
         ),
         ("Trial length".to_string(), trial),
+        ("Auto trim".to_string(), trim_text(&e.trim)),
         (
             "Sites compared".to_string(),
             sites_text(ok.iter().map(|s| s.label.as_str())),
@@ -1303,11 +1592,11 @@ fn write_endurance_in(
     let mut sheets = vec![freeze_at(dir, s, header)?];
 
     // Sites
-    let widths = [8, 10, 10, 10, 10, 11, 10, 10, 11, 12, 12, 16, 16, 9, 9, 12, 10, 60];
+    let widths = [8, 10, 10, 10, 10, 11, 9, 9, 11, 10, 10, 11, 12, 12, 16, 16, 9, 9, 12, 10, 60];
     let mut st = sheet(dir, 1, "Sites", &widths, 1)?;
     let titles = [
         "Site", "Loops", "In window", "Window cut by", "Good in window", "Window yield %",
-        "Compared span", "Good in span", "Span yield %", "Skipped at start", "Skipped at end",
+        "Trimmed", "Kept", "Kept yield %", "Compared span", "Good in span", "Span yield %", "Skipped at start", "Skipped at end",
         &format!("First {n} loops"), &format!("Last {n} loops"), "First all pass", "Last all pass",
         "Minutes (est.)", "Full trial", "Status",
     ];
@@ -1336,6 +1625,9 @@ fn write_endurance_in(
                 t(&x.cut_by),
                 C::N(x.good as f64, 0),
                 ys(x.window_yield),
+                C::N(x.trimmed as f64, 0),
+                C::N(x.kept as f64, 0),
+                ys(x.kept_yield),
                 if has { C::N(x.span as f64, 0) } else { C::E },
                 if has { C::N(x.span_good as f64, 0) } else { C::E },
                 ys(x.span_yield),
@@ -1388,6 +1680,11 @@ fn write_endurance_in(
         ("Drift", "ABS(Mean first - Mean last) / (USL - LSL) x 100%".to_string()),
         ("Compared loops", pick),
         ("Trial window", window),
+        ("Auto trim", trim_text(&e.trim)),
+        (
+            "Trimmed for sites",
+            if e.trim.sites.is_empty() { "none".to_string() } else { e.trim.sites.join(", ") },
+        ),
         ("Valid site", format!("yield at least {}% over the compared loops, and the compared loops all pass", o.yield_pct)),
         ("Comment on", format!("drift above {}%, Cpk below {}", o.drift_pct, o.cpk_min)),
         ("Part filter", filter.to_string()),
@@ -1858,6 +2155,115 @@ mod tests {
         assert_eq!(e.short_rows, 1);
         assert!(e.rows[0].comment.contains("Fewer than 4 values: first 4, last 2"));
         assert!(endurance(&d, &d.all_rows(), &EnduranceOpts { runs: usize::MAX, ..Default::default() }).is_err());
+    }
+
+    /// Three sites, `n` loops each, in touchdown order: site 1 fails loops 0-1 (unstable start),
+    /// site 2 fails every 8th loop from loop 4 (about 88% yield), site 3 passes 3 loops only.
+    fn unstable(n: usize) -> Dataset {
+        let mut p = vec![];
+        for i in 0..n {
+            p.push((1, i >= 2, 1.0));
+            p.push((2, i < 4 || (i - 4) % 8 != 0, 1.0));
+            p.push((3, i < 3, 1.0));
+        }
+        ds(&p, test(100, "VOUT", 0.0, 10.0))
+    }
+
+    #[test]
+    fn auto_trim_cuts_failing_ends_then_bad_loops_between() {
+        let d = unstable(80);
+        let base = EnduranceOpts { runs: 10, ..Default::default() };
+        let off = endurance(&d, &d.all_rows(), &base).unwrap();
+        assert!(off.sites[0].ok, "{}", off.sites[0].status);
+        assert!(!off.sites[1].ok, "{}", off.sites[1].status);
+        assert!(!off.sites[2].ok);
+        // ends: the unstable start of site 1 goes for every site; site 2 stays below 95%
+        let ends = endurance(&d, &d.all_rows(), &EnduranceOpts { trim: Trim::Ends, ..base.clone() }).unwrap();
+        assert_eq!(ends.trim.start, 2);
+        assert_eq!(ends.trim.between, 0);
+        assert!(!ends.sites[1].ok);
+        // any: site 2's failing loops between go too, and the broken site 3 removes nothing
+        let any = endurance(&d, &d.all_rows(), &EnduranceOpts { trim: Trim::Any, ..base.clone() }).unwrap();
+        assert!(any.sites[0].ok && any.sites[1].ok, "{}", any.sites[1].status);
+        assert!(!any.sites[2].ok);
+        assert_eq!(any.trim.sites, vec!["1", "2"]);
+        assert!(any.trim.between > 0);
+        assert!(any.sites[1].kept_yield.unwrap() >= 95.0);
+        assert!(any.sites[1].status.starts_with("Compared after trimming"));
+        // the trimmed trial holds the compared sites' kept loops only, in file order
+        let keep = any.kept_rows();
+        assert!(keep.windows(2).all(|w| w[0] < w[1]));
+        assert!(keep.iter().all(|&r| d.parts[r].site != 3));
+        // a few failing loops may stay, as long as each site keeps the yield
+        for site in [1u8, 2] {
+            let mine: Vec<&usize> = keep.iter().filter(|&&r| d.parts[r].site == site).collect();
+            let good = mine.iter().filter(|&&&r| d.parts[r].is_pass()).count();
+            assert!(good as f64 * 100.0 / mine.len() as f64 >= 95.0);
+        }
+        assert_eq!(keep.len(), any.sites[0].kept_rows.len() + any.sites[1].kept_rows.len());
+    }
+
+    #[test]
+    fn auto_trim_drops_a_site_that_needs_more_than_the_limit() {
+        // site 2 fails every 3rd loop (67% yield): rescuing it would cost a third of the loops
+        let mut p = vec![];
+        for i in 0..90 {
+            p.push((1, true, 1.0));
+            p.push((2, i % 3 != 1, 1.0));
+        }
+        let d = ds(&p, test(100, "VOUT", 0.0, 10.0));
+        let opts = EnduranceOpts { runs: 10, trim: Trim::Any, ..Default::default() };
+        let e = endurance(&d, &d.all_rows(), &opts).unwrap();
+        assert!(e.sites[0].ok);
+        assert_eq!(e.sites[0].trimmed, 0, "the good site keeps every loop");
+        assert!(!e.sites[1].ok);
+        assert_eq!(e.trim.sites, vec!["1"]);
+        // with no limit the weak site is rescued at the cost of its failing loops
+        let all = endurance(&d, &d.all_rows(), &EnduranceOpts { max_trim_pct: 0.0, ..opts }).unwrap();
+        assert!(all.sites[1].ok);
+        // only as many failing loops as the yield needs: 60 good of 63 kept is 95.2%
+        assert_eq!(all.trim.between, 27);
+        assert!(all.sites[1].kept_yield.unwrap() >= 95.0);
+    }
+
+    #[test]
+    fn a_site_the_trim_leaves_out_stays_dropped_and_the_limit_holds_for_one_site() {
+        // site 1 fails its first 30 of 100 loops; site 2 passes all
+        let mut p = vec![];
+        for i in 0..100 {
+            p.push((1, i >= 30, 1.0));
+            p.push((2, true, 1.0));
+        }
+        let d = ds(&p, test(100, "VOUT", 0.0, 10.0));
+        let opts = EnduranceOpts { runs: 2, trim: Trim::Any, ..Default::default() };
+        let e = endurance(&d, &d.all_rows(), &opts).unwrap();
+        assert!(!e.sites[0].ok, "{}", e.sites[0].status);
+        assert!(e.sites[0].status.contains("trim limit"));
+        assert!(e.sites[1].ok);
+        assert_eq!(e.sites[1].trimmed, 0);
+        assert!(e.kept_rows().iter().all(|&r| d.parts[r].site == 2));
+        // alone, site 1 would need 30% of the loops: over the 20% limit it is dropped too
+        let one = d.subset(&(0..d.n_parts()).filter(|&r| d.parts[r].site == 1).collect::<Vec<_>>());
+        let e = endurance(&one, &one.all_rows(), &opts).unwrap();
+        assert!(!e.sites[0].ok, "{}", e.sites[0].status);
+        assert!(e.kept_rows().is_empty());
+    }
+
+    #[test]
+    fn raw_trim_reruns_without_a_site_whose_compared_loops_fail() {
+        // runs 2: site 1 fails loops 1 and 3, so its first two kept loops can never all pass
+        // without leaving out both; site 2 passes all and should lose nothing
+        let mut p = vec![];
+        for i in 0..40 {
+            p.push((1, i != 1 && i != 3, 1.0));
+            p.push((2, true, 1.0));
+        }
+        let d = ds(&p, test(100, "VOUT", 0.0, 10.0));
+        let opts = EnduranceOpts { runs: 2, pick: Pick::Raw, trim: Trim::Ends, yield_pct: 90.0, ..Default::default() };
+        let e = endurance(&d, &d.all_rows(), &opts).unwrap();
+        assert!(!e.sites[0].ok, "{}", e.sites[0].status);
+        assert!(e.sites[1].ok);
+        assert_eq!(e.sites[1].trimmed, 0);
     }
 
     #[test]

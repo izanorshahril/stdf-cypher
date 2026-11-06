@@ -3264,11 +3264,15 @@ function viewQual(el) {
   const eRuns = num(st.e.runs ?? 25), eDrift = num(st.e.drift ?? 5, 0.5), eYield = num(st.e.yield ?? 95, 0.5), eCpk = num(st.e.cpk ?? 1.33, 0.01);
   const ePick = select([["clean", "Clean: first and last good loops"], ["raw", "Raw: loops as they are (all must pass)"]], st.e.pick || "clean", (v) => (st.e.pick = v));
   const eSkip = num(st.e.skip ?? 0), eLoops = num(st.e.max_loops ?? 1000, 1, 80), eMin = num(st.e.max_minutes ?? 90, 1, 80);
+  const eMaxTrim = num(st.e.max_trim ?? 20, 1);
+  const eTrim = select([["off", "Off"], ["ends", "Ends: failing loops at the start and end"], ["any", "Ends, then bad loops between"]], st.e.trim || "off", (v) => (st.e.trim = v));
+  const ePathT = (() => { const f = files().find((d) => d.id === +eDs.value) || files()[0]; if (!f) return "trimmed.stdf"; return f.paths[0].replace(/(\.stdf|\.std)?(\.gz)?$/i, "") + "_trimmed.stdf"; })();
+  const [eTPath, eTPf] = pathField("save", st.e.tpath || ePathT, { title: "Save the trimmed STDF", name: "trimmed.stdf", ext: "stdf" });
   const [ePath, ePf] = pathField("save", st.e.path || defPath("endurance_drift.xlsx"), { title: "Save endurance report", name: "endurance_drift.xlsx", ext: "xlsx" });
   const eOut = h("div"), eRes = h("div");
   const eParams = () => {
-    Object.assign(st.e, { ds: +eDs.value, runs: +eRuns.value, drift: +eDrift.value, yield: +eYield.value, cpk: +eCpk.value, pick: ePick.value, skip: +eSkip.value, max_loops: +eLoops.value, max_minutes: +eMin.value, path: ePath.value });
-    return { ds: st.e.ds, runs: st.e.runs, drift: st.e.drift, yield: st.e.yield, cpk: st.e.cpk, pick: st.e.pick, skip: st.e.skip, max_loops: st.e.max_loops, max_minutes: st.e.max_minutes, filter: filt() };
+    Object.assign(st.e, { ds: +eDs.value, runs: +eRuns.value, drift: +eDrift.value, yield: +eYield.value, cpk: +eCpk.value, pick: ePick.value, skip: +eSkip.value, max_loops: +eLoops.value, max_minutes: +eMin.value, trim: eTrim.value, max_trim: +eMaxTrim.value, path: ePath.value, tpath: eTPath.value });
+    return { ds: st.e.ds, runs: st.e.runs, drift: st.e.drift, yield: st.e.yield, cpk: st.e.cpk, pick: st.e.pick, skip: st.e.skip, max_loops: st.e.max_loops, max_minutes: st.e.max_minutes, trim: st.e.trim, max_trim: st.e.max_trim, filter: filt() };
   };
   const eCheck = async () => {
     if (!files().length) return;
@@ -3279,10 +3283,12 @@ function viewQual(el) {
       eOut.replaceChildren(
         h("div", { class: "kpis" }, kpi("Sites compared", `${ok} of ${d.sites.length}`, ok === d.sites.length ? "all sites pass" : "see the dropped sites below"),
           kpi("Test-site rows", d.rows.toLocaleString(), `${d.tests.toLocaleString()} tests${d.short_rows ? `, ${d.short_rows} with fewer than ${p.runs} values` : ""}`),
-          kpi(`Drift above ${p.drift}%`, d.over.toLocaleString(), "rows to comment"), kpi(`Cpk below ${p.cpk}`, d.low_cpk.toLocaleString(), "rows")),
+          kpi(`Drift above ${p.drift}%`, d.over.toLocaleString(), "rows to comment"), kpi(`Cpk below ${p.cpk}`, d.low_cpk.toLocaleString(), "rows"),
+          p.trim !== "off" ? kpi("Loops trimmed", (d.trim.start + d.trim.end + d.trim.between).toLocaleString(), `${d.trim.start} start, ${d.trim.end} end, ${d.trim.between} between`) : ""),
+        p.trim !== "off" ? h("div", { class: "muted small", style: { margin: "6px 0" } }, d.trim.loops ? `Loops left out for every site: ${d.trim.loops}. Trimmed for sites ${d.trim.sites.join(", ") || "none"}; the other sites could not reach the yield or the good loops needed and are dropped.` : "The trim left out no loop.") : "",
         h("div", { class: "tbl-wrap" }, h("table", {},
-          h("thead", {}, h("tr", {}, ["Site", "Loops", "In window", "Cut by", "Good", "Span yield", `First ${p.runs}`, `Last ${p.runs}`, "Skipped start / end", "Status"].map((x) => h("th", {}, x)))),
-          h("tbody", {}, d.sites.map((s) => h("tr", {}, h("td", {}, s.label), h("td", {}, s.loops), h("td", {}, s.window), h("td", {}, s.cut_by), h("td", {}, s.good), h("td", {}, pctTxt(s.span_yield)),
+          h("thead", {}, h("tr", {}, ["Site", "Loops", "In window", "Cut by", "Good", "Window yield", "Trimmed", "Kept yield", "Span yield", `First ${p.runs}`, `Last ${p.runs}`, "Skipped start / end", "Status"].map((x) => h("th", {}, x)))),
+          h("tbody", {}, d.sites.map((s) => h("tr", {}, h("td", {}, s.label), h("td", {}, s.loops), h("td", {}, s.window), h("td", {}, s.cut_by), h("td", {}, s.good), h("td", {}, pctTxt(s.window_yield)), h("td", {}, s.trimmed || ""), h("td", {}, pctTxt(s.kept_yield)), h("td", {}, pctTxt(s.span_yield)),
             h("td", {}, s.first_loops), h("td", {}, s.last_loops), h("td", {}, s.first_loops ? `${s.skipped_lead} / ${s.skipped_tail}` : ""), h("td", {}, statusBadge(s))))))),
         d.top.length ? h("h3", {}, "Largest drifts") : "", topTable(d.top, p.drift));
     } catch (e) { showErr(eOut, e); }
@@ -3295,12 +3301,23 @@ function viewQual(el) {
       eRes.replaceChildren(resultLine(`Saved ${r.path}: ${r.rows.toLocaleString()} test-site rows on ${r.sites} sites${r.dropped ? ` (${r.dropped} dropped)` : ""}, ${r.over.toLocaleString()} above the drift threshold`, r.path));
     } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
   };
+  const eTRes = h("div");
+  const eTrimSave = async () => {
+    if (!eTPath.value) return toast("Choose where to save the trimmed STDF", "bad");
+    busy("Writing the trimmed STDF…");
+    try {
+      const r = await api("endurance_trim_save", Object.assign(eParams(), { path: eTPath.value }));
+      eTRes.replaceChildren(resultLine(`Saved ${r.path}: ${r.kept.toLocaleString()} parts (the compared sites, first to last compared loop, without the trimmed loops)`, r.path), h("button", { onclick: () => loadPaths([r.path]) }, "Open it"));
+    } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+  };
   el.append(h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "Endurance check (one file)"),
     h("p", { class: "muted small" }, "The same unit loops on each site for 1,000 runs or 1.5 hours, and the first and last loops of each site are compared. Clean skips failing loops (an unstable start, noisy loops) and compares the first and last good loops, as long as the yield over the compared span reaches the threshold; a site below it is dropped. The window cut leaves out loops past 1,000 runs or 90 minutes (time estimated from the file start and finish), where a long run degrades the unit. 0 = no cut."),
     scopeNote(),
     h("div", { class: "controls" }, field("File", eDs), field("Runs at each end", eRuns), field("Drift threshold %", eDrift), field("Yield threshold %", eYield), field("Cpk minimum", eCpk)),
-    h("div", { class: "controls" }, field("Compared loops", ePick), field("Skip first loops", eSkip), field("Window ends after loops", eLoops), field("or minutes", eMin), h("button", { onclick: eCheck }, "Check sites")),
-    eOut, h("div", { class: "row", style: { marginTop: "10px" } }, ePf, h("button", { class: "primary", onclick: eSave }, "Export to Excel")), eRes));
+    h("div", { class: "controls" }, field("Compared loops", ePick), field("Skip first loops", eSkip), field("Window ends after loops", eLoops), field("or minutes", eMin), field("Auto trim to reach the yield", eTrim), field("Trim at most % of loops", eMaxTrim), h("button", { onclick: eCheck }, "Check sites")),
+    h("p", { class: "muted small" }, "Auto trim leaves out loops for every site at once (loop k is the k-th part of each site, one touchdown): first the loops at the start and end in which any site fails, then, with Ends then bad loops between, the failing loops between until every site reaches the yield. A site that still cannot reach it, or would need more loops left out than the limit (0 = no limit), is dropped instead and does not decide what is trimmed."),
+    eOut, h("div", { class: "row", style: { marginTop: "10px" } }, ePf, h("button", { class: "primary", onclick: eSave }, "Export to Excel")), eRes,
+    h("div", { class: "row", style: { marginTop: "6px" } }, eTPf, h("button", { onclick: eTrimSave, title: "The compared sites from their first to last compared loop, without the trimmed loops, as a new STDF. The source file is not changed." }, "Save trimmed STDF")), eTRes));
 
   // -- 25x loop compare
   const ids = files().map((d) => d.id);

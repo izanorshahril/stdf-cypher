@@ -139,6 +139,18 @@ enum Cmd {
         /// end the trial window this many minutes after the file start (0 = no cut)
         #[arg(long, default_value_t = 0.0)]
         max_minutes: f64,
+        /// leave out loops to reach the yield: off; ends (leading and trailing loops in which any
+        /// site fails); any (ends, then failing loops between until every site reaches it)
+        #[arg(long, default_value = "off", value_parser = ["off", "ends", "any"])]
+        trim: String,
+        /// the most loops the trim may leave out, % of the window (0 = no limit); a site that needs
+        /// more is dropped instead
+        #[arg(long, default_value_t = 20.0)]
+        max_trim: f64,
+        /// also write the trimmed trial (compared sites, first to last compared loop, without the
+        /// trimmed loops) to this STDF file
+        #[arg(long)]
+        trimmed_stdf: Option<PathBuf>,
         #[command(flatten)]
         l: LoadArgs,
     },
@@ -930,6 +942,9 @@ fn run() -> Result<()> {
             skip,
             max_loops,
             max_minutes,
+            trim,
+            max_trim,
+            trimmed_stdf,
             l,
         } => {
             use stdf_cypher::qual;
@@ -944,6 +959,8 @@ fn run() -> Result<()> {
                 skip,
                 max_loops,
                 max_minutes,
+                trim: qual::Trim::parse(&trim)?,
+                max_trim_pct: max_trim,
             };
             let e = qual::endurance(&ds, &r, &opts)?;
             let name = file.file_name().map_or(ds.name.clone(), |n| n.to_string_lossy().to_string());
@@ -955,11 +972,29 @@ fn run() -> Result<()> {
                 w.low_cpk,
                 out.display()
             );
+            if opts.trim != qual::Trim::Off {
+                println!(
+                    "trim: {} loops left out at the start, {} at the end, {} between ({}); trimmed for sites {}",
+                    e.trim.start,
+                    e.trim.end,
+                    e.trim.between,
+                    if e.trim.loops.is_empty() { "none" } else { &e.trim.loops },
+                    if e.trim.sites.is_empty() { "none".to_string() } else { e.trim.sites.join(", ") }
+                );
+            }
             for s in &e.sites {
                 println!(
                     "  site {:<6} {:>6} loops {:>6} good  first {:<12} last {:<14} {}",
                     s.label, s.loops, s.good, s.first_loops, s.last_loops, s.status
                 );
+            }
+            if let Some(p) = trimmed_stdf {
+                let keep = e.kept_rows();
+                if keep.is_empty() {
+                    bail!("no site is compared: there are no loops to write to {}", p.display());
+                }
+                let t = trim::write(&file, &ds, &keep, false, &p)?;
+                println!("trimmed trial: {} parts -> {}", t.kept, p.display());
             }
         }
         Cmd::LoopCompare {

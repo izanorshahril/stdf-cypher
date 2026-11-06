@@ -1076,6 +1076,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "part_trace_export" => part_trace_export_op(reg, &pp),
         "endurance_check" => endurance_op(reg, &pp, false),
         "endurance_export" => endurance_op(reg, &pp, true),
+        "endurance_trim_save" => endurance_trim_save_op(reg, &pp),
         "loop_compare_check" => loop_compare_op(reg, &pp, false),
         "loop_compare_export" => loop_compare_op(reg, &pp, true),
         // part datalog: search parts, then write the chosen tests' results
@@ -4295,22 +4296,12 @@ fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
 
 /// Endurance check of one dataset: the sites and the largest drifts, or (with `export`) the workbook.
 fn endurance_op(reg: &Registry, pp: &P, export: bool) -> Result<Value> {
-    use crate::qual::{endurance, write_endurance, EnduranceOpts, Pick};
+    use crate::qual::{endurance, write_endurance};
     let id = pp.usize("ds", 0);
     let (ds, _) = reg.get(id)?;
     let filter = pp.str("filter");
     let rows = reg.rows(id, &ds, &filter)?;
-    let d = EnduranceOpts::default();
-    let opts = EnduranceOpts {
-        runs: pp.usize("runs", d.runs),
-        drift_pct: pp.f64("drift", d.drift_pct),
-        yield_pct: pp.f64("yield", d.yield_pct),
-        cpk_min: pp.f64("cpk", d.cpk_min),
-        pick: Pick::parse(&pp.str("pick"))?,
-        skip: pp.usize("skip", 0),
-        max_loops: pp.usize("max_loops", 0),
-        max_minutes: pp.f64("max_minutes", 0.0),
-    };
+    let opts = endurance_opts(pp)?;
     let e = endurance(&ds, &rows, &opts)?;
     if export {
         let out = pp.str("path");
@@ -4327,8 +4318,50 @@ fn endurance_op(reg: &Registry, pp: &P, export: bool) -> Result<Value> {
         "low_cpk": e.low_cpk,
         "tests": e.tests,
         "short_rows": e.short_rows,
+        "trim": e.trim,
+        "kept_parts": e.kept_rows().len(),
         "top": top_drifts(e.rows.iter().map(|r| (r.drift, &ds.tests[r.test], e.sites[r.site].label.as_str(), r.comment.as_str()))),
     }))
+}
+
+/// The endurance settings the page sends.
+fn endurance_opts(pp: &P) -> Result<crate::qual::EnduranceOpts> {
+    use crate::qual::{EnduranceOpts, Pick, Trim};
+    let d = EnduranceOpts::default();
+    Ok(EnduranceOpts {
+        runs: pp.usize("runs", d.runs),
+        drift_pct: pp.f64("drift", d.drift_pct),
+        yield_pct: pp.f64("yield", d.yield_pct),
+        cpk_min: pp.f64("cpk", d.cpk_min),
+        pick: Pick::parse(&pp.str("pick"))?,
+        skip: pp.usize("skip", 0),
+        max_loops: pp.usize("max_loops", 0),
+        max_minutes: pp.f64("max_minutes", 0.0),
+        trim: Trim::parse(&pp.str("trim"))?,
+        max_trim_pct: pp.f64("max_trim", d.max_trim_pct),
+    })
+}
+
+/// Writes the trimmed trial of the endurance check to a new STDF file: every compared site from its
+/// first compared loop to its last, without the loops the trim left out.
+fn endurance_trim_save_op(reg: &Registry, pp: &P) -> Result<Value> {
+    let id = pp.usize("ds", 0);
+    let (ds, paths) = reg.get(id)?;
+    if paths.len() != 1 || ds.sources.len() != 1 {
+        bail!("the trimmed STDF needs a dataset opened from a single file");
+    }
+    let out = pp.str("path");
+    if out.is_empty() {
+        bail!("choose where to save the trimmed STDF");
+    }
+    let rows = reg.rows(id, &ds, &pp.str("filter"))?;
+    let e = crate::qual::endurance(&ds, &rows, &endurance_opts(pp)?)?;
+    let keep = e.kept_rows();
+    if keep.is_empty() {
+        bail!("no site is compared: there are no loops to save");
+    }
+    let res = crate::trim::write(std::path::Path::new(&paths[0]), &ds, &keep, false, std::path::Path::new(&out))?;
+    Ok(json!(res))
 }
 
 /// The 20 largest drifts as {test, site, drift, comment}.

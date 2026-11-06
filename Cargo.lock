@@ -1827,7 +1827,7 @@ dependencies = [
 
 [[package]]
 name = "stdf-cypher"
-version = "0.3.15"
+version = "0.3.16"
 dependencies = [
  "anyhow",
  "axum",
