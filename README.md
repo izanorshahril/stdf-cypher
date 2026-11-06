@@ -24,7 +24,7 @@ stdf-cypher split lot1.stdf --by hbin -o out/
   Requests with a foreign Host or Origin, or without the token, get 403 or 401.
   `serve --host <this PC's address>` also accepts that address, so another PC can open it; `--host 0.0.0.0` accepts localhost only.
   Uploads are stored up to 8 GB each.
-* **Analyse:** Overview → Test explorer → Wafer maps → Compare → Match, merge & trace → Failure investigation → Bad candidates → Signature check → Retest trace → Part trace → Correlation → ANOVA → Abnormal parts → Machine learning → Records. The **part filter** and the **population** (all parts / good parts only) in the top bar apply to every view.
+* **Analyse:** Overview → Test explorer → Wafer maps → Compare → Match, merge & trace → Failure investigation → Bad candidates → Signature check → Retest trace → Part trace → Correlation → ANOVA → Qualification drift → Abnormal parts → Machine learning → Records. The **part filter** and the **population** (all parts / good parts only) in the top bar apply to every view.
 * **Rename** a dataset with ✎ next to the dataset picker (or *Rename* on Home) so files are easy to tell apart in Compare, Match and chart titles.
 * **Part datalog:** type a part ID, die X/Y (`3,-2`, `W01 3,-2`) or part text and click one of the live matches to add it (tick which ways to match, including die X/Y read from tests), or paste a list; give each part a mark (the label written on the unit) and order the list with ↑ ↓ (the datalog prints in that order). Pick tests the same way; tests a file or part lacks print as N/A. Save as readable text (one block per part) or CSV (one row per part, or one per result).
 * **Settings:** defaults kept on this PC: file order, retest handling, chart options and three sections for tracing.
@@ -102,6 +102,8 @@ Tabular commands print the top rows; add `-o file.csv` for the full table.
 | `dump FILE [--rec PRR,PTR] [-n N]` | Records as JSON lines |
 | `xlsx FILE -o out.xlsx` | Every record in an Excel workbook: one sheet per record kind, the fields as columns (sheets continue past 1,048,575 rows) |
 | `part-trace FILES… -o out.xlsx [--key part_txt\|tests:80149\|tests:80100,80101,80102] [--names A,B,…] [--last-only all\|1,3] [--wxy-test 80149] [--wxy-tests 80100,80101,80102] [--offset-tests 80103,80104]` | Each part's history across files in an Excel workbook: one row per part, one group of columns per file, in the order given |
+| `endurance FILE -o out.xlsx [--runs 25] [--drift 5] [--yield 95] [--cpk 1.33] [--pick clean\|raw] [--skip 0] [--max-loops 1000] [--max-minutes 90]` | Endurance check of a looped file: mean drift of each test on each site, first vs last loops |
+| `loop-compare OLD NEW -o out.xlsx [--names "Rev 1,Rev 2"] [--runs 25] [--take first\|last] [--skip 0] [--drift 5] [--cpk 1.33]` | 25x loop compare of an old and a new test program: mean drift of each test on each site |
 | `prr FILES… [-o csv]` | Part (PRR) table incl. first failing test |
 | `tests FILES… [-o csv]` | Per-test N, mean, σ, min/max, Cpk, fails |
 | `export FILES… -o out.csv [--tests 1000,1010]` | Parts × tests matrix |
@@ -199,6 +201,22 @@ These are the same views in the desktop app and in `stdf-cypher serve` (which se
   Placeholder IDs are never merged this way.
   Parts without an ID are left out and counted, and a **Summary** sheet lists each file with its lot, tester and counts, including the tests left out.
   The part filter and population apply, and the Summary sheet records them.
+* **Qualification drift**: mean drift of every test on every site, exported to Excel.
+  Each site holds its own looped unit, so each site is its own trial, and drift is `ABS(mean1 - mean2) / (USL - LSL)`.
+  Drift above the threshold (default 5%) is red, Cpk below the minimum (default 1.33) is yellow, and the comment column says why.
+  **Endurance check** (one file): the first 25 loops of each site against its last 25.
+  *Clean* (default) skips failing loops, such as an unstable start or noisy loops, and compares the first and last 25 good loops; a site whose yield over the compared span is below the threshold (default 95%) is dropped.
+  *Raw* takes the loops as they are, and they must all pass.
+  The trial window can skip warm-up loops and end after a number of loops (1,000) or minutes (90), so loops of a run left going too long, where the unit degrades, are left out; the time of a part is estimated from its place between the file's start and finish times.
+  A site that ran fewer loops and minutes than the trial target is dropped as a short trial; with a time target, this needs the file's start and finish times, and without them the length is not judged.
+  The workbook has a Drift sheet (one row per test and site), a Sites sheet (loops, window, yield, estimated minutes, the loop numbers compared and why a site was dropped) and a Summary sheet.
+  **25x loop compare** (two files, old and new test program): each site takes its first (or last) 25 good loops from each file, and a site without 25 good loops in both files (unstable or inactive) is dropped, so no site removal or trimming is needed by hand.
+  Tests pair by number and name, else by number and pin, so renamed tests still pair; drift uses the old file's limits, and Cp and Cpk each file's own.
+  Units that differ only by an SI prefix (mV and V) are converted, and the new statistics are shown in the old unit; other unit changes get no drift and a comment.
+  The workbook has a Mean drift sheet (old and new statistics side by side per test and site, with name, unit and limit checks), a Sites sheet, an Unmatched tests sheet and a Summary sheet.
+  Both reports count the values behind each statistic (N columns) and comment when a test has fewer values than the loops compared; a site with no values on one side keeps its row, without a drift.
+  For a test whose limits change part by part, the limits of the compared loops are used, with a comment when they change between them.
+  The part filter applies; the population does not, because the yield check needs every loop.
 * **Loadboard and any test as a factor**: the loadboard (DIB) ID is read from a test (default 5100, set on Bad candidates, Retest trace or ANOVA) as a file-level value: the most common value in each file, so parts missing it take their file's board, and a file whose board changes is flagged. It is the field `loadboard` (and `site_loadboard` for site × board) in filters (`loadboard = 2`), color-by, ANOVA and the Bad candidates common factors; ANOVA also takes any test's value as the factor (`test:5100`)
 * **Histogram scale**: Compare and Bad candidates histograms switch between % of group and counts; every method column has a hover note, and *Methods and how the score is calculated* explains the candidate score
 * **Correlation**: unit correlation (tester ↔ tester), test-to-test matrix, drivers of a target
@@ -234,6 +252,7 @@ src/trim.rs      edit & trim: part selection by ID or row, keep or remove, backf
 src/touch.rs     touchdown and loop estimate (experiment): PIR runs, site order and test time, loops
 src/xlsx.rs      Excel workbook export (one sheet per record kind, no spreadsheet crate)
 src/parttrace.rs part trace workbook (one row per part across files), detection of shared parts
+src/qual.rs      qualification drift workbooks: endurance check and 25x loop compare, per test and site
 src/viz.rs       Plotly figure builders (theme-token colours)
 src/api.rs       JSON operations used by the dashboard
 src/server.rs    axum server (dashboard, uploads, window event stream)

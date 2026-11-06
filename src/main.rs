@@ -108,6 +108,71 @@ enum Cmd {
         #[command(flatten)]
         l: LoadArgs,
     },
+    /// Endurance check of one looped file: mean drift of each test on each site, first vs last
+    /// loops, as an Excel workbook
+    Endurance {
+        file: PathBuf,
+        /// the workbook to write (.xlsx)
+        #[arg(short, long)]
+        out: PathBuf,
+        /// loops compared at each end
+        #[arg(long, default_value_t = 25)]
+        runs: usize,
+        /// drift threshold, % of the limit range
+        #[arg(long, default_value_t = 5.0)]
+        drift: f64,
+        /// lowest yield of a valid site, %
+        #[arg(long = "yield", default_value_t = 95.0)]
+        yield_pct: f64,
+        /// Cpk below this is commented
+        #[arg(long, default_value_t = 1.33)]
+        cpk: f64,
+        /// clean: first and last good loops (failing loops skipped); raw: loops as they are
+        #[arg(long, default_value = "clean", value_parser = ["clean", "raw"])]
+        pick: String,
+        /// loops skipped at the start of each site
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        /// end the trial window after this many loops of a site (0 = no cut)
+        #[arg(long, default_value_t = 0)]
+        max_loops: usize,
+        /// end the trial window this many minutes after the file start (0 = no cut)
+        #[arg(long, default_value_t = 0.0)]
+        max_minutes: f64,
+        #[command(flatten)]
+        l: LoadArgs,
+    },
+    /// 25x loop compare of an old and a new file: mean drift of each test on each site, as an
+    /// Excel workbook
+    LoopCompare {
+        /// the old (reference) file
+        old: PathBuf,
+        /// the new file
+        new: PathBuf,
+        /// the workbook to write (.xlsx)
+        #[arg(short, long)]
+        out: PathBuf,
+        /// names of the old and new file in the report, e.g. "Rev 1.002,Rev 1.003"
+        #[arg(long, value_delimiter = ',')]
+        names: Vec<String>,
+        /// good loops taken from each site of each file
+        #[arg(long, default_value_t = 25)]
+        runs: usize,
+        /// drift threshold, % of the limit range
+        #[arg(long, default_value_t = 5.0)]
+        drift: f64,
+        /// Cpk below this is commented
+        #[arg(long, default_value_t = 1.33)]
+        cpk: f64,
+        /// take the first or the last good loops of each site
+        #[arg(long, default_value = "first", value_parser = ["first", "last"])]
+        take: String,
+        /// loops skipped at the start of each site
+        #[arg(long, default_value_t = 0)]
+        skip: usize,
+        #[command(flatten)]
+        l: LoadArgs,
+    },
     /// Part results table (PRR) – prints or writes CSV
     Prr {
         files: Vec<PathBuf>,
@@ -851,6 +916,103 @@ fn run() -> Result<()> {
                 println!(
                     "  {:<32} {:>8} parts {:>8} good {:>8} in an earlier file {:>8} tested again {:>8} no ID",
                     r.name, r.parts, r.good, r.in_earlier, r.repeats, r.no_id
+                );
+            }
+        }
+        Cmd::Endurance {
+            file,
+            out,
+            runs,
+            drift,
+            yield_pct,
+            cpk,
+            pick,
+            skip,
+            max_loops,
+            max_minutes,
+            l,
+        } => {
+            use stdf_cypher::qual;
+            let ds = load(std::slice::from_ref(&file), &l)?;
+            let r = rows(&ds, &l.filter)?;
+            let opts = qual::EnduranceOpts {
+                runs,
+                drift_pct: drift,
+                yield_pct,
+                cpk_min: cpk,
+                pick: qual::Pick::parse(&pick)?,
+                skip,
+                max_loops,
+                max_minutes,
+            };
+            let e = qual::endurance(&ds, &r, &opts)?;
+            let name = file.file_name().map_or(ds.name.clone(), |n| n.to_string_lossy().to_string());
+            let w = qual::write_endurance(&e, &ds, &name, &l.filter, &out)?;
+            println!(
+                "{} test-site rows, {} above {drift}% drift, {} with Cpk below {cpk} -> {}",
+                w.rows,
+                w.over,
+                w.low_cpk,
+                out.display()
+            );
+            for s in &e.sites {
+                println!(
+                    "  site {:<6} {:>6} loops {:>6} good  first {:<12} last {:<14} {}",
+                    s.label, s.loops, s.good, s.first_loops, s.last_loops, s.status
+                );
+            }
+        }
+        Cmd::LoopCompare {
+            old,
+            new,
+            out,
+            names,
+            runs,
+            drift,
+            cpk,
+            take,
+            skip,
+            l,
+        } => {
+            use stdf_cypher::qual;
+            if !names.is_empty() && names.len() != 2 {
+                bail!("--names takes the old and the new name");
+            }
+            let da = load(std::slice::from_ref(&old), &l)?;
+            let db = load(std::slice::from_ref(&new), &l)?;
+            let file_name = |p: &Path, ds: &Dataset| p.file_name().map_or(ds.name.clone(), |n| n.to_string_lossy().to_string());
+            let a = qual::Side {
+                name: names.first().cloned().unwrap_or_else(|| file_name(&old, &da)),
+                rows: rows(&da, &l.filter)?,
+                ds: &da,
+            };
+            let b = qual::Side {
+                name: names.get(1).cloned().unwrap_or_else(|| file_name(&new, &db)),
+                rows: rows(&db, &l.filter)?,
+                ds: &db,
+            };
+            let opts = qual::LoopOpts {
+                runs,
+                drift_pct: drift,
+                cpk_min: cpk,
+                take: qual::Take::parse(&take)?,
+                skip,
+            };
+            let c = qual::loop_compare(&a, &b, &opts)?;
+            let w = qual::write_loop_compare(&c, &a, &b, &l.filter, &out)?;
+            println!(
+                "{} tests paired ({} only old, {} only new), {} test-site rows, {} above {drift}% drift -> {}",
+                c.pairs.len(),
+                c.only_old.len(),
+                c.only_new.len(),
+                w.rows,
+                w.over,
+                out.display()
+            );
+            for s in &c.sites {
+                println!(
+                    "  site {:<6} old {:>5} good  new {:>5} good  {}",
+                    s.label, s.good[0], s.good[1], s.status
                 );
             }
         }

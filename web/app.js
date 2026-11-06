@@ -332,6 +332,7 @@ const VIEWS = {
   parttrace: { label: "Part trace", fn: viewPartTrace },
   correlation: { label: "Correlation", fn: viewCorrelation },
   anova: { label: "ANOVA", fn: viewAnova },
+  qual: { label: "Qualification drift", fn: viewQual },
   anomaly: { label: "Abnormal parts", fn: viewAnomaly },
   ml: { label: "Machine learning", fn: viewML },
   records: { label: "Records", fn: viewRecords },
@@ -2875,6 +2876,7 @@ async function viewHome(el) {
     ["parttrace", "Part trace", "Each part's history across files, as an Excel report"],
     ["correlation", "Correlation", "Tester-to-tester correlation, test-to-test matrix"],
     ["anova", "ANOVA", "Which tests differ by site, wafer or lot"],
+    ["qual", "Qualification drift", "Endurance and 25x loop mean drift by test and site, as Excel reports"],
     ["anomaly", "Abnormal parts", "PAT, robust z, wafer NNR, Isolation Forest"],
     ["ml", "Machine learning", "What drives fails? PCA & clustering"],
     ["records", "Records", "Part table and every raw STDF record"],
@@ -3239,6 +3241,117 @@ function viewPartTrace(el) {
     res));
   draw();
   detect();
+}
+// ---- Qualification drift: endurance check of one file, 25x loop compare of two, per test and site
+function viewQual(el) {
+  el.append(h("h1", {}, "Qualification drift"), h("p", { class: "lead" }, "Mean drift of every test on every site, written to Excel. Each site holds its own looped unit, so each site is its own trial. Drift = ABS(mean1 - mean2) / (USL - LSL)."));
+  const st = S.qual || (S.qual = { e: {}, c: {} });
+  const files = () => S.datasets.filter((d) => d.paths && d.paths.length);
+  const num = (v, step, w) => h("input", { type: "number", value: v, step: step || 1, min: 0, style: { width: (w || 70) + "px" } });
+  const defPath = (name) => { const f = files()[0]; if (!f) return name; const dir = dirname(f.paths[0]); return dir + (dir.includes("\\") ? "\\" : "/") + name; };
+  const filt = () => S.filter || "";
+  const pctTxt = (v) => (v == null ? "" : v.toFixed(2) + "%");
+  const topTable = (top, drift) => top.length ? h("div", { class: "tbl-wrap" }, h("table", {},
+    h("thead", {}, h("tr", {}, ["Test", "Unit", "Site", "Drift %", "Comment"].map((x) => h("th", {}, x)))),
+    h("tbody", {}, top.map((r) => h("tr", {}, h("td", {}, r.test), h("td", {}, r.units), h("td", {}, r.site),
+      h("td", {}, r.drift > drift ? badge(r.drift.toFixed(2), "bad") : r.drift.toFixed(2)), h("td", { class: "small" }, r.comment)))))) : "";
+  const scopeNote = () => (S.scope === "good" ? h("div", { class: "row tight small" }, badge("population ignored", "warn"), "The yield check needs every loop, so these reports use all parts. The part filter still applies.") : "");
+  const fileOpts = () => files().map((d) => [String(d.id), d.name]);
+  const statusBadge = (s) => badge(s.status, s.ok ? "good" : "bad");
+
+  // -- endurance check
+  const eDs = select(fileOpts(), String(st.e.ds ?? (files()[0] || {}).id), (v) => (st.e.ds = +v));
+  const eRuns = num(st.e.runs ?? 25), eDrift = num(st.e.drift ?? 5, 0.5), eYield = num(st.e.yield ?? 95, 0.5), eCpk = num(st.e.cpk ?? 1.33, 0.01);
+  const ePick = select([["clean", "Clean: first and last good loops"], ["raw", "Raw: loops as they are (all must pass)"]], st.e.pick || "clean", (v) => (st.e.pick = v));
+  const eSkip = num(st.e.skip ?? 0), eLoops = num(st.e.max_loops ?? 1000, 1, 80), eMin = num(st.e.max_minutes ?? 90, 1, 80);
+  const [ePath, ePf] = pathField("save", st.e.path || defPath("endurance_drift.xlsx"), { title: "Save endurance report", name: "endurance_drift.xlsx", ext: "xlsx" });
+  const eOut = h("div"), eRes = h("div");
+  const eParams = () => {
+    Object.assign(st.e, { ds: +eDs.value, runs: +eRuns.value, drift: +eDrift.value, yield: +eYield.value, cpk: +eCpk.value, pick: ePick.value, skip: +eSkip.value, max_loops: +eLoops.value, max_minutes: +eMin.value, path: ePath.value });
+    return { ds: st.e.ds, runs: st.e.runs, drift: st.e.drift, yield: st.e.yield, cpk: st.e.cpk, pick: st.e.pick, skip: st.e.skip, max_loops: st.e.max_loops, max_minutes: st.e.max_minutes, filter: filt() };
+  };
+  const eCheck = async () => {
+    if (!files().length) return;
+    loading(eOut);
+    try {
+      const p = eParams(), d = await api("endurance_check", p);
+      const ok = d.sites.filter((s) => s.ok).length;
+      eOut.replaceChildren(
+        h("div", { class: "kpis" }, kpi("Sites compared", `${ok} of ${d.sites.length}`, ok === d.sites.length ? "all sites pass" : "see the dropped sites below"),
+          kpi("Test-site rows", d.rows.toLocaleString(), `${d.tests.toLocaleString()} tests${d.short_rows ? `, ${d.short_rows} with fewer than ${p.runs} values` : ""}`),
+          kpi(`Drift above ${p.drift}%`, d.over.toLocaleString(), "rows to comment"), kpi(`Cpk below ${p.cpk}`, d.low_cpk.toLocaleString(), "rows")),
+        h("div", { class: "tbl-wrap" }, h("table", {},
+          h("thead", {}, h("tr", {}, ["Site", "Loops", "In window", "Cut by", "Good", "Span yield", `First ${p.runs}`, `Last ${p.runs}`, "Skipped start / end", "Status"].map((x) => h("th", {}, x)))),
+          h("tbody", {}, d.sites.map((s) => h("tr", {}, h("td", {}, s.label), h("td", {}, s.loops), h("td", {}, s.window), h("td", {}, s.cut_by), h("td", {}, s.good), h("td", {}, pctTxt(s.span_yield)),
+            h("td", {}, s.first_loops), h("td", {}, s.last_loops), h("td", {}, s.first_loops ? `${s.skipped_lead} / ${s.skipped_tail}` : ""), h("td", {}, statusBadge(s))))))),
+        d.top.length ? h("h3", {}, "Largest drifts") : "", topTable(d.top, p.drift));
+    } catch (e) { showErr(eOut, e); }
+  };
+  const eSave = async () => {
+    if (!ePath.value) return toast("Choose where to save the report", "bad");
+    busy("Writing the endurance report…");
+    try {
+      const r = await api("endurance_export", Object.assign(eParams(), { path: ePath.value }));
+      eRes.replaceChildren(resultLine(`Saved ${r.path}: ${r.rows.toLocaleString()} test-site rows on ${r.sites} sites${r.dropped ? ` (${r.dropped} dropped)` : ""}, ${r.over.toLocaleString()} above the drift threshold`, r.path));
+    } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+  };
+  el.append(h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "Endurance check (one file)"),
+    h("p", { class: "muted small" }, "The same unit loops on each site for 1,000 runs or 1.5 hours, and the first and last loops of each site are compared. Clean skips failing loops (an unstable start, noisy loops) and compares the first and last good loops, as long as the yield over the compared span reaches the threshold; a site below it is dropped. The window cut leaves out loops past 1,000 runs or 90 minutes (time estimated from the file start and finish), where a long run degrades the unit. 0 = no cut."),
+    scopeNote(),
+    h("div", { class: "controls" }, field("File", eDs), field("Runs at each end", eRuns), field("Drift threshold %", eDrift), field("Yield threshold %", eYield), field("Cpk minimum", eCpk)),
+    h("div", { class: "controls" }, field("Compared loops", ePick), field("Skip first loops", eSkip), field("Window ends after loops", eLoops), field("or minutes", eMin), h("button", { onclick: eCheck }, "Check sites")),
+    eOut, h("div", { class: "row", style: { marginTop: "10px" } }, ePf, h("button", { class: "primary", onclick: eSave }, "Export to Excel")), eRes));
+
+  // -- 25x loop compare
+  const ids = files().map((d) => d.id);
+  const cA = select(fileOpts(), String(st.c.a ?? ids[0]), (v) => (st.c.a = +v));
+  const cB = select(fileOpts(), String(st.c.b ?? ids[1] ?? ids[0]), (v) => (st.c.b = +v));
+  const nA = h("input", { type: "text", value: st.c.name_a || "", placeholder: "e.g. Rev 1.002", style: { width: "150px" } });
+  const nB = h("input", { type: "text", value: st.c.name_b || "", placeholder: "e.g. Rev 1.003", style: { width: "150px" } });
+  const cRuns = num(st.c.runs ?? 25), cDrift = num(st.c.drift ?? 5, 0.5), cCpk = num(st.c.cpk ?? 1.33, 0.01), cSkip = num(st.c.skip ?? 0);
+  const cTake = select([["first", "First good loops"], ["last", "Last good loops"]], st.c.take || "first", (v) => (st.c.take = v));
+  const [cPath, cPf] = pathField("save", st.c.path || defPath("loop_compare_drift.xlsx"), { title: "Save 25x loop compare", name: "loop_compare_drift.xlsx", ext: "xlsx" });
+  const cOut = h("div"), cRes = h("div");
+  const cParams = () => {
+    Object.assign(st.c, { a: +cA.value, b: +cB.value, name_a: nA.value, name_b: nB.value, runs: +cRuns.value, drift: +cDrift.value, cpk: +cCpk.value, skip: +cSkip.value, take: cTake.value, path: cPath.value });
+    return { a: st.c.a, b: st.c.b, name_a: st.c.name_a, name_b: st.c.name_b, runs: st.c.runs, drift: st.c.drift, cpk: st.c.cpk, skip: st.c.skip, take: st.c.take, filter: filt() };
+  };
+  const cCheck = async () => {
+    if (files().length < 2) return showErr(cOut, new Error("Open the old and the new file"));
+    if (cA.value === cB.value) return showErr(cOut, new Error("Pick two different files"));
+    loading(cOut);
+    try {
+      const p = cParams(), d = await api("loop_compare_check", p);
+      const ok = d.sites.filter((s) => s.ok).length;
+      const nm = [p.name_a || dsName(p.a), p.name_b || dsName(p.b)];
+      cOut.replaceChildren(
+        h("div", { class: "kpis" }, kpi("Sites compared", `${ok} of ${d.sites.length}`, `${p.runs} good loops in both files`),
+          kpi("Tests paired", d.pairs.toLocaleString(), `${d.only_old} only old, ${d.only_new} only new`),
+          kpi("Changed", `${d.limits_changed} limits`, `${d.renamed} names`),
+          kpi(`Drift above ${p.drift}%`, d.over.toLocaleString(), `of ${d.rows.toLocaleString()} test-site rows${d.short_rows ? `, ${d.short_rows} with fewer than ${p.runs} values` : ""}`)),
+        h("div", { class: "tbl-wrap" }, h("table", {},
+          h("thead", {}, h("tr", {}, ["Site", `${nm[0]} good`, `${nm[0]} loops used`, `${nm[1]} good`, `${nm[1]} loops used`, "Status"].map((x) => h("th", {}, x)))),
+          h("tbody", {}, d.sites.map((s) => h("tr", {}, h("td", {}, s.label), h("td", {}, `${s.good[0]} of ${s.loops[0]}`), h("td", {}, s.used[0]), h("td", {}, `${s.good[1]} of ${s.loops[1]}`), h("td", {}, s.used[1]), h("td", {}, statusBadge(s))))))),
+        d.top.length ? h("h3", {}, "Largest drifts") : "", topTable(d.top, p.drift));
+    } catch (e) { showErr(cOut, e); }
+  };
+  const cSave = async () => {
+    if (cA.value === cB.value) return toast("Pick two different files", "bad");
+    if (!cPath.value) return toast("Choose where to save the report", "bad");
+    busy("Writing the 25x loop compare…");
+    try {
+      const r = await api("loop_compare_export", Object.assign(cParams(), { path: cPath.value }));
+      cRes.replaceChildren(resultLine(`Saved ${r.path}: ${r.rows.toLocaleString()} test-site rows on ${r.sites} sites${r.dropped ? ` (${r.dropped} dropped)` : ""}, ${r.over.toLocaleString()} above the drift threshold`, r.path));
+    } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+  };
+  el.append(h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, "25x loop compare (old vs new file)"),
+    h("p", { class: "muted small" }, "The same units loop on the old and the new test program. Each site takes its first (or last) 25 good loops from each file; a site without 25 good loops in both files (an unstable or inactive site) is dropped, and extra loops are left out. Tests pair by number and name, else by number. Drift uses the old file's limits."),
+    scopeNote(),
+    h("div", { class: "controls" }, field("Old (reference)", cA), field("Name", nA), field("New", cB), field("Name", nB)),
+    h("div", { class: "controls" }, field("Loops per site", cRuns), field("Take", cTake), field("Skip first loops", cSkip), field("Drift threshold %", cDrift), field("Cpk minimum", cCpk), h("button", { onclick: cCheck }, "Check sites")),
+    cOut, h("div", { class: "row", style: { marginTop: "10px" } }, cPf, h("button", { class: "primary", onclick: cSave }, "Export to Excel")), cRes));
+  if (files().length) eCheck();
+  if (files().length > 1 && cA.value !== cB.value) cCheck();
 }
 // ---- Part datalog: pick parts, pick tests, write their results
 const DL_MODES = [["part_id", "Part ID"], ["xy", "X/Y"], ["part_txt", "Part text"], ["test_xy", "Die X/Y from tests"]];

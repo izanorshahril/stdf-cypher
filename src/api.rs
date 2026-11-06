@@ -1074,6 +1074,10 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "part_trace_detect" => part_trace_detect_op(reg, &pp),
         "part_trace_audit" => part_trace_audit_op(reg, &pp),
         "part_trace_export" => part_trace_export_op(reg, &pp),
+        "endurance_check" => endurance_op(reg, &pp, false),
+        "endurance_export" => endurance_op(reg, &pp, true),
+        "loop_compare_check" => loop_compare_op(reg, &pp, false),
+        "loop_compare_export" => loop_compare_op(reg, &pp, true),
         // part datalog: search parts, then write the chosen tests' results
         "find_parts" => {
             let id = pp.usize("ds", 0);
@@ -4287,6 +4291,106 @@ fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
     };
     let s = export_audited(&runs, std::path::Path::new(&out), &filter, &found)?;
     Ok(json!({"path": out, "summary": s}))
+}
+
+/// Endurance check of one dataset: the sites and the largest drifts, or (with `export`) the workbook.
+fn endurance_op(reg: &Registry, pp: &P, export: bool) -> Result<Value> {
+    use crate::qual::{endurance, write_endurance, EnduranceOpts, Pick};
+    let id = pp.usize("ds", 0);
+    let (ds, _) = reg.get(id)?;
+    let filter = pp.str("filter");
+    let rows = reg.rows(id, &ds, &filter)?;
+    let d = EnduranceOpts::default();
+    let opts = EnduranceOpts {
+        runs: pp.usize("runs", d.runs),
+        drift_pct: pp.f64("drift", d.drift_pct),
+        yield_pct: pp.f64("yield", d.yield_pct),
+        cpk_min: pp.f64("cpk", d.cpk_min),
+        pick: Pick::parse(&pp.str("pick"))?,
+        skip: pp.usize("skip", 0),
+        max_loops: pp.usize("max_loops", 0),
+        max_minutes: pp.f64("max_minutes", 0.0),
+    };
+    let e = endurance(&ds, &rows, &opts)?;
+    if export {
+        let out = pp.str("path");
+        if out.is_empty() {
+            bail!("choose where to save the report");
+        }
+        let w = write_endurance(&e, &ds, &reg.name(id), &filter, std::path::Path::new(&out))?;
+        return Ok(json!(w));
+    }
+    Ok(json!({
+        "sites": e.sites,
+        "rows": e.rows.len(),
+        "over": e.over,
+        "low_cpk": e.low_cpk,
+        "tests": e.tests,
+        "short_rows": e.short_rows,
+        "top": top_drifts(e.rows.iter().map(|r| (r.drift, &ds.tests[r.test], e.sites[r.site].label.as_str(), r.comment.as_str()))),
+    }))
+}
+
+/// The 20 largest drifts as {test, site, drift, comment}.
+fn top_drifts<'a>(rows: impl Iterator<Item = (Option<f64>, &'a data::TestInfo, &'a str, &'a str)>) -> Vec<Value> {
+    let mut v: Vec<_> = rows.filter(|r| r.0.is_some()).collect();
+    v.sort_by(|a, b| b.0.unwrap_or(0.0).total_cmp(&a.0.unwrap_or(0.0)));
+    v.into_iter()
+        .take(20)
+        .map(|(d, t, site, comment)| json!({"test": format!("{} {}", t.num, t.name), "units": t.units, "site": site, "drift": d, "comment": comment}))
+        .collect()
+}
+
+/// 25x loop compare of `a` (old, reference) and `b` (new).
+fn loop_compare_op(reg: &Registry, pp: &P, export: bool) -> Result<Value> {
+    use crate::qual::{loop_compare, write_loop_compare, LoopOpts, Side, Take};
+    let (ia, ib) = (pp.usize("a", usize::MAX), pp.usize("b", usize::MAX));
+    if ia == usize::MAX || ib == usize::MAX {
+        bail!("choose the old and the new file");
+    }
+    let (da, _) = reg.get(ia)?;
+    let (db, _) = reg.get(ib)?;
+    let filter = pp.str("filter");
+    let name = |k: &str, id: usize| {
+        let n = pp.str(k);
+        if n.trim().is_empty() {
+            reg.name(id)
+        } else {
+            n.trim().to_string()
+        }
+    };
+    let a = Side { name: name("name_a", ia), ds: &da, rows: reg.rows(ia, &da, &filter)? };
+    let b = Side { name: name("name_b", ib), ds: &db, rows: reg.rows(ib, &db, &filter)? };
+    let d = LoopOpts::default();
+    let opts = LoopOpts {
+        runs: pp.usize("runs", d.runs),
+        drift_pct: pp.f64("drift", d.drift_pct),
+        cpk_min: pp.f64("cpk", d.cpk_min),
+        take: Take::parse(&pp.str("take"))?,
+        skip: pp.usize("skip", 0),
+    };
+    let c = loop_compare(&a, &b, &opts)?;
+    if export {
+        let out = pp.str("path");
+        if out.is_empty() {
+            bail!("choose where to save the report");
+        }
+        let w = write_loop_compare(&c, &a, &b, &filter, std::path::Path::new(&out))?;
+        return Ok(json!(w));
+    }
+    Ok(json!({
+        "sites": c.sites,
+        "pairs": c.pairs.len(),
+        "renamed": c.pairs.iter().filter(|p| !p.name_match).count(),
+        "limits_changed": c.pairs.iter().filter(|p| !p.limits_match).count(),
+        "only_old": c.only_old.len(),
+        "only_new": c.only_new.len(),
+        "rows": c.rows.len(),
+        "over": c.over,
+        "low_cpk": c.low_cpk,
+        "short_rows": c.short_rows,
+        "top": top_drifts(c.rows.iter().map(|r| (r.drift, &da.tests[c.pairs[r.pair].old], c.sites[r.site].label.as_str(), r.comment.as_str()))),
+    }))
 }
 
 fn merge_candidates_op(reg: &Registry) -> Result<Value> {
