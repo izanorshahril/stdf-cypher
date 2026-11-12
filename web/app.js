@@ -71,7 +71,7 @@ const pad3 = (v) => { const s = String(v); return s.startsWith("-") ? "-" + s.sl
 const wxyWith = (t, w, x, y) => t.replace("{w}", w).replace("{x3}", pad3(x)).replace("{y3}", pad3(y)).replace("{x}", x).replace("{y}", y);
 const testWith = (t, num, name) => t.replace("{num}", num).replace("{name}", name);
 /** Wafer, X and Y as one ID, in the form set in Settings (default W12X-2Y25; letters, not |, which reads as "or" in a filter). */
-const wxyText = (w, x, y) => wxyWith(S.cfg.wxyFmt || WXY_FORMATS[0][0], w, x, y);
+const wxyText = (w, x, y) => { const t = S.cfg.wxyFmt || WXY_FORMATS[0][0], wide = (v) => String(v).replace("-", "").length > 3; return (t.includes("{x3}") && wide(x)) || (t.includes("{y3}") && wide(y)) ? wxyWith(WXY_FORMATS[0][0], w, x, y) : wxyWith(t, w, x, y); };
 /** Part trace fields a part can show (mini card, search): [key, label]. */
 function traceFields() {
   const t = idTests(true);
@@ -964,7 +964,9 @@ async function viewCorrelation(el) {
 function corrUnit(el) {
   el.append(h("p", { class: "lead" }, "The same physical parts tested in two files (e.g. golden units on two testers, or a re-test) are paired by the IDs picked for each file, as on Match parts. Each test is CORRELATED, OFFSET (good r but mean offset beyond tolerance) or UNCORRELATED."));
   const a = select(dsOptions(), String(S.ucA ?? S.ds), (v) => { S.ucA = +v; ka.forDs(S.ucA); });
-  const dA = S.datasets.find((d) => d.id === (S.ucA ?? S.ds));
+  if (!S.datasets.some((d) => d.id === S.ucA)) S.ucA = undefined;
+  if (!S.datasets.some((d) => d.id === S.ucB)) S.ucB = undefined;
+  const dA = S.datasets.find((d) => d.id === (S.ucA ?? S.ds)) || S.datasets[0];
   const twin = S.datasets.find((d) => d.id !== dA.id && d.files === 1 && dA.wafers.length && d.wafers.some((w) => dA.wafers.includes(w)));
   const b = select(dsOptions(), String(S.ucB ?? (twin ? twin.id : otherDs(dA.id))), (v) => { S.ucB = +v; kb.forDs(S.ucB); });
   // the same ID pickers as Match parts, so both pages pair the same units
@@ -2962,7 +2964,8 @@ async function viewHome(el) {
   left.append(drop, h("div", { class: "home-opts" }, h("label", { class: "chk" }, merge, "Combine the files I open into one dataset (lot-to-lot, ANOVA by file)"), field("Retested parts", dedup), field("Order of opened files", sortSel)));
 
   if (has) {
-    left.append(h("h2", {}, "Open datasets"));
+    left.append(h("div", { class: "row", style: { justifyContent: "space-between", alignItems: "baseline" } }, h("h2", {}, "Open datasets"),
+      h("button", { class: "ghost", title: "Close every open file and dataset to start fresh. The files on disk are not changed.", onclick: closeAll }, "Close all files")));
     const cards = h("div", { class: "ds-cards" });
     for (const d of S.datasets) {
       cards.append(h("div", { class: "ds-card" + (d.id === S.ds ? " current" : "") },
@@ -3023,6 +3026,23 @@ async function viewHome(el) {
 function dirname(p) { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i > 0 ? p.slice(0, i) : p; }
 function fmtSize(b) { return b > 1e9 ? (b / 1e9).toFixed(1) + " GB" : b > 1e6 ? (b / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1e3)) + " KB"; }
 
+/** Closes every dataset (files on disk stay as they are; copies of dropped files are deleted). */
+async function closeAll() {
+  const n = S.datasets.length;
+  if (!n || !confirm(`Close all ${n} open dataset${n > 1 ? "s" : ""}? The files on disk are not changed; you can open them again from Recent files.`)) return;
+  busy("Closing…");
+  try {
+    let closed = 0;
+    for (const d of [...S.datasets]) { try { await api("remove", { ds: d.id }); closed++; } catch (e) {} }
+    // every choice that names a dataset goes with them
+    Object.assign(S, { pt: null, rt: null, rtLast: null, m: null, mres: null, bc: null, bcLast: null, sg: null, sgLast: null, dl: null, fp: null, featured: {}, drafts: {}, rec: null, inv: null,
+      ucA: undefined, ucB: undefined, cmpA: undefined, cmpB: undefined, cmpLater: "", dualA: "", dualB: "", wafer: "all", explorerTest: null });
+    await refreshDatasets();
+    const left = S.datasets.length;
+    toast(left ? `Closed ${closed} of ${n}; ${left} could not be closed` : `Closed ${closed} dataset${closed > 1 ? "s" : ""}`, left ? "bad" : "good", left ? 8000 : 4000);
+    go("home");
+  } finally { busy(null); }
+}
 // ---- opening files
 async function openFiles() {
   if (S.info && S.info.native_dialogs) {
@@ -4232,26 +4252,162 @@ function drawTrim(body, ds, data, yields, est) {
 }
 
 // ---- Settings: defaults used across the views, kept in this browser profile
-/** A label form for Settings: a preset or your own template, checked by the server (which writes the reports). */
-function labelPick(key, title, presets, example, help) {
-  const cur = S.cfg[key] || presets[0][0];
-  const isPreset = presets.some(([t]) => t === cur);
-  const sel = select([...presets.map(([t, ex]) => [t, ex]), ["custom", "Custom…"]], isPreset ? cur : "custom", () => sync());
-  const own = h("input", { type: "text", value: isPreset ? "" : cur, placeholder: help, style: { width: "200px" }, hidden: isPreset, onchange: () => sync() });
-  const shown = h("span", { class: "muted small" }, `e.g. ${example(cur)}`);
-  async function sync() {
-    own.hidden = sel.value !== "custom";
-    const t = sel.value === "custom" ? own.value.trim() : sel.value;
-    if (!t) return;
-    const next = Object.assign({ wxy: S.cfg.wxyFmt || "", test: S.cfg.testFmt || "" }, key === "wxyFmt" ? { wxy: t } : { test: t });
-    try {
-      await api("label_formats", next);
-      S.cfg[key] = t; saveCfg(); S.featured = {};
-      shown.textContent = `e.g. ${example(t)}`;
-      toast("Saved", "good", 1500);
-    } catch (e) { toast(e.message, "bad"); }
+/** The fields and pieces of a label template: [{lit}|{tag}], or an error message. */
+function labelTokens(t) {
+  const out = [];
+  let i = 0;
+  while (i < t.length) {
+    const o = t.indexOf("{", i), c = t.indexOf("}", i);
+    if (c >= 0 && (o < 0 || c < o)) return { err: 'A "}" has no "{" before it' };
+    if (o < 0) { out.push({ lit: t.slice(i) }); break; }
+    if (o > i) out.push({ lit: t.slice(i, o) });
+    const e = t.indexOf("}", o);
+    if (e < 0) return { err: 'A "{" is not closed with "}"' };
+    out.push({ tag: t.slice(o + 1, e) });
+    i = e + 1;
   }
-  return field(title, h("div", { class: "row tight" }, sel, own, shown));
+  return { out };
+}
+/** What is wrong with a wafer, X, Y template, or "". */
+function checkWxyTemplate(t) {
+  if (!t) return "";
+  const r = labelTokens(t);
+  if (r.err) return r.err;
+  const tags = r.out.filter((x) => x.tag !== undefined).map((x) => x.tag);
+  for (const g of tags) if (!["w", "x", "y", "x3", "y3"].includes(g)) return `{${g}} is not a field: use {w}, {x}, {y}, or {x3}, {y3} for 3 digits`;
+  const n = (...a) => tags.filter((x) => a.includes(x)).length;
+  if (n("w") !== 1) return "Put {w} in once";
+  if (n("x", "x3") !== 1) return "Put {x} (or {x3}) in once";
+  if (n("y", "y3") !== 1) return "Put {y} (or {y3}) in once";
+  for (let i = 1; i < r.out.length; i++) {
+    const a = r.out[i - 1], b = r.out[i];
+    if (a.tag !== undefined && b.tag !== undefined && !["x3", "y3"].includes(b.tag)) return `{${a.tag}}{${b.tag}} has nothing between: add a separator, or use {x3} / {y3} so the numbers read back`;
+    // a digit next to a field reads as part of the number: {w}1{x} writes wafer 11, X 2 as 1112
+    if (a.tag !== undefined && b.lit !== undefined && /^\d/.test(b.lit)) return `A digit right after {${a.tag}} would read as part of the number: start "${b.lit}" with a letter or a sign`;
+    if (a.lit !== undefined && b.tag !== undefined && /\d$/.test(a.lit)) return `A digit right before {${b.tag}} would read as part of the number: end "${a.lit}" with a letter or a sign`;
+  }
+  return "";
+}
+/** What is wrong with a test template, or "". */
+function checkTestTemplate(t) {
+  if (!t) return "";
+  const r = labelTokens(t);
+  if (r.err) return r.err;
+  const tags = r.out.filter((x) => x.tag !== undefined).map((x) => x.tag);
+  for (const g of tags) if (!["num", "name"].includes(g)) return `{${g}} is not a field: use {num} and {name}`;
+  if (tags.filter((x) => x === "num").length !== 1) return "Put {num} in once";
+  if (tags.filter((x) => x === "name").length > 1) return "Put {name} in at most once";
+  return "";
+}
+/** Wafer, X, Y as the template writes them; X or Y too wide for a 3-digit field takes the default form, as the server does. */
+function wxyLabel(t, w, x, y) {
+  const wide = (v) => String(Math.abs(v)).length > 3;
+  if ((t.includes("{x3}") && wide(x)) || (t.includes("{y3}") && wide(y))) return wxyWith(WXY_FORMATS[0][0], w, x, y);
+  return wxyWith(t, w, x, y);
+}
+/** Wafer, X, Y read back from a label, or null. */
+function wxyRead(t, s) {
+  let re = "^";
+  const ord = [], esc = (z) => z.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const k of labelTokens(t).out || []) {
+    if (k.lit !== undefined) re += esc(k.lit);
+    else { re += k.tag === "w" ? "(-?\\d+?)" : k.tag.endsWith("3") ? "(-?\\d{3})" : "(-?\\d+)"; ord.push(k.tag[0]); }
+  }
+  const m = new RegExp(re + "$", "i").exec(s);
+  if (!m) return null;
+  const o = {};
+  ord.forEach((k, j) => (o[k] = +m[j + 1]));
+  return o;
+}
+// the labels the page wants saved (null: an edit not yet valid), sent together, the latest only
+const labelWant = {};
+let labelSaveSeq = 0;
+async function saveLabels() {
+  const mine = ++labelSaveSeq;
+  await new Promise((r) => setTimeout(r, 400));
+  if (mine !== labelSaveSeq) return;
+  if (Object.values(labelWant).some((v) => v === null)) return;
+  const want = { wxy: labelWant.wxyFmt ?? (S.cfg.wxyFmt || ""), test: labelWant.testFmt ?? (S.cfg.testFmt || "") };
+  if (want.wxy === (S.cfg.wxyFmt || "") && want.test === (S.cfg.testFmt || "")) return;
+  try {
+    const r = await api("label_formats", want);
+    if (mine !== labelSaveSeq) return;
+    // the server's values: the defaults when a label was cleared
+    S.cfg.wxyFmt = r.wxy === WXY_FORMATS[0][0] ? "" : r.wxy;
+    S.cfg.testFmt = r.test === TEST_FORMATS[0][0] ? "" : r.test;
+    saveCfg(); S.featured = {};
+    toast("Saved", "good", 1200);
+  } catch (e) { if (mine === labelSaveSeq) toast(e.message, "bad"); }
+}
+/** One label editor for Settings: fill in the blanks around fixed fields (one row), the template they make (editable),
+ *  a check of it and examples. Saved on the server, which writes the reports, once the template is good. */
+function labelEditor(spec) {
+  const cur = S.cfg[spec.key] || spec.def;
+  const blanks = spec.fields.map((_, i) => i).concat([spec.fields.length]).map(() => h("input", { type: "text", class: "gap" }));
+  // the blanks of the current template, when it is one the blanks can make
+  const fromTpl = (t) => {
+    const r = labelTokens(t);
+    if (r.err) return null;
+    const seq = r.out, want = spec.fields.map((f) => f.tags);
+    const lits = [""];
+    let k = 0;
+    for (const x of seq) {
+      if (x.lit !== undefined) lits[lits.length - 1] += x.lit;
+      else { if (!want[k] || !want[k].includes(x.tag)) return null; k++; lits.push(""); }
+    }
+    return k === want.length && spec.make(lits) === t ? lits : null;
+  };
+  const tpl = h("input", { type: "text", class: "tpl", value: cur, "aria-label": `${spec.title} template` });
+  const note = h("div", { class: "small label-check" }), examples = h("div");
+  const row = h("div", { class: "label-blanks" });
+  spec.fields.forEach((f, i) => row.append(blanks[i], h("span", { class: "label-chip" }, f.label)));
+  row.append(blanks[spec.fields.length]);
+  blanks.forEach((b, i) => { b.setAttribute("aria-label", i === 0 ? `Before ${spec.fields[0].label}` : i === spec.fields.length ? `After ${spec.fields[i - 1].label}` : `Between ${spec.fields[i - 1].label} and ${spec.fields[i].label}`); });
+  const setBlanks = (lits) => { row.classList.toggle("custom", !lits); blanks.forEach((b, i) => (b.value = lits ? lits[i] : "")); };
+  const update = (typed) => {
+    // trimmed, as the server keeps it; empty is the default
+    const t = tpl.value.trim() || spec.def;
+    const err = spec.check(tpl.value.trim());
+    note.className = "small label-check " + (err ? "bad" : spec.hint(t) ? "warn" : "good");
+    note.textContent = err ? `✗ ${err}` : spec.hint(t) || spec.ok;
+    examples.replaceChildren(...(err ? [] : spec.examples(t)));
+    if (typed) setBlanks(fromTpl(t));
+    // every edit cancels a save still waiting; a good template is saved with the other label
+    labelWant[spec.key] = err ? null : tpl.value.trim();
+    saveLabels();
+  };
+  blanks.forEach((b) => b.addEventListener("input", () => { row.classList.remove("custom"); tpl.value = spec.make(blanks.map((x) => x.value)); update(false); }));
+  tpl.addEventListener("input", () => update(true));
+  setBlanks(fromTpl(cur));
+  update(false);
+  return h("div", { class: "label-editor" }, h("b", {}, spec.title),
+    h("div", { class: "muted small" }, "Fill in the blanks: what goes before, between and after."), row,
+    h("div", { class: "muted small", style: { marginTop: "8px" } }, "Template: made from the blanks, or type your own."), tpl, note, examples);
+}
+function labelEditors() {
+  const wxySpec = {
+    key: "wxyFmt", title: "Wafer, X, Y", def: WXY_FORMATS[0][0], ok: "✓ Reads back correctly",
+    fields: [{ label: "wafer", tags: ["w"] }, { label: "X", tags: ["x", "x3"] }, { label: "Y", tags: ["y", "y3"] }],
+    // nothing between two numbers: the second is written as 3 digits so they read back
+    make: (b) => `${b[0]}{w}${b[1]}${b[1] === "" ? "{x3}" : "{x}"}${b[2]}${b[2] === "" ? "{y3}" : "{y}"}${b[3]}`,
+    check: checkWxyTemplate,
+    hint: (t) => (t.includes("{x3}") || t.includes("{y3}") ? "✓ Nothing between the numbers: X and Y are written as 3 digits (007) so they read back" : ""),
+    examples: (t) => [[1, 118, 126], [12, -5, 7], [24, 111, 146], [3, 1000, 2]].map(([w, x, y]) => {
+      const s = wxyLabel(t, w, x, y), back = wxyRead(t, s);
+      const ok = back && back.w === w && back.x === x && back.y === y;
+      const wide = (t.includes("{x3}") && String(Math.abs(x)).length > 3) || (t.includes("{y3}") && String(Math.abs(y)).length > 3);
+      return h("div", { class: "small mono muted" }, `wafer ${w}, X ${x}, Y ${y} → `, h("span", { class: "label-out" }, s), wide ? " (too wide for 3 digits: default form)" : ok ? " ✓" : h("span", { class: "flag-fail" }, " ✗ reads back as another die"));
+    }),
+  };
+  const testSpec = {
+    key: "testFmt", title: "Test number and name", def: TEST_FORMATS[0][0], ok: "✓ Looks good",
+    fields: [{ label: "number", tags: ["num"] }, { label: "name", tags: ["name"] }],
+    make: (b) => `${b[0]}{num}${b[1]}{name}${b[2]}`,
+    check: checkTestTemplate,
+    hint: () => "",
+    examples: (t) => [[72199, "VDD_LEAK"], [1013, "IDDQ"]].map(([n, nm]) => h("div", { class: "small mono muted" }, `${n} ${nm} → `, h("span", { class: "label-out" }, testWith(t, n, nm)))),
+  };
+  return h("div", { class: "label-grid" }, labelEditor(wxySpec), labelEditor(testSpec));
 }
 function viewSettings(el) {
   el.append(h("h1", {}, "Settings"), h("p", { class: "lead" }, "Shared settings, saved on this PC. Every page uses them: change one here and it changes everywhere. Pages show the value they use, with a link back here."));
@@ -4328,8 +4484,7 @@ function viewSettings(el) {
       idBox,
       h("label", { class: "chk", style: { marginTop: "10px" }, title: "Identity tests differ by position or board only, so they would top marker rankings and first-fail picks for no physical reason" }, ignore, "Ignore the identification tests in analytics (rankings, signatures, first fails)")),
     sec("Labels", "How wafer, X, Y and a test are written on every page, in the Excel reports and in CSV files. Matching does not change: a part is still found by its values, and a search reads W,X,Y typed in this form.",
-      h("div", { class: "controls" }, labelPick("wxyFmt", "Wafer, X, Y", WXY_FORMATS, (t) => wxyWith(t, 1, 118, 126), "{w} {x} {y}, or {x3} {y3} for 3 digits"),
-        labelPick("testFmt", "Test number and name", TEST_FORMATS, (t) => testWith(t, 72199, "TESTNAME"), "{num} {name}"))),
+      labelEditors()),
     sec("Die coordinates from tests", "Offsets added to the X and Y tests rebuild die X/Y for Wafer maps, Bad candidates and the Part datalog. They change how parts are identified only when Check WXY against is die X/Y: then wafer, X, Y is the die position.",
       h("div", { class: "controls" }, field("X offset test", traced("ox", inp("ox", "none"))), field("Y offset test", traced("oy", inp("oy", "none"))), field("Offset", omode), flip("fx", "flip X"), flip("fy", "flip Y"))),
     sec("Other trace fields", "Shown in the part trace card and the parts search of Retest trace.",

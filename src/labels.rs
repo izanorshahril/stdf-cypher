@@ -38,40 +38,109 @@ pub fn test_format() -> String {
     get(&TEST, TEST_DEFAULT)
 }
 
+/// The pieces of a template: literal text and `{field}` names, or what is wrong with its braces.
+fn pieces(t: &str) -> Result<Vec<(bool, &str)>> {
+    let mut out = vec![];
+    let mut rest = t;
+    while !rest.is_empty() {
+        let open = rest.find('{');
+        let close = rest.find('}');
+        match (open, close) {
+            (_, Some(c)) if open.is_none_or(|o| c < o) => bail!("a \"}}\" has no \"{{\" before it"),
+            (None, _) => {
+                out.push((false, rest));
+                break;
+            }
+            (Some(o), Some(c)) => {
+                if o > 0 {
+                    out.push((false, &rest[..o]));
+                }
+                out.push((true, &rest[o + 1..c]));
+                rest = &rest[c + 1..];
+            }
+            (Some(_), None) => bail!("a \"{{\" is not closed with \"}}\""),
+        }
+    }
+    Ok(out)
+}
+
+/// What is wrong with a wafer, X, Y template, as the Settings page says it.
+fn check_wxy(t: &str) -> Result<()> {
+    let p = pieces(t)?;
+    let tags: Vec<&str> = p.iter().filter(|x| x.0).map(|x| x.1).collect();
+    if let Some(g) = tags
+        .iter()
+        .find(|g| !["w", "x", "y", "x3", "y3"].contains(g))
+    {
+        bail!("{{{g}}} is not a field: use {{w}}, {{x}}, {{y}}, or {{x3}}, {{y3}} for 3 digits");
+    }
+    let n = |a: &[&str]| tags.iter().filter(|g| a.contains(g)).count();
+    if n(&["w"]) != 1 {
+        bail!("put {{w}} in once");
+    }
+    if n(&["x", "x3"]) != 1 {
+        bail!("put {{x}} (or {{x3}}) in once");
+    }
+    if n(&["y", "y3"]) != 1 {
+        bail!("put {{y}} (or {{y3}}) in once");
+    }
+    // it must read back as it was written: two fields next to each other need the second one
+    // padded ({w}{x3}{y3}); {w}{x}{y} would read 1234 as 1, 23, 4 or 12, 3, 4
+    for w in p.windows(2) {
+        // a digit next to a field reads as part of the number: {w}1{x} writes wafer 11, X 2 as 1112
+        if w[0].0 && !w[1].0 && w[1].1.starts_with(|c: char| c.is_ascii_digit()) {
+            bail!(
+                "a digit right after {{{}}} would read as part of the number: start \"{}\" with a letter or a sign",
+                w[0].1,
+                w[1].1
+            );
+        }
+        if !w[0].0 && w[1].0 && w[0].1.ends_with(|c: char| c.is_ascii_digit()) {
+            bail!(
+                "a digit right before {{{}}} would read as part of the number: end \"{}\" with a letter or a sign",
+                w[1].1,
+                w[0].1
+            );
+        }
+        if w[0].0 && w[1].0 && !matches!(w[1].1, "x3" | "y3") {
+            bail!(
+                "{{{}}}{{{}}} has nothing between: add a separator, or use {{x3}} / {{y3}} so the numbers read back",
+                w[0].1,
+                w[1].1
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What is wrong with a test template.
+fn check_test(t: &str) -> Result<()> {
+    let tags: Vec<&str> = pieces(t)?
+        .into_iter()
+        .filter(|x| x.0)
+        .map(|x| x.1)
+        .collect();
+    if let Some(g) = tags.iter().find(|g| !["num", "name"].contains(g)) {
+        bail!("{{{g}}} is not a field: use {{num}} and {{name}}");
+    }
+    if tags.iter().filter(|g| **g == "num").count() != 1 {
+        bail!("put {{num}} in once");
+    }
+    if tags.iter().filter(|g| **g == "name").count() > 1 {
+        bail!("put {{name}} in at most once");
+    }
+    Ok(())
+}
+
 /// Sets the templates; an empty one goes back to the default.
 pub fn set_formats(wxy: &str, test: &str) -> Result<()> {
     let wxy = wxy.trim();
     let test = test.trim();
     if !wxy.is_empty() {
-        let has = |a: &str, b: &str| wxy.contains(a) || wxy.contains(b);
-        if !(wxy.contains("{w}") && has("{x}", "{x3}") && has("{y}", "{y3}")) {
-            bail!("the wafer, X, Y label needs {{w}}, {{x}} and {{y}} (or {{x3}} and {{y3}})");
-        }
-        // it must read back as it was written: two fields next to each other need the second
-        // one padded ({w}{x3}{y3}); {w}{x}{y} would read 1234 as 1, 23, 4 or 12, 3, 4
-        let mut prev_field = false;
-        let mut rest = wxy;
-        while !rest.is_empty() {
-            match rest.find('{') {
-                Some(0) => {
-                    let end = rest.find('}').unwrap_or(rest.len() - 1);
-                    let tag = &rest[1..end];
-                    if prev_field && !matches!(tag, "x3" | "y3") {
-                        bail!("put a separator between the fields of the wafer, X, Y label, or use {{x3}} and {{y3}} (three digits) after {{w}}");
-                    }
-                    prev_field = true;
-                    rest = &rest[end + 1..];
-                }
-                Some(i) => {
-                    prev_field = false;
-                    rest = &rest[i..];
-                }
-                None => break,
-            }
-        }
+        check_wxy(wxy)?;
     }
-    if !test.is_empty() && !test.contains("{num}") {
-        bail!("the test label needs {{num}}");
+    if !test.is_empty() {
+        check_test(test)?;
     }
     *WXY.write().unwrap() = wxy.to_string();
     *TEST.write().unwrap() = test.to_string();
@@ -191,6 +260,15 @@ mod tests {
         // fields next to each other cannot be read back unless padded
         assert!(set_formats("{w}{x}{y}", "").is_err());
         assert!(set_formats("{w}{x3}{y}", "").is_err());
+        // fields named wrongly, twice, or braces left open
+        assert!(set_formats("W{w}X{x}Y{z}", "").is_err());
+        assert!(set_formats("W{w}X{x}Y{y}{w}", "").is_err());
+        assert!(set_formats("W{w}X{x}Y{y", "").is_err());
+        // a digit next to a field
+        assert!(set_formats("{w}1{x}_{y}", "").is_err());
+        assert!(set_formats("W{w}X{x}9{y}", "").is_err());
+        assert!(set_formats("", "{num} {nam}").is_err());
+        assert!(set_formats("", "{num}{num}").is_err());
         assert!(set_formats("", "T{name}").is_err());
         for (t, text) in [
             ("T#{num}_{name}", "T#72199_VDD"),

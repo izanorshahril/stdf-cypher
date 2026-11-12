@@ -381,3 +381,16 @@ tr.row-warn td { background: color-mix(in srgb, var(--warn) 9%, transparent); }
 .run-chip { padding: 2px 8px; border: 1px solid var(--border, #ccc); border-radius: 12px; }
 .run-chip.on { border-color: var(--accent); }
 .tr-cell { white-space: nowrap; }
+
+/* Settings, Labels: fill in the blanks (one row) over the template, wafer, X, Y beside the test */
+.label-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 20px; }
+.label-blanks { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; margin: 4px 0; }
+.label-blanks input.gap { width: 52px; min-width: 0; text-align: center; font-family: var(--mono, monospace); }
+.label-blanks.custom { opacity: 0.55; }
+.label-chip { padding: 4px 8px; border-radius: 6px; background: var(--accent-soft, rgba(80,120,220,.12)); color: var(--accent); font-family: var(--mono, monospace); font-size: 13px; white-space: nowrap; }
+.label-editor .tpl { width: 100%; font-family: var(--mono, monospace); margin-top: 2px; }
+.label-check { margin: 4px 0; }
+.label-check.good { color: var(--pass, #2e7d32); }
+.label-check.warn { color: var(--serious, #b26a00); }
+.label-check.bad { color: var(--fail, #c62828); }
+.label-out { color: var(--text, inherit); }
