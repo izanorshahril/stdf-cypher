@@ -375,3 +375,9 @@ tr.row-warn td { background: color-mix(in srgb, var(--warn) 9%, transparent); }
 /* part search hits */
 .hit-list { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin: 8px 0; }
 .hit-list .hit { text-align: left; }
+
+/* Trace: quick run toggles and part cells */
+.run-chips { flex-wrap: wrap; margin-bottom: 6px; }
+.run-chip { padding: 2px 8px; border: 1px solid var(--border, #ccc); border-radius: 12px; }
+.run-chip.on { border-color: var(--accent); }
+.tr-cell { white-space: nowrap; }

@@ -11,7 +11,7 @@
 //! Also finds which of several files hold the same parts, so they can be offered for tracing.
 
 use crate::analysis::retest::placeholder;
-use crate::data::matching::{norm, num_key, wxy_text, KeySpec};
+use crate::data::matching::{norm, num_key, KeySpec};
 use crate::data::{Dataset, Part};
 use crate::xlsx::{self, column_letters, style, write_styled, Sheet, MAX_ROWS};
 use anyhow::{bail, Result};
@@ -88,6 +88,16 @@ pub struct Run<'a> {
     pub rows: Vec<usize>,
     /// keep only the last test of a part this file holds more than once
     pub last_only: bool,
+    /// per ID: whether it links tests of one part across files (true where missing). An ID that
+    /// does not is shown in its column only: e.g. a WXY test that is not always right, or part
+    /// IDs that restart in every file
+    pub links: Vec<bool>,
+}
+
+impl Run<'_> {
+    fn links_at(&self, i: usize) -> bool {
+        self.links.get(i).copied().unwrap_or(true)
+    }
 }
 
 /// Leaves out the IDs no file has (a test no file logs), so the report has no empty ID column.
@@ -106,6 +116,13 @@ pub fn drop_unused_ids(runs: &mut [Run], specs: &[String]) -> Vec<String> {
             i += 1;
             used[i - 1]
         });
+        if !r.links.is_empty() {
+            let mut i = 0;
+            r.links.retain(|_| {
+                i += 1;
+                used.get(i - 1).copied().unwrap_or(true)
+            });
+        }
     }
     (0..n)
         .filter(|&i| !used[i])
@@ -141,6 +158,9 @@ pub struct RunStats {
     /// parts whose only IDs are placeholders (all zeros, one character repeated…): each keeps a
     /// row of its own and is never matched
     pub placeholder: usize,
+    /// tests with an ID value that is on several parts of this file (the same W,X,Y with other
+    /// part texts): that value is not used to match them
+    pub ambiguous: usize,
     /// different parts in the file
     pub distinct: usize,
     /// parts already seen in an earlier file
@@ -159,8 +179,9 @@ pub struct RunStats {
     pub with: Vec<usize>,
 }
 
-/// Two tests that share one ID but disagree on another. `joined`: the shared ID is the more trusted
-/// one (W,X,Y over WXY over part text), so they are one part and the other ID is marked; `apart`:
+/// Two tests that share one ID but disagree on another. `shared`: an ID value on several parts of
+/// one file, left out of matching there (`at` is the test). `joined`: the shared ID is the more trusted
+/// one (W,X,Y over part text; IDs that only show never take part), so they are one part and the other ID is marked; `apart`:
 /// the ID that differs is the more trusted one, so they are two parts.
 #[derive(Debug, Clone, Serialize)]
 pub struct Conflict {
@@ -179,6 +200,12 @@ pub struct Conflict {
 
 impl Conflict {
     pub fn text(&self) -> String {
+        if self.kind == "shared" {
+            return format!(
+                "{} {} is on several parts in one file: not used to match them",
+                self.by, self.value
+            );
+        }
         let how = if self.kind == "joined" {
             format!("one part, by {}", self.by)
         } else {
@@ -192,6 +219,12 @@ impl Conflict {
 
     /// The note on the part's row in the report.
     pub fn note(&self) -> String {
+        if self.kind == "shared" {
+            return format!(
+                "{} {} is on several parts in this file",
+                self.by, self.value
+            );
+        }
         if self.kind == "joined" {
             format!(
                 "matched by {}; {} {} also logged",
@@ -259,8 +292,18 @@ fn agree(a: &[Option<String>], b: &[Option<String>]) -> bool {
 }
 
 /// The IDs of one test of a part, placeholders left out, and its IDs as logged.
-fn ids_of(run: &Run, n: usize, r: usize) -> (Vec<Option<String>>, Vec<Option<String>>) {
-    let raw: Vec<Option<String>> = (0..n)
+/// The IDs of one test of a part: the linking IDs with placeholders left out, the linking IDs as
+/// logged, and the values of the IDs that are only shown.
+fn ids_of(
+    run: &Run,
+    n: usize,
+    r: usize,
+) -> (
+    Vec<Option<String>>,
+    Vec<Option<String>>,
+    Vec<Option<String>>,
+) {
+    let all: Vec<Option<String>> = (0..n)
         .map(|i| {
             run.keys
                 .get(i)
@@ -268,11 +311,38 @@ fn ids_of(run: &Run, n: usize, r: usize) -> (Vec<Option<String>>, Vec<Option<Str
                 .and_then(|key| key.key(run.ds, r))
         })
         .collect();
+    let raw: Vec<Option<String>> = all
+        .iter()
+        .enumerate()
+        .map(|(i, v)| v.clone().filter(|_| run.links_at(i)))
+        .collect();
+    let extra = all
+        .into_iter()
+        .enumerate()
+        .map(|(i, v)| v.filter(|_| !run.links_at(i)))
+        .collect();
     let ids = raw
         .iter()
         .map(|v| v.clone().filter(|v| placeholder(v).is_none()))
         .collect();
-    (ids, raw)
+    (ids, raw, extra)
+}
+
+/// Adds the values of the IDs that are only shown to a part's texts: each different value once,
+/// joined by " / " (a WXY test that reads differently in two files shows both).
+fn add_shown(texts: &mut [Option<String>], run: &Run, extra: &[Option<String>]) {
+    for (i, v) in extra.iter().enumerate() {
+        let Some(v) = v else { continue };
+        let v = shown(run.keys[i].as_ref(), v);
+        match &mut texts[i] {
+            Some(t) if t.split(" / ").any(|x| x == v) => {}
+            Some(t) => {
+                t.push_str(" / ");
+                t.push_str(&v);
+            }
+            t => *t = Some(v),
+        }
+    }
 }
 
 fn collect(runs: &[Run], audit: &Audit) -> Parts {
@@ -300,24 +370,80 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
             ..Default::default()
         };
         let big: Vec<usize> = run.keys.iter().flatten().flat_map(KeySpec::tests).collect();
+        // ID values on several parts of this file: the same value with another value of a second
+        // ID (one W,X,Y on two part texts, a part text copied to another die). Such a value does
+        // not tell the parts apart, so it is not used to match them in this file; repeats of one
+        // part agree on every ID and do not count.
+        let mut seen: Vec<HashMap<String, Vec<Vec<Option<String>>>>> = vec![HashMap::new(); n];
+        for &r in &run.rows {
+            let ids = ids_of(run, n, r).0;
+            for (i, v) in ids.iter().enumerate() {
+                if let Some(v) = v {
+                    let others: Vec<Option<String>> = ids
+                        .iter()
+                        .enumerate()
+                        .map(|(j, x)| if j == i { None } else { x.clone() })
+                        .collect();
+                    seen[i].entry(v.clone()).or_default().push(others);
+                }
+            }
+        }
+        let ambiguous: Vec<HashSet<String>> = seen
+            .into_iter()
+            .map(|m| {
+                m.into_iter()
+                    .filter(|(_, o)| o.iter().any(|a| o.iter().any(|b| !agree(a, b))))
+                    .map(|(v, _)| v)
+                    .collect()
+            })
+            .collect();
         for &r in &run.rows {
             let p = &run.ds.parts[r];
             st.good += usize::from(p.is_pass());
-            let (ids, raw) = ids_of(run, n, r);
+            let (mut ids, raw, extra) = ids_of(run, n, r);
+            let mut dropped = vec![];
+            for (i, v) in ids.iter_mut().enumerate() {
+                if v.as_ref().is_some_and(|x| ambiguous[i].contains(x)) {
+                    dropped.push((i, v.take().unwrap_or_default()));
+                }
+            }
+            st.ambiguous += usize::from(!dropped.is_empty());
+            for (i, v) in &dropped {
+                conflicts.push(Conflict {
+                    kind: "shared",
+                    by: titles[*i].clone(),
+                    value: shown(run.keys[*i].as_ref(), v),
+                    field: titles[*i].clone(),
+                    mine: String::new(),
+                    theirs: String::new(),
+                    at: (k, r),
+                    other: (k, r),
+                });
+            }
+            for (i, v) in extra.iter().enumerate() {
+                st.with[i] += usize::from(v.is_some());
+            }
             if ids.iter().all(Option::is_none) {
+                // only IDs that do not link: the part cannot be traced
                 if raw.iter().all(Option::is_none) {
                     st.no_id += 1;
                     continue;
                 }
-                // a placeholder (all zeros…) is on many different parts: the part keeps a row of
-                // its own and is never matched
-                st.placeholder += 1;
-                st.distinct += 1;
+                // a placeholder (all zeros…), or a value on several parts of this file, does not
+                // tell parts apart: the part keeps a row of its own and is never matched
+                st.placeholder += usize::from(dropped.is_empty());
+                let mut texts: Vec<Option<String>> = raw
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v.as_ref().map(|v| shown(run.keys[i].as_ref(), v)))
+                    .collect();
+                add_shown(&mut texts, run, &extra);
                 entries.push(Entry {
-                    texts: raw,
+                    texts,
                     vals: vec![None; n],
                     hits: vec![(k as u32, r as u32)],
                     flagged: audit.flagged.contains(&(k as u32, r as u32)),
+                    conflict: !dropped.is_empty(),
                     ..Default::default()
                 });
                 continue;
@@ -327,7 +453,7 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
             }
             st.rounded += usize::from(big.iter().any(|&t| run.ds.value(t, r).abs() > MAX_EXACT));
             // every part an ID of this test points at, in the order they were found
-            let mut cands: Vec<usize> = vec![];
+            let mut found: HashSet<usize> = HashSet::new();
             for (i, v) in ids.iter().enumerate() {
                 for &c in v
                     .as_ref()
@@ -335,12 +461,10 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
                     .into_iter()
                     .flatten()
                 {
-                    let c = root(&entries, c);
-                    if !cands.contains(&c) {
-                        cands.push(c);
-                    }
+                    found.insert(root(&entries, c));
                 }
             }
+            let mut cands: Vec<usize> = found.into_iter().collect();
             cands.sort_unstable();
             // a part an ID points at is this part unless a more trusted ID says otherwise
             let differs = |e: &[Entry], c: usize, j: usize| matches!((&ids[j], &e[c].vals[j]), (Some(a), Some(b)) if a != b);
@@ -393,7 +517,19 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
                         e.hits.extend(other);
                         e.hits.sort_unstable();
                         for i in 0..n {
-                            if e.vals[i].is_none() {
+                            if !run.links_at(i) {
+                                // shown only: both parts' values
+                                for v in texts[i].iter().flat_map(|t| t.split(" / ")) {
+                                    match &mut e.texts[i] {
+                                        Some(t) if t.split(" / ").any(|x| x == v) => {}
+                                        Some(t) => {
+                                            t.push_str(" / ");
+                                            t.push_str(v);
+                                        }
+                                        t => *t = Some(v.to_string()),
+                                    }
+                                }
+                            } else if e.vals[i].is_none() {
                                 e.vals[i] = vals[i].clone();
                                 e.texts[i] = texts[i].clone();
                             }
@@ -444,8 +580,14 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
                             by: titles[by].clone(),
                             value: entries[c].texts[by].clone().unwrap_or_default(),
                             field: titles[field].clone(),
-                            mine: ids[field].clone().unwrap_or_default(),
-                            theirs: entries[c].vals[field].clone().unwrap_or_default(),
+                            mine: shown(
+                                run.keys[field].as_ref(),
+                                &ids[field].clone().unwrap_or_default(),
+                            ),
+                            theirs: shown(
+                                run.keys[field].as_ref(),
+                                &entries[c].vals[field].clone().unwrap_or_default(),
+                            ),
                             at: (k, r),
                             other: (at.0 as usize, at.1 as usize),
                         });
@@ -461,37 +603,54 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
                     e.vals[i] = Some(v.clone());
                     e.texts[i] = Some(match run.keys[i] {
                         Some(KeySpec::PartTxt) => p.part_txt.trim().to_string(),
-                        _ => v.clone(),
+                        _ => shown(run.keys[i].as_ref(), v),
                     });
                     index[i].entry(v.clone()).or_default().push(target);
                 }
             }
+            add_shown(&mut e.texts, run, &extra);
+            e.conflict |= !dropped.is_empty();
             e.flagged |= audit.flagged.contains(&(k as u32, r as u32));
-            match e.hits.last() {
-                Some(&(last, earlier)) if last == k as u32 => {
-                    st.repeats += 1;
-                    if run.last_only {
-                        st.left_out += 1;
-                        st.parts -= 1;
-                        st.good -= usize::from(run.ds.parts[earlier as usize].is_pass());
-                        e.hits.pop();
-                    }
-                }
-                Some(_) => {
-                    st.distinct += 1;
-                    st.in_earlier += 1;
-                }
-                None => st.distinct += 1,
-            }
             e.hits.push((k as u32, r as u32));
         }
         stats.push(st);
     }
-    for e in entries.iter().filter(|e| e.into.is_none()) {
-        let files: HashSet<u32> = e.hits.iter().map(|h| h.0).collect();
-        if files.len() > 1 {
-            for f in files {
-                stats[f as usize].shared += 1;
+    // what each file adds, from the parts as they ended up (parts found by different IDs may have
+    // merged after their tests were read): different parts, tests beyond a part's first in a file,
+    // parts seen in an earlier file, and each part's last test only where the file asks for it
+    for i in 0..entries.len() {
+        if entries[i].into.is_some() {
+            continue;
+        }
+        let mut count: Vec<usize> = vec![0; runs.len()];
+        for &(k, _) in &entries[i].hits {
+            count[k as usize] += 1;
+        }
+        for (k, &c) in count.iter().enumerate().filter(|(_, c)| **c > 0) {
+            let st = &mut stats[k];
+            st.distinct += 1;
+            st.repeats += c - 1;
+            st.in_earlier += usize::from(count[..k].iter().any(|&x| x > 0));
+            let files = count.iter().filter(|&&x| x > 0).count();
+            st.shared += usize::from(files > 1);
+            if runs[k].last_only && c > 1 {
+                // the earlier tests of the part in this file go; the hits are in test order
+                let ds = runs[k].ds;
+                let mut seen = 0;
+                entries[i].hits.retain(|&(f, r)| {
+                    if f as usize != k {
+                        return true;
+                    }
+                    seen += 1;
+                    if seen < c {
+                        st.left_out += 1;
+                        st.parts -= 1;
+                        st.good -= usize::from(ds.parts[r as usize].is_pass());
+                        false
+                    } else {
+                        true
+                    }
+                });
             }
         }
     }
@@ -524,6 +683,61 @@ fn order(entries: &[Entry]) -> Vec<usize> {
         stack.extend(after[i].iter().rev());
     }
     out
+}
+
+/// The note on each part whose IDs disagree with another's, by part.
+fn conflict_notes(entries: &[Entry], conflicts: &[Conflict]) -> HashMap<usize, String> {
+    // which part each test ended up in
+    let mut part_of: HashMap<(u32, u32), usize> = HashMap::new();
+    for (i, e) in entries.iter().enumerate().filter(|(_, e)| e.into.is_none()) {
+        for &h in &e.hits {
+            part_of.insert(h, i);
+        }
+    }
+    let mut notes: HashMap<usize, String> = HashMap::new();
+    for c in conflicts {
+        let note = c.note();
+        for (k, r) in [c.at, c.other] {
+            if let Some(&i) = part_of.get(&(k as u32, r as u32)) {
+                notes.entry(i).or_insert_with(|| note.clone());
+            }
+        }
+    }
+    notes
+}
+
+/// One part of a trace, as the page shows it: its IDs, and its tests in each file (file, row) in
+/// file order, then test order.
+#[derive(Debug, Clone)]
+pub struct TracePart {
+    pub ids: Vec<Option<String>>,
+    pub hits: Vec<(u32, u32)>,
+    /// its IDs disagree with another part's: the note says how
+    pub note: Option<String>,
+}
+
+/// The parts of a trace in report order, with what each file adds and the IDs that disagree: the
+/// page draws the same trace the workbook writes.
+pub fn trace_parts(runs: &[Run]) -> (Vec<TracePart>, Vec<RunStats>, Vec<Conflict>) {
+    let parts = collect(runs, &Audit::default());
+    let notes = conflict_notes(&parts.entries, &parts.conflicts);
+    let shown = order(&parts.entries)
+        .into_iter()
+        .map(|i| {
+            let e = &parts.entries[i];
+            TracePart {
+                ids: e.texts.clone(),
+                hits: e.hits.clone(),
+                note: e.conflict.then(|| {
+                    notes
+                        .get(&i)
+                        .cloned()
+                        .unwrap_or_else(|| "IDs disagree with another row".into())
+                }),
+            }
+        })
+        .collect();
+    (shown, parts.stats, parts.conflicts)
 }
 
 /// Which files hold the same parts by any of their IDs, and the tests kept apart because their IDs
@@ -681,22 +895,7 @@ fn write_book(
     let mut rows = 0u64;
     let mut by_run: Vec<Vec<u32>> = vec![vec![]; runs.len()];
     let mut in_several = 0usize;
-    // which part each test ended up in, for the note on parts whose IDs disagree
-    let mut part_of: HashMap<(u32, u32), usize> = HashMap::new();
-    for (i, e) in entries.iter().enumerate().filter(|(_, e)| e.into.is_none()) {
-        for &h in &e.hits {
-            part_of.insert(h, i);
-        }
-    }
-    let mut notes: HashMap<usize, String> = HashMap::new();
-    for c in &conflicts {
-        let note = c.note();
-        for (k, r) in [c.at, c.other] {
-            if let Some(&i) = part_of.get(&(k as u32, r as u32)) {
-                notes.entry(i).or_insert_with(|| note.clone());
-            }
-        }
-    }
+    let notes = conflict_notes(&entries, &conflicts);
     let shown = order(&entries);
     for &n in &shown {
         let e = &entries[n];
@@ -872,10 +1071,35 @@ fn write_num(out: &mut impl Write, letter: &str, row: u64, v: u64, style: u32) -
     }
 }
 
-/// A test as the report names it.
+/// A test as the report names it (Settings, test label).
 fn test_label(ds: &Dataset, t: u32) -> String {
     let t = &ds.tests[t as usize];
-    format!("{} {}", t.num, t.name)
+    crate::labels::test(t.num, &t.name)
+}
+
+/// Wafer, X, Y (canonical W1X2Y3) in the chosen form (Settings).
+fn show_wxy(v: &str) -> String {
+    shown(
+        Some(&KeySpec::WxyTests {
+            w: 0,
+            x: 0,
+            y: 0,
+            offsets: None,
+            sub: false,
+        }),
+        v,
+    )
+}
+
+/// An ID's value as people read it: wafer, X, Y in the chosen form (Settings), others as they are.
+fn shown(k: Option<&KeySpec>, v: &str) -> String {
+    match k {
+        Some(KeySpec::WxyTests { .. }) => match crate::data::matching::components(v)[..] {
+            [w, x, y] => crate::labels::wxy(w, x, y),
+            _ => v.to_string(),
+        },
+        _ => v.to_string(),
+    }
 }
 
 /// One row: the part's `i`th test in each file that has one. The part's IDs are text, so a code
@@ -1296,9 +1520,10 @@ pub fn audit(files: &[AuditFile], tests: &IdTests) -> Audit {
                 .map(|t| f.ds.value(t, r))
                 .filter(|v| v.is_finite());
             let wt = reader.w_x_y(f.ds, r);
+            // canonical for the checks; the chosen form (Settings) only where it is shown
             let wt_text = wt.map(|v| {
                 let [w, x, y] = v.map(num_key);
-                wxy_text(&w, &x, &y)
+                crate::data::matching::wxy_text(&w, &x, &y)
             });
             let clean = |s: Option<String>| s.filter(|v| !v.is_empty() && placeholder(v).is_none());
             let ids = [clean(Some(txt)), clean(wxy.map(num_key)), clean(wt_text)];
@@ -1310,7 +1535,7 @@ pub fn audit(files: &[AuditFile], tests: &IdTests) -> Audit {
                 part_id: p.part_id.clone(),
                 part_txt: p.part_txt.trim().to_string(),
                 wxy: ids[1].clone().unwrap_or_default(),
-                w_x_y: ids[2].clone().unwrap_or_default(),
+                w_x_y: ids[2].as_deref().map(show_wxy).unwrap_or_default(),
                 hbin: p.hbin,
             };
             if ids.iter().flatten().count() >= 2 {
@@ -1325,7 +1550,7 @@ pub fn audit(files: &[AuditFile], tests: &IdTests) -> Audit {
                         id: "WXY",
                         value: a.clone(),
                         other: "W,X,Y",
-                        others: vec![b.clone()],
+                        others: vec![show_wxy(b)],
                         rows: vec![row.clone()],
                     });
                 }
@@ -1356,9 +1581,16 @@ pub fn audit(files: &[AuditFile], tests: &IdTests) -> Audit {
                 out.findings.push(Finding {
                     kind: "id_differs",
                     id: ID_NAMES[a],
-                    value: value.to_string(),
+                    value: if a == 2 {
+                        show_wxy(value)
+                    } else {
+                        value.to_string()
+                    },
                     other: ID_NAMES[b],
-                    others: others.keys().map(|s| s.to_string()).collect(),
+                    others: others
+                        .keys()
+                        .map(|s| if b == 2 { show_wxy(s) } else { s.to_string() })
+                        .collect(),
                     rows,
                 });
             }
@@ -1453,6 +1685,7 @@ mod tests {
             keys: vec![Some(KeySpec::PartTxt)],
             rows: (0..d.n_parts()).collect(),
             last_only: false,
+            links: vec![],
         }
     }
 
@@ -1464,6 +1697,7 @@ mod tests {
             keys: specs.iter().map(|k| key_for(k, d)).collect(),
             rows: (0..d.n_parts()).collect(),
             last_only: false,
+            links: vec![],
         }
     }
 
@@ -1695,6 +1929,7 @@ mod tests {
             keys: vec![Some(KeySpec::Tests(vec![0]))],
             rows: vec![0, 1],
             last_only: false,
+            links: vec![],
         }]);
         assert_eq!((f.files[0].rounded, f.files[0].repeats), (2, 1));
     }
@@ -2091,11 +2326,83 @@ mod tests {
         ]);
         let runs = [by("one", &one, &IDS), by("two", &two, &IDS)];
         let f = detect(&runs);
-        // P1 and P2 are kept apart in each file and found again by their part texts
+        // the W,X,Y is on two parts in each file, so it matches nothing there: P1 and P2 are
+        // found again by their part texts, and each test is marked
         assert_eq!(f.in_several, 2);
-        assert!(f.conflicts.iter().all(|c| c.kind == "apart"));
+        assert_eq!(f.conflicts.len(), 4);
+        assert!(f.conflicts.iter().all(|c| c.kind == "shared"));
+        assert_eq!((f.files[0].ambiguous, f.files[1].ambiguous), (2, 2));
         let d = tempfile::tempdir().unwrap();
         let s = export(&runs, &d.path().join("t.xlsx"), "").unwrap();
         assert_eq!((s.parts, s.rows), (2, 2));
+    }
+
+    #[test]
+    fn an_id_that_only_shows_never_links_or_splits_parts() {
+        let d = tempfile::tempdir().unwrap();
+        let book = d.path().join("trace.xlsx");
+        let nan = f32::NAN;
+        // the same part (W,X,Y and part text agree) with two different WXY test results, and a
+        // part that has only a WXY result
+        let one = with_ids(&[
+            ("P1", 3001002.0, 3.0, 1.0, 2.0),
+            ("", 3009009.0, nan, nan, nan),
+        ]);
+        let two = with_ids(&[
+            ("P1", 3001999.0, 3.0, 1.0, 2.0),
+            ("", 3009009.0, nan, nan, nan),
+        ]);
+        let ids = ["w_x_y:2,3,4", "part_txt", "tests:1"];
+        let mk = |name: &str, d| Run {
+            links: vec![true, true, false],
+            ..by(name, d, &ids)
+        };
+        let runs = [mk("one", &one), mk("two", &two)];
+        let f = detect(&runs);
+        assert_eq!((f.in_several, f.conflicts.len()), (1, 0));
+        // the WXY-only parts cannot be traced
+        assert_eq!((f.files[0].no_id, f.files[1].no_id), (1, 1));
+        let s = export(&runs, &book, "").unwrap();
+        assert_eq!((s.parts, s.conflicts), (1, 0));
+        let x = part(&book, "xl/worksheets/sheet1.xml");
+        assert_eq!(cell(&x, "A3").unwrap(), "W3X1Y2");
+        assert_eq!(cell(&x, "C2").unwrap(), "PTR 1");
+        assert_eq!(cell(&x, "C3").unwrap(), "3001002 / 3001999");
+    }
+
+    #[test]
+    fn parts_merged_through_another_file_count_once_and_keep_their_shown_values() {
+        let d = tempfile::tempdir().unwrap();
+        let nan = f32::NAN;
+        // file one has P1 twice: once with part text only, once with W,X,Y only; file two links
+        // them (P1 with that W,X,Y). Test 1 is shown only.
+        let one = with_ids(&[("P1", 10.0, nan, nan, nan), ("", 20.0, 3.0, 1.0, 2.0)]);
+        let two = with_ids(&[("P1", 30.0, 3.0, 1.0, 2.0)]);
+        let ids = ["w_x_y:2,3,4", "part_txt", "tests:1"];
+        let mk = |name: &str, d, last| Run {
+            links: vec![true, true, false],
+            last_only: last,
+            ..by(name, d, &ids)
+        };
+        let runs = [mk("one", &one, false), mk("two", &two, false)];
+        let f = detect(&runs);
+        assert_eq!(
+            (f.in_several, f.files[0].distinct, f.files[0].repeats),
+            (1, 1, 1)
+        );
+        let s = export(&runs, &d.path().join("t.xlsx"), "").unwrap();
+        assert_eq!((s.parts, s.rows), (1, 2));
+        let x = part(&d.path().join("t.xlsx"), "xl/worksheets/sheet1.xml");
+        let shown = cell(&x, "C3").unwrap();
+        for v in ["10", "20", "30"] {
+            assert!(shown.split(" / ").any(|s| s == v), "{shown}");
+        }
+        // keeping only the last test of file one leaves one row
+        let runs = [mk("one", &one, true), mk("two", &two, false)];
+        let s = export(&runs, &d.path().join("t.xlsx"), "").unwrap();
+        assert_eq!(
+            (s.parts, s.rows, s.runs[0].left_out, s.runs[0].parts),
+            (1, 1, 1, 1)
+        );
     }
 }

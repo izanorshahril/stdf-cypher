@@ -348,6 +348,7 @@ pub fn find_parts(
     q: &str,
     modes: &[&str],
     custom: Option<CustomXy>,
+    wxy_test: Option<usize>,
     limit: usize,
 ) -> Vec<usize> {
     let q = q.trim();
@@ -356,6 +357,11 @@ pub fn find_parts(
     }
     let ql = q.to_lowercase();
     let xy = parse_xy(q);
+    // wafer, X, Y from tests as the labels write them (Settings), e.g. 1-118-126 or 1118126
+    let wxy_q = crate::labels::parse_wxy(q)
+        .and_then(|[w, x, y]| Some((Some(w), x.parse::<i16>().ok()?, y.parse::<i16>().ok()?)));
+    // the WXY test's value, typed as a number
+    let code = q.parse::<f64>().ok().filter(|v| v.is_finite());
     let on = |m: &str| modes.contains(&m);
     let only_id = modes == ["part_id"];
     // "W01" finds wafer "DEMO-W01", and wafer 1 read from a test
@@ -379,14 +385,17 @@ pub fn find_parts(
             xy.as_ref()
                 .is_some_and(|(w, x, y)| p.x == *x && p.y == *y && wafer_ok(w, ds.wafer_name(p)))
         };
-        let at_tests = || match (&xy, custom) {
+        let at_tests = || match (wxy_q.as_ref().or(xy.as_ref()), custom) {
             (Some((w, x, y)), Some(f)) => f(r)
                 .iter()
                 .any(|(cw, cx, cy)| cx == x && cy == y && wafer_ok(w, cw)),
             _ => false,
         };
+        let at_wxy =
+            || matches!((wxy_test, code), (Some(t), Some(c)) if ds.value(t, r) as f32 == c as f32);
         let hit = (on("part_id") && id())
             || (on("part_txt") && txt())
+            || (on("wxy") && at_wxy())
             || (on("xy") && at())
             || (on("test_xy") && at_tests());
         if hit {

@@ -194,6 +194,11 @@ impl KeySpec {
     /// A value typed by a user in this key's canonical form: 12|-2|25, 12,-2,25 or w12x-2y25 for
     /// wafer, X and Y read as W12X-2Y25.
     pub fn norm_input(&self, s: &str) -> String {
+        if matches!(self, KeySpec::WxyTests { .. } | KeySpec::WaferXy) {
+            if let Some([w, x, y]) = crate::labels::parse_wxy(s) {
+                return wxy_text(&w, &x, &y);
+            }
+        }
         match self {
             KeySpec::PartId | KeySpec::PartTxt => norm(s),
             _ => {

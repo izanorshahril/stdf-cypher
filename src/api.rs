@@ -483,7 +483,7 @@ fn part_json(ds: &Dataset, i: usize) -> Value {
     json!({"index": i, "part_id": p.part_id, "part_txt": p.part_txt, "file": p.file, "wafer": ds.wafer_name(p), "head": p.head, "site": p.site,
         "x": if p.x == -32768 { Value::Null } else { json!(p.x) }, "y": if p.y == -32768 { Value::Null } else { json!(p.y) },
         "hbin": p.hbin, "sbin": p.sbin, "pass": p.passed, "alarm": !p.alarms.is_empty(), "num_test": p.num_test, "test_t": p.test_t,
-        "first_fail": p.first_fail.map(|f| ds.tests[f as usize].key.clone()).unwrap_or_default()})
+        "first_fail": p.first_fail.map(|f| { let t = &ds.tests[f as usize]; crate::labels::test(t.num, &t.name) }).unwrap_or_default()})
 }
 
 /// One raw STDF record as JSON, without the serde tag.
@@ -1274,6 +1274,8 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         "part_trace_detect" => part_trace_detect_op(reg, &pp),
         "part_trace_audit" => part_trace_audit_op(reg, &pp),
         "part_trace_export" => part_trace_export_op(reg, &pp),
+        "part_trace_view" => part_trace_view_op(reg, &pp),
+        "featured_test" => featured_test_op(reg, &pp),
         "endurance_check" => endurance_op(reg, &pp, false),
         "endurance_export" => endurance_op(reg, &pp, true),
         "endurance_trim_save" => endurance_trim_save_op(reg, &pp),
@@ -1312,11 +1314,16 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             };
             let custom_ref: Option<crate::datalog::CustomXy> =
                 if txy.is_some() { Some(&custom) } else { None };
+            // the WXY test (one test holding the wafer, X, Y code), when the search uses it
+            let wq = pp.str("wxy_test");
+            let wxy_test = (modes.contains(&"wxy") && !wq.trim().is_empty())
+                .then(|| test_ref(&ds, wq.trim()).ok())
+                .flatten();
             let mut rows = vec![];
             // one query per line (a pasted list); every hit of each
             let mut missing = vec![];
             for q in pp.str("q").lines().map(str::trim).filter(|q| !q.is_empty()) {
-                let hits = crate::datalog::find_parts(&ds, q, &modes, custom_ref, limit);
+                let hits = crate::datalog::find_parts(&ds, q, &modes, custom_ref, wxy_test, limit);
                 if hits.is_empty() {
                     missing.push(q.to_string());
                 }
@@ -1327,10 +1334,17 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             Ok(json!({
                 "rows": rows.iter().take(limit).map(|&i| {
                     let mut v = part_json(&ds, i);
+                    if let Some(t) = wxy_test {
+                        let x = ds.value(t, i);
+                        if x.is_finite() {
+                            v["wxy"] = json!(data::matching::num_key(x));
+                        }
+                    }
                     if let Some(t) = txy.as_ref() {
                         let w = t.wafer(&ds, i).unwrap_or_default();
                         if let Some((x, y)) = t.raw_xy(&ds, i) {
-                            v["test_xy"] = json!({"wafer": w, "raw": [x, y]});
+                            v["test_xy"] = json!({"wafer": w, "raw": [x, y],
+                                "label": crate::labels::wxy(&w, &x.to_string(), &y.to_string())});
                         }
                     }
                     v
@@ -1403,6 +1417,13 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
         }
         "commonality" => commonality_op(reg, &pp),
         "case_save" | "case_load" | "case_list" => case_op(&pp, op),
+        // how wafer, X, Y and a test are written everywhere (Settings)
+        "label_formats" => {
+            if pp.0.get("wxy").is_some() || pp.0.get("test").is_some() {
+                crate::labels::set_formats(&pp.str("wxy"), &pp.str("test"))?;
+            }
+            Ok(json!({"wxy": crate::labels::wxy_format(), "test": crate::labels::test_format()}))
+        }
         "loadboard" => {
             if let Some(t) = pp.opt_usize("test") {
                 data::set_loadboard_test(t as u32);
@@ -4375,10 +4396,20 @@ fn part_trace_keys(pp: &P) -> Vec<String> {
     }
 }
 
+/// Per ID of `keys`: whether it links parts across files (`links`, true where missing); the others
+/// are only shown in their column.
+fn part_trace_links(pp: &P) -> Vec<bool> {
+    pp.0.get("links")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().map(|b| b.as_bool().unwrap_or(true)).collect())
+        .unwrap_or_default()
+}
+
 /// Which open files hold the same parts, by any of the IDs `keys`, and where the IDs disagree.
 fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
     use crate::parttrace::{detect, key_for, Run};
     let specs = part_trace_keys(pp);
+    let links = part_trace_links(pp);
     let filter = pp.str("filter");
     let open: Vec<(usize, String, Arc<Dataset>)> = {
         let v = reg.items.read().unwrap();
@@ -4399,6 +4430,7 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
                 keys: specs.iter().map(|k| key_for(k, ds)).collect(),
                 rows: reg.rows(*id, ds, &filter)?,
                 last_only: false,
+                links: links.clone(),
             })
         })
         .collect::<Result<_>>()?;
@@ -4427,6 +4459,7 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
         "by_id": d.by_id,
         "conflicts": d.conflicts.len(),
         "joined": d.conflicts.iter().filter(|c| c.kind == "joined").count(),
+        "shared": d.conflicts.iter().filter(|c| c.kind == "shared").count(),
         "first_conflicts": conflicts,
     }))
 }
@@ -4489,6 +4522,192 @@ fn part_trace_audit_op(reg: &Registry, pp: &P) -> Result<Value> {
     }))
 }
 
+/// The trace the page draws: the same parts as the workbook, each with its test in every file (the
+/// last when a file tests it more than once): bin, site, pass, first and last failing test, and the
+/// value of the traced test when one is given.
+fn part_trace_view_op(reg: &Registry, pp: &P) -> Result<Value> {
+    use crate::parttrace::{key_for, trace_parts, Run};
+    let empty = vec![];
+    let list =
+        pp.0.get("runs")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&empty);
+    let picked: Vec<(usize, String, bool)> = list
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            let last = r
+                .get("last_only")
+                .and_then(|l| l.as_bool())
+                .unwrap_or(false);
+            Some((r.get("ds")?.as_u64()? as usize, name.to_string(), last))
+        })
+        .collect();
+    let specs = part_trace_keys(pp);
+    let links = part_trace_links(pp);
+    let filter = pp.str("filter");
+    let dss: Vec<Arc<Dataset>> = picked
+        .iter()
+        .map(|(id, _, _)| reg.get(*id).map(|d| d.0))
+        .collect::<Result<_>>()?;
+    let runs: Vec<Run> = picked
+        .iter()
+        .zip(&dss)
+        .map(|((id, name, last_only), ds)| {
+            Ok(Run {
+                name: if name.is_empty() {
+                    reg.name(*id)
+                } else {
+                    name.clone()
+                },
+                ds,
+                keys: specs.iter().map(|k| key_for(k, ds)).collect(),
+                rows: reg.rows(*id, ds, &filter)?,
+                last_only: *last_only,
+                links: links.clone(),
+            })
+        })
+        .collect::<Result<_>>()?;
+    let titles = crate::parttrace::id_titles(&runs);
+    let (parts, stats, conflicts) = trace_parts(&runs);
+    // the traced test in each file, by number or name
+    let q = pp.str("test");
+    let q = q.split(':').next().unwrap_or("").trim().to_string();
+    let traced: Vec<Option<usize>> = dss
+        .iter()
+        .map(|ds| (!q.is_empty()).then(|| test_ref(ds, &q).ok()).flatten())
+        .collect();
+    let test_info = traced
+        .iter()
+        .zip(&dss)
+        .find_map(|(t, ds)| t.map(|t| (ds.tests[t].key.clone(), ds.tests[t].units.clone())));
+    let label = |ds: &Dataset, t: u32| {
+        let t = &ds.tests[t as usize];
+        crate::labels::test(t.num, &t.name)
+    };
+    let mut by_run: Vec<Vec<u32>> = vec![vec![]; runs.len()];
+    let rows: Vec<Value> = parts
+        .iter()
+        .map(|p| {
+            by_run.iter_mut().for_each(Vec::clear);
+            for &(k, r) in &p.hits {
+                by_run[k as usize].push(r);
+            }
+            let cells: Vec<Value> = by_run
+                .iter()
+                .enumerate()
+                .map(|(k, hits)| {
+                    let Some(&r) = hits.last() else {
+                        return Value::Null;
+                    };
+                    let ds = &runs[k].ds;
+                    let q = &ds.parts[r as usize];
+                    let value = traced[k]
+                        .map(|t| ds.value(t, r as usize))
+                        .filter(|v| v.is_finite());
+                    json!({
+                        "row": r, "part_id": q.part_id, "hbin": q.hbin, "site": q.site,
+                        "pass": if q.partial { Value::Null } else { json!(q.is_pass()) },
+                        "first": q.fails.first().map(|&t| label(ds, t)),
+                        "last": q.fails.last().map(|&t| label(ds, t)),
+                        "value": value, "n": hits.len(),
+                    })
+                })
+                .collect();
+            json!({"ids": p.ids, "note": p.note, "runs": cells})
+        })
+        .collect();
+    Ok(json!({
+        "titles": titles,
+        "runs": runs.iter().zip(&picked).map(|(r, (id, _, _))| json!({"id": id, "name": r.name})).collect::<Vec<_>>(),
+        "stats": stats,
+        "conflicts": conflicts.len(),
+        "test": test_info.map(|(k, u)| json!({"key": k, "units": u})),
+        "parts": rows,
+    }))
+}
+
+/// The test to show first: the one most parts fail. Files of one lot: the latest file by test start
+/// time (its parts are the latest state of the lot). Files of several lots: the highest fail rate in
+/// any of them. `ds` lists the datasets (default: every open one); a combined dataset counts each of
+/// its files. Tests in `exclude` (the identity tests) are left out.
+fn featured_test_op(reg: &Registry, pp: &P) -> Result<Value> {
+    let mut ids = id_list(pp.0.get("ds"));
+    if ids.is_empty() {
+        ids = reg.open_paths().into_iter().map(|(i, _)| i).collect();
+        ids.dedup();
+    }
+    let skip: std::collections::HashSet<u32> = parse_nums(&pp.str("exclude"))
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    // each file of each dataset: (dataset, its rows, lot, start time, name)
+    struct Unit {
+        ds: Arc<Dataset>,
+        rows: Vec<usize>,
+        lot: String,
+        start: u32,
+        name: String,
+    }
+    let mut units: Vec<Unit> = vec![];
+    for id in ids {
+        let Ok((ds, _)) = reg.get(id) else { continue };
+        let mut by_file: std::collections::BTreeMap<u16, Vec<usize>> = Default::default();
+        for (r, p) in ds.parts.iter().enumerate() {
+            by_file.entry(p.file).or_default().push(r);
+        }
+        for (f, rows) in by_file {
+            let src = ds.sources.get(f as usize).cloned().unwrap_or_default();
+            units.push(Unit {
+                ds: ds.clone(),
+                rows,
+                lot: src.lot_id.trim().to_string(),
+                start: src.start_t,
+                name: data::short_name(&src.path),
+            });
+        }
+    }
+    if units.is_empty() {
+        return Ok(json!({"key": null}));
+    }
+    // one lot only when every file names it: files without a lot ID may be of different lots
+    let one_lot = !units[0].lot.is_empty() && units.iter().all(|u| u.lot == units[0].lot);
+    if one_lot {
+        let latest = units.iter().map(|u| u.start).max().unwrap_or(0);
+        units.retain(|u| u.start == latest);
+    }
+    let mut best: Option<(f64, usize, usize, usize)> = None; // rate, fails, unit, test
+    for (k, u) in units.iter().enumerate() {
+        let mut count: std::collections::HashMap<u32, usize> = Default::default();
+        for &r in &u.rows {
+            for &t in &u.ds.parts[r].fails {
+                *count.entry(t).or_default() += 1;
+            }
+        }
+        for (t, c) in count {
+            if skip.contains(&u.ds.tests[t as usize].num) {
+                continue;
+            }
+            let rate = c as f64 / u.rows.len().max(1) as f64;
+            let better = best.is_none_or(|(br, bc, _, bt)| {
+                rate > br || (rate == br && (c > bc || (c == bc && (t as usize) < bt)))
+            });
+            if better {
+                best = Some((rate, c, k, t as usize));
+            }
+        }
+    }
+    Ok(match best {
+        Some((rate, fails, k, t)) => {
+            let u = &units[k];
+            let ti = &u.ds.tests[t];
+            json!({"key": ti.key, "num": ti.num, "name": ti.name, "fails": fails, "parts": u.rows.len(),
+                "rate": rate, "file": u.name, "lot": u.lot, "one_lot": one_lot})
+        }
+        None => json!({"key": null}),
+    })
+}
+
 /// Writes the part trace workbook: `runs` is [{ds, name}] in the order of the report.
 fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
     use crate::parttrace::{audit, export_audited, key_for, AuditFile, Audit, Run};
@@ -4515,6 +4734,7 @@ fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
         .map(|(id, _, _)| reg.get(*id).map(|d| d.0))
         .collect::<Result<_>>()?;
     let specs = part_trace_keys(pp);
+    let links = part_trace_links(pp);
     if specs.is_empty() {
         bail!("tick at least one ID to identify parts by");
     }
@@ -4533,6 +4753,7 @@ fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
                 keys: specs.iter().map(|k| key_for(k, ds)).collect(),
                 rows: reg.rows(*id, ds, &filter)?,
                 last_only: *last_only,
+                links: links.clone(),
             })
         })
         .collect::<Result<_>>()?;

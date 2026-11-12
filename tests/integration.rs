@@ -2204,3 +2204,49 @@ fn merging_keeps_the_fixed_limits_of_a_file_beside_one_with_per_part_limits() {
     // the rows of the fixed file keep its limit; they are not blank
     assert!(pl.lo[..n_fixed].iter().all(|v| *v == lo));
 }
+
+#[test]
+fn trace_view_and_the_most_failed_test() {
+    isolate();
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("synthetic_samples/tc_profile/demo");
+    let reg = api::Registry::app();
+    let files = ["synthetic_demo_lotA.stdf", "synthetic_demo_lotA_retest_bins2_3.stdf", "synthetic_demo_lotB_shifted.stdf"];
+    let paths: Vec<String> = files.iter().map(|f| dir.join(f).to_string_lossy().to_string()).collect();
+    api::run(&reg, "load", &json!({"paths": paths, "sort": "none"})).unwrap();
+    // one lot (lot A and its retest): the latest file's most failed test
+    let one = api::run(&reg, "featured_test", &json!({"ds": [0, 1]})).unwrap();
+    let a = load(&dir.join(files[0]));
+    let r = load(&dir.join(files[1]));
+    let latest = if r.sources[0].start_t >= a.sources[0].start_t { &r } else { &a };
+    let most = |d: &Dataset| {
+        let mut c = std::collections::HashMap::<u32, usize>::new();
+        for p in &d.parts {
+            for &t in &p.fails {
+                *c.entry(t).or_default() += 1;
+            }
+        }
+        let n = c.values().copied().max().unwrap();
+        c.into_iter().filter(|x| x.1 == n).map(|x| x.0).min().unwrap()
+    };
+    assert_eq!(one["key"], json!(latest.tests[most(latest) as usize].key));
+    assert_eq!(one["one_lot"], json!(true));
+    // two lots: the highest fail rate of any file
+    let two = api::run(&reg, "featured_test", &json!({"ds": [0, 2]})).unwrap();
+    assert_eq!(two["one_lot"], json!(false));
+    assert!(two["rate"].as_f64().unwrap() > 0.0);
+    // the page's trace: lot A and its retest, by part text
+    let v = api::run(
+        &reg,
+        "part_trace_view",
+        &json!({"runs": [{"ds": 0, "name": "R1"}, {"ds": 1, "name": "R2"}], "keys": ["part_txt"], "test": one["key"]}),
+    )
+    .unwrap();
+    let parts = v["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), a.n_parts());
+    let both: Vec<_> = parts.iter().filter(|p| !p["runs"][0].is_null() && !p["runs"][1].is_null()).collect();
+    assert_eq!(both.len(), r.n_parts());
+    // a part failing in R1 names its first and last failing test, and the followed test's value
+    let failed = both.iter().find(|p| p["runs"][0]["pass"] == json!(false)).unwrap();
+    assert!(failed["runs"][0]["first"].as_str().unwrap().contains(' '));
+    assert!(v["test"]["key"].is_string());
+}

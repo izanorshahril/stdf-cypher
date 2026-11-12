@@ -85,12 +85,16 @@ enum Cmd {
         /// the workbook to write (.xlsx)
         #[arg(short, long)]
         out: PathBuf,
-        /// an ID parts are found by, repeated for several: part_txt, tests:80149 (one test),
-        /// w_x_y:80100,80101,80102 (wafer, X, Y), tests:501,502 (any combination), part_id,
-        /// wafer_xy or xy. Tests sharing any ID are the same part; tests whose IDs disagree are
-        /// kept apart. Default: part text, --wxy-test and --wxy-tests (with --offset-tests)
+        /// an ID that links parts across files, repeated for several: w_x_y:80100,80101,80102
+        /// (wafer, X, Y), part_txt, tests:501,502 (any combination)… Tests sharing any of them are
+        /// the same part; when they disagree, wafer, X, Y decides over part text. Default: wafer, X,
+        /// Y from --wxy-tests (with --offset-tests), then part text
         #[arg(long)]
         key: Vec<String>,
+        /// an ID shown in its own column but never used to link parts, repeated for several:
+        /// tests:80149 (a single WXY test, which can be wrong), xy, part_id…
+        #[arg(long)]
+        show: Vec<String>,
         /// a name for each file's columns, e.g. "V93K first,V93K retest" (default: file names)
         #[arg(long, value_delimiter = ',')]
         names: Vec<String>,
@@ -110,6 +114,13 @@ enum Cmd {
         /// die X and Y are the tests with the offsets taken off rather than added
         #[arg(long)]
         subtract_offsets: bool,
+        /// how wafer, X, Y are written: W{w}X{x}Y{y} (default), W{w}_X{x}_Y{y}, {w}-{x}-{y},
+        /// {w}{x3}{y3} (X and Y zero-padded: 1118126)…
+        #[arg(long, default_value = "")]
+        wxy_format: String,
+        /// how a test is written: "{num} {name}" (default), T#{num}_{name}, {num}::{name}…
+        #[arg(long, default_value = "")]
+        test_format: String,
         #[command(flatten)]
         l: LoadArgs,
     },
@@ -815,15 +826,19 @@ fn run() -> Result<()> {
             files,
             out,
             key,
+            show,
             names,
             last_only,
             wxy_test,
             wxy_tests,
             offset_tests,
             subtract_offsets,
+            wxy_format,
+            test_format,
             l,
         } => {
             use stdf_cypher::parttrace::{self, Run};
+            stdf_cypher::labels::set_formats(&wxy_format, &test_format)?;
             if files.is_empty() {
                 bail!("no input files");
             }
@@ -842,15 +857,17 @@ fn run() -> Result<()> {
             }
             let wt = [wxy_tests.clone(), offset_tests.clone()].concat().join(",");
             let sub = if subtract_offsets { "_sub" } else { "" };
-            let specs: Vec<String> = if key.is_empty() {
-                vec![
-                    "part_txt".into(),
-                    format!("tests:{wxy_test}"),
-                    format!("w_x_y{sub}:{wt}"),
-                ]
+            let linking: Vec<String> = if key.is_empty() {
+                vec![format!("w_x_y{sub}:{wt}"), "part_txt".into()]
             } else {
                 key
             };
+            let links: Vec<bool> = linking
+                .iter()
+                .map(|_| true)
+                .chain(show.iter().map(|_| false))
+                .collect();
+            let specs: Vec<String> = linking.into_iter().chain(show).collect();
             let dss: Vec<Dataset> = files
                 .iter()
                 .map(|f| load(std::slice::from_ref(f), &l))
@@ -876,6 +893,7 @@ fn run() -> Result<()> {
                     keys,
                     rows: rows(ds, &l.filter)?,
                     last_only: last[i],
+                    links: links.clone(),
                 });
             }
             for k in parttrace::drop_unused_ids(&mut runs, &specs) {
@@ -919,7 +937,13 @@ fn run() -> Result<()> {
                 );
             }
             // the audit compares only the IDs the trace uses
-            let uses = |k: &str| specs.iter().any(|s| s.eq_ignore_ascii_case(k));
+            // the audit compares only the IDs that link parts
+            let uses = |k: &str| {
+                specs
+                    .iter()
+                    .zip(&links)
+                    .any(|(s, &l)| l && s.eq_ignore_ascii_case(k))
+            };
             let tests = parttrace::IdTests {
                 wxy: if uses(&format!("tests:{wxy_test}")) {
                     wxy_test

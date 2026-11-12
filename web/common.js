@@ -124,9 +124,22 @@ const SC = (() => {
     if (typeof v !== "number") return String(v);
     const a = Math.abs(v);
     if (d !== undefined) return v.toFixed(d);
-    if (a !== 0 && (a >= 1e6 || a < 1e-3)) return v.toExponential(3);
-    if (Number.isInteger(v)) return String(v);
-    return String(+v.toPrecision(5));
+    // never in scientific notation: a result can be a code or flag (24111146 is wafer 24, X 111,
+    // Y 146), and 2.411e+7 hides its digits. Whole numbers are written in full.
+    if (Number.isInteger(v)) return a < 1e21 ? String(v) : BigInt(v).toString();
+    if (a >= 1e5) return String(+v.toFixed(2));
+    return plainDigits(+v.toPrecision(5));
+  }
+  /** A number written out in full: JavaScript writes 1.2345e-25 and 1e21 with an exponent. */
+  function plainDigits(v) {
+    const s = String(v);
+    const m = /^(-?)(\d+)(?:\.(\d+))?e([+-]\d+)$/.exec(s);
+    if (!m) return s;
+    const [, sign, int, frac = "", e] = m;
+    const digits = int + frac, exp = +e, point = int.length + exp;
+    if (point <= 0) return `${sign}0.${"0".repeat(-point)}${digits}`.replace(/0+$/, "");
+    if (point >= digits.length) return sign + digits + "0".repeat(point - digits.length);
+    return `${sign}${digits.slice(0, point)}.${digits.slice(point)}`;
   }
   const fmtP = (p) => (p === null || p === undefined ? "–" : p < 1e-4 ? p.toExponential(1) : p.toFixed(4));
   const pct = (v, d = 2) => (v === null || v === undefined ? "–" : v.toFixed(d) + "%");

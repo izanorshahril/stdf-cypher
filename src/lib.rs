@@ -12,6 +12,7 @@ pub mod api;
 pub mod data;
 pub mod datalog;
 pub mod desktop;
+pub mod labels;
 pub mod merge;
 pub mod ml;
 pub mod parttrace;
