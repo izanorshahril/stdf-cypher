@@ -336,7 +336,8 @@ pub fn build(ds: &Dataset, rows: &[usize], marks: &[String], cols: &[Col], forma
 
 /// Die position from tests (wafer label, X, Y) for a row, when the file
 /// logs it as results (see the Settings page).
-pub type CustomXy<'a> = &'a dyn Fn(usize) -> Option<(String, i16, i16)>;
+/// A part's (wafer, X, Y) from tests: as logged, and as die X/Y when offsets are set.
+pub type CustomXy<'a> = &'a dyn Fn(usize) -> Vec<(String, i16, i16)>;
 
 /// Rows of `ds` matching a search in any of `modes`: `part_id` (exact, or
 /// contained when it is the only mode), `part_txt` (contained), `xy` (PRR
@@ -379,9 +380,9 @@ pub fn find_parts(
                 .is_some_and(|(w, x, y)| p.x == *x && p.y == *y && wafer_ok(w, ds.wafer_name(p)))
         };
         let at_tests = || match (&xy, custom) {
-            (Some((w, x, y)), Some(f)) => {
-                f(r).is_some_and(|(cw, cx, cy)| cx == *x && cy == *y && wafer_ok(w, &cw))
-            }
+            (Some((w, x, y)), Some(f)) => f(r)
+                .iter()
+                .any(|(cw, cx, cy)| cx == x && cy == y && wafer_ok(w, cw)),
             _ => false,
         };
         let hit = (on("part_id") && id())

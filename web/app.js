@@ -83,10 +83,10 @@ function traceValues(ids) {
 const main = document.getElementById("main");
 const GROUPS = [["", "none"], ["pass", "good / bad"], ["alarm", "alarm"], ["site", "test site"], ["head", "head"], ["hbin", "hard bin"], ["sbin", "soft bin"], ["wafer", "wafer"], ["file", "file / lot"], ["loadboard", "loadboard"], ["site_loadboard", "site × loadboard"]];
 /** Loadboard test number input (a session setting: the `loadboard` field reads this test's most common value per file). */
+/** The loadboard test the page uses: one shared setting, changed in Settings only. */
 function loadboardField() {
-  const i = h("input", { type: "text", value: S.lbTest || "5100", style: { width: "80px" }, title: "Test number holding the loadboard (DIB) ID. Read per file (its most common value), so parts missing it still get the file's board. Usable as the field `loadboard` in filters, color-by, ANOVA and commonality, and `site_loadboard` for site × board.",
-    onchange: async (e) => { const v = e.target.value.trim(); try { const r = await api("loadboard", { test: v }); S.lbTest = String(r.test); saveCfg(); S.testsCache = {}; toast(`Loadboard = test ${r.test}`, "good"); } catch (err) { toast(err.message, "bad"); } } });
-  return field("Loadboard test", i);
+  return field("Loadboard test", h("div", { class: "row tight" }, h("span", { class: "small", title: "Test number holding the loadboard (DIB) ID, read per file (its most common value). The field `loadboard` in filters, color-by and ANOVA." }, `test ${S.lbTest || "5100"}`),
+    h("button", { class: "ghost small", title: "One setting for every page", onclick: () => go("settings") }, "Change in Settings…")));
 }
 
 async function api(op, params) {
@@ -94,6 +94,21 @@ async function api(op, params) {
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || "request failed");
   return j.data;
+}
+/** Keeps what is typed or picked in `el` under `key` for this session, so switching tabs or pages
+ *  does not lose it; restores it when the field is made again. Returns `el`. */
+function draft(key, el) {
+  const d = (S.drafts ||= {});
+  const get = () => (el.type === "checkbox" ? el.checked : el.value);
+  if (d[key] !== undefined) { if (el.type === "checkbox") el.checked = d[key]; else el.value = d[key]; }
+  for (const ev of ["input", "change"]) el.addEventListener(ev, () => (d[key] = get()));
+  return el;
+}
+/** Which parts an action uses: the part filter and the population at the top, or the whole file. */
+function scopeLine(what, whole) {
+  const f = scoped(S.filter);
+  return h("div", { class: "row tight small scope-line" }, badge(whole ? "whole file" : f ? "filtered" : "all parts", whole ? "neutral" : f ? "warn" : "neutral"),
+    whole ? `${what}: every part of the file; the part filter and population at the top do not apply here.` : f ? `${what} only the parts matching ${f} (the part filter and population at the top).` : `${what} every part (no part filter, all parts).`);
 }
 /** A filter limited to the chosen population (all parts or good parts only). */
 const scoped = (f) => (S.scope === "good" ? (f && f.trim() ? `(${f}) and pass` : "pass") : f || "");
@@ -342,7 +357,7 @@ const VIEWS = {
 // pages that became a tab of another page: [page, tab]
 const VIEW_TABS = {
   parttrace: ["trace", "parttrace"], retest: ["trace", "retest"], findpart: ["trace", "find"],
-  parts: ["records", "parts"], datalog: ["records", "datalog"], raw: ["records", "raw"],
+  parts: ["records", "raw"], datalog: ["records", "datalog"], raw: ["records", "raw"],
   trim: ["data", "trim"], export: ["data", "export"], match: ["data", "match"],
 };
 
@@ -356,7 +371,7 @@ function renderNav() {
     const disabled = !v.always && !S.datasets.length;
     nav.append(h("button", { class: (S.view === k ? "active" : "") + (disabled ? " dim" : ""), onclick: () => go(k), title: disabled ? "Open an STDF file first" : "" }, v.label));
   }
-  nav.append(h("div", { class: "hint" }, S.datasets.length ? "The part filter and population at the top apply to every view." : "Open an STDF file to unlock the analyses."));
+  nav.append(h("div", { class: "hint" }, S.datasets.length ? "The part filter and population at the top apply to every analysis and export; raw records, the part datalog and Edit & trim work on the whole file, and say so." : "Open an STDF file to unlock the analyses."));
 }
 /** A view name, a tab name (parttrace) or page/tab (trace/retest) as [page, tab or undefined]; null when unknown. */
 function viewOf(name) {
@@ -400,7 +415,7 @@ function viewData(el) {
   tabbedPage(el, "data", "Edit, merge & export", "", [
     ["trim", "Edit & trim", viewTrim],
     ["export", "Merge, split & export", viewExport],
-    ["match", "Match & merge", viewMatch],
+    ["match", "Match parts", viewMatch],
   ]);
 }
 function otherDs(id) {
@@ -578,28 +593,27 @@ async function viewExplorer(el) {
 // ---- Wafer maps
 async function viewWafer(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
-  el.append(h("h1", {}, "Wafer maps"), h("p", { class: "lead" }, "Bin, pass/fail or test-value maps per wafer. Die coordinates come from the PRR X/Y (wafers from WIR), or are rebuilt from datalogged test results, e.g. wafer, X, Y and an X/Y offset logged in tests 80100–80104 (die X = X + X offset). If the map still looks off, try subtracting the offset or flipping an axis."));
+  el.append(h("h1", {}, "Wafer maps"), h("p", { class: "lead" }, "Bin, pass/fail or test-value maps per wafer. Die coordinates come from the PRR X/Y (wafers from WIR), or are rebuilt from datalogged test results, e.g. wafer, X, Y and an X/Y offset logged in tests 80100–80104 (die X = X + X offset). The tests and offsets are set once in Settings. If the map still looks off, try subtracting the offset or flipping an axis."));
   if (!S.wcoords) S.wcoords = ds && ds.wafers.length ? "prr" : "tests";
-  const coords = select([["prr", "PRR X/Y + WIR wafer"], ["tests", "from test results (PTR)"]], S.wcoords, (v) => { S.wcoords = v; S.wafer = "all"; renderCtl(); draw(); });
+  const coords = select([["prr", "PRR X/Y + WIR wafer"], ["tests", "die X/Y from tests"]], S.wcoords, (v) => { S.wcoords = v; S.wafer = "all"; renderCtl(); draw(); });
   const mode = select([["hbin", "hard bin"], ["sbin", "soft bin"], ["pass", "pass / fail"], ["test", "test value"]], S.wmode || "hbin", (v) => { S.wmode = v; draw(); });
   const test = testInput("wt", S.wtest || S.explorerTest || "");
   test.addEventListener("change", () => { S.wtest = test.value; if ((S.wmode || "hbin") === "test") draw(); });
-  const small = (inp) => { inp.style.minWidth = "120px"; inp.style.width = "130px"; return inp; };
+  // the tests and offsets are one shared setting (Settings), shown here; flips only turn the map
   const wc = waferCal();
-  const wt = small(testInput("wwt", wc.w, "none = one map"));
-  const xt = small(testInput("wxt", wc.x, "X test"));
-  const yt = small(testInput("wyt", wc.y, "Y test"));
-  const oxt = small(testInput("woxt", wc.ox, "none"));
-  const oyt = small(testInput("woyt", wc.oy, "none"));
-  const omode = select([["add", "X + offset"], ["sub", "X − offset"]], wc.mode, () => cal());
   const fx = h("input", { type: "checkbox", checked: wc.fx, onchange: () => cal() });
   const fy = h("input", { type: "checkbox", checked: wc.fy, onchange: () => cal() });
-  function cal() { Object.assign(wc, { w: wt.value, x: xt.value, y: yt.value, ox: oxt.value, oy: oyt.value, mode: omode.value, fx: fx.checked, fy: fy.checked }); saveCfg(); S.wafer = "all"; draw(); }
-  for (const i of [wt, xt, yt, oxt, oyt]) i.addEventListener("change", cal);
+  function cal() { Object.assign(wc, { fx: fx.checked, fy: fy.checked }); saveCfg(); S.wafer = "all"; draw(); }
+  const calText = () => {
+    const off = (t, o) => (o ? `${t} ${wc.mode === "sub" ? "−" : "+"} ${o}` : t || "–");
+    return `wafer ${wc.w || "none (one map)"} · X ${off(wc.x, wc.ox)} · Y ${off(wc.y, wc.oy)}`;
+  };
+  const calField = field("Die X/Y from tests (shared setting)", h("div", { class: "row tight" }, h("span", { class: "small" }, calText()),
+    h("button", { class: "ghost small", title: "The wafer, X, Y and offset tests are set once, in Settings, for every page", onclick: () => go("settings") }, "Change in Settings…")));
   const wafer = select([["all", "all wafers (gallery)"]], "all", (v) => { S.wafer = v; draw(); });
   const ctl = h("div", { class: "controls" });
   function renderCtl() {
-    ctl.replaceChildren(field("Coordinates", coords), ...(S.wcoords === "tests" ? [field("Wafer test", wt), field("X test", xt), field("Y test", yt), field("X offset test", oxt), field("Y offset test", oyt), field("Offset", omode), h("label", { class: "chk" }, fx, "flip X"), h("label", { class: "chk" }, fy, "flip Y")] : []), field("Color by", mode), field("Test (for test value)", test), field("Wafer", wafer));
+    ctl.replaceChildren(field("Coordinates", coords), ...(S.wcoords === "tests" ? [calField, h("label", { class: "chk", title: "Display orientation of the map" }, fx, "flip X"), h("label", { class: "chk", title: "Display orientation of the map" }, fy, "flip Y")] : []), field("Color by", mode), field("Test (for test value)", test), field("Wafer", wafer));
   }
   renderCtl();
   const out = h("div");
@@ -637,8 +651,8 @@ async function viewCompare(el) {
     const sel = h("input", { type: "text", class: "filter-input", placeholder: "group, e.g. site = 3  or  $match  or  part_id in @ids.txt", value: S.cmpSel || "", style: { minWidth: "300px" } });
     const vs = h("input", { type: "text", class: "filter-input", placeholder: "versus (blank = all other parts)", value: S.cmpVs || "" });
     const matchBy = select([["key", "number + name"], ["num", "test number"], ["name", "test name"]], S.cmpMatch || "key", (v) => (S.cmpMatch = v));
-    const later = select([["", "none"], ...dsOptions().filter(([v]) => +v !== S.ds)], S.cmpLater ?? "", (v) => { S.cmpLater = v; keys.hidden = !v; });
-    const ka = keyPicker("a"), kb = keyPicker("b");
+    const later = select([["", "none"], ...dsOptions().filter(([v]) => +v !== S.ds)], S.cmpLater ?? "", (v) => { S.cmpLater = v; keys.hidden = !v; if (v) kb.forDs(+v); });
+    const ka = keyPicker("cmp_a", S.ds), kb = keyPicker("cmp_b", S.cmpLater ? +S.cmpLater : null);
     const keys = h("div", { class: "row tight", hidden: !S.cmpLater }, ka.el, h("span", { class: "muted small" }, "↔"), kb.el);
     const run = h("button", { class: "primary", onclick: () => {
       S.cmpFA = fa.value; S.cmpFB = fb.value; S.cmpSel = sel.value; S.cmpVs = vs.value;
@@ -940,25 +954,26 @@ async function viewCorrelation(el) {
   setMode(cur);
 }
 function corrUnit(el) {
-  el.append(h("p", { class: "lead" }, "The same physical parts tested in two files (e.g. golden units on two testers, or a re-test) are matched by part ID or wafer X/Y. Each test is CORRELATED, OFFSET (good r but mean offset beyond tolerance) or UNCORRELATED."));
-  const a = select(dsOptions(), String(S.ucA ?? S.ds), (v) => (S.ucA = +v));
+  el.append(h("p", { class: "lead" }, "The same physical parts tested in two files (e.g. golden units on two testers, or a re-test) are paired by the IDs picked for each file, as on Match parts. Each test is CORRELATED, OFFSET (good r but mean offset beyond tolerance) or UNCORRELATED."));
+  const a = select(dsOptions(), String(S.ucA ?? S.ds), (v) => { S.ucA = +v; ka.forDs(S.ucA); });
   const dA = S.datasets.find((d) => d.id === (S.ucA ?? S.ds));
   const twin = S.datasets.find((d) => d.id !== dA.id && d.files === 1 && dA.wafers.length && d.wafers.some((w) => dA.wafers.includes(w)));
-  const b = select(dsOptions(), String(S.ucB ?? (twin ? twin.id : otherDs(dA.id))), (v) => (S.ucB = +v));
-  const mb = select([["auto", "auto"], ["part_id", "part ID"], ["xy", "wafer + X/Y"]], "auto");
+  const b = select(dsOptions(), String(S.ucB ?? (twin ? twin.id : otherDs(dA.id))), (v) => { S.ucB = +v; kb.forDs(S.ucB); });
+  // the same ID pickers as Match parts, so both pages pair the same units
+  const ka = keyPicker("uc_a", +a.value), kb = keyPicker("uc_b", +b.value);
   const rmin = h("input", { type: "number", step: "0.01", value: 0.9 });
   const off = h("input", { type: "number", step: "0.5", value: 5 });
   const out = h("div");
-  el.append(h("div", { class: "controls" }, field("File A", a), field("File B", b), field("Match by", mb), field("min r", rmin), field("max offset % limit", off), h("button", { class: "primary", onclick: run }, "Correlate")), out);
+  el.append(h("div", { class: "controls" }, field("File A", a), field("Identify A parts by", ka.el), field("File B", b), field("Identify B parts by", kb.el), field("min r", rmin), field("max offset % limit", off), h("button", { class: "primary", onclick: run }, "Correlate")), out);
   async function run() {
     loading(out);
-    const params = { a: +a.value, b: +b.value, match_by: mb.value, r_min: +rmin.value, offset_pct: +off.value, filter_a: scoped(""), filter_b: scoped("") };
+    const params = { a: +a.value, b: +b.value, key_a: ka.value(), key_b: kb.value(), r_min: +rmin.value, offset_pct: +off.value, filter_a: scoped(""), filter_b: scoped("") };
     try {
       const d = await api("unitcorr", params);
       const r = d.report;
       out.replaceChildren(h("div", { class: "kpis" }, kpi("Matched parts", r.matched.toLocaleString(), `by ${r.match_by}`), kpi("Only in A / B", `${r.only_a} / ${r.only_b}`), kpi("Bin agreement", pct(r.bin_agreement_pct, 1)),
         ...Object.entries(r.summary).filter(([, v]) => v > 0).map(([k, v]) => kpi(k.replace("_", " ").toLowerCase(), v))));
-      if (!r.matched) { out.append(h("div", { class: "err" }, "No parts matched. Unit correlation needs the same physical parts in both files: identical part IDs (final test) or identical wafer IDs + X/Y (wafer sort). Try another 'Match by', or pick files from the same lot.")); return; }
+      if (!r.matched) { out.append(h("div", { class: "err" }, "No parts matched. Unit correlation needs the same physical parts in both files, with the same ID in each. Pick another ID (the list shows how many parts of each file have it), or files from the same lot.")); return; }
       const [card, c] = chartBox("tall");
       out.append(card);
       if (d.first) plot(c, d.first);
@@ -1176,10 +1191,9 @@ function mlPca(el) {
 
 // ---- Records
 function viewRecords(el) {
-  tabbedPage(el, "records", "Records", "Every STDF record of the current dataset. The part table summarises each PRR with its first failing test; the part datalog writes the results of the parts and tests you pick; the record viewer shows any record type field by field, straight from the file.", [
-    ["parts", "Part table (PRR)", recParts],
+  tabbedPage(el, "records", "Records", "Every STDF record of the current dataset, by record type. PRR opens as the part table (each part with its first failing test; click one for its results), or as its raw fields. The part datalog writes the results of the parts and tests you pick.", [
+    ["raw", "Records", recRaw],
     ["datalog", "Part datalog", viewDatalog],
-    ["raw", "Record viewer (all types)", recRaw],
   ]);
 }
 
@@ -1230,7 +1244,7 @@ async function recParts(el) {
   el.append(h("div", { class: "controls" },
     h("button", { onclick: () => { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(scoped(S.filter))}&t=${encodeURIComponent(window.STDF_TOKEN)}`; } }, "Download CSV (all tests)"),
     h("button", { onclick: () => go("trim") }, "Edit & trim…"),
-    h("button", { onclick: () => go("export") }, "Split, extract or save report…")));
+    h("button", { onclick: () => go("export") }, "Split, extract or save report…")), scopeLine("The part table and its CSV list"));
   const out = h("div");
   el.append(out);
   loading(out);
@@ -1252,7 +1266,7 @@ async function recParts(el) {
 const TEST_RECS = ["PTR", "MPR", "FTR", "TSR"];
 function recRaw(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
-  if (!S.rec || S.rec.ds !== S.ds) S.rec = { ds: S.ds, file: 0, type: "PRR", test: "", offset: 0, limit: 200 };
+  if (!S.rec || S.rec.ds !== S.ds) S.rec = { ds: S.ds, file: 0, type: "PRR", test: "", offset: 0, limit: 200, prr: S.rec ? S.rec.prr : "parts" };
   const st = S.rec;
   const ctl = h("div", { class: "controls" });
   const pager = h("div", { class: "row" });
@@ -1266,11 +1280,33 @@ function recRaw(el) {
   test.addEventListener("change", () => { st.test = test.value; st.offset = 0; load(); });
   const size = select([["100", "100"], ["200", "200"], ["500", "500"], ["1000", "1000"]], String(st.limit), (v) => { st.limit = +v; st.offset = 0; load(); });
   const testField = field("Test number", test);
-  ctl.append(ds && ds.paths.length > 1 ? field("File", fileSel) : "", field("Record type", typeSel), testField, field("Rows per page", size));
+  // PRR as the part table (first fail, alarms, part filter, click for results) or as raw fields
+  const prrView = select([["parts", "part table"], ["raw", "raw fields"]], st.prr || "parts", (v) => { st.prr = v; load(); });
+  const prrField = field("PRR as", prrView);
+  const fileField = ds && ds.paths.length > 1 ? field("File", fileSel) : "";
+  const sizeField = field("Rows per page", size);
+  ctl.append(fileField, field("Record type", typeSel), prrField, testField, sizeField);
+  const wholeNote = scopeLine("Raw records", true);
+  el.insertBefore(wholeNote, pager);
   async function load() {
     loading(out, "Reading records…");
     testField.hidden = !TEST_RECS.includes(st.type);
+    prrField.hidden = st.type !== "PRR";
+    const asParts = st.type === "PRR" && (st.prr || "parts") === "parts";
+    sizeField.hidden = asParts;
+    wholeNote.hidden = asParts;
+    if (fileField) fileField.hidden = asParts;
     try {
+      if (asParts) {
+        // the record types and their counts, then the part table
+        const c = await api("records", { ds: S.ds, file: st.file, rec: "PRR", test: null, offset: 0, limit: 1 });
+        typeSel.replaceChildren(...Object.entries(c.counts).map(([k, n]) => h("option", { value: k, selected: k === st.type }, `${k} (${n.toLocaleString()})`)));
+        pager.replaceChildren();
+        detail.replaceChildren();
+        out.replaceChildren();
+        await recParts(out);
+        return;
+      }
       const tn = parseInt(String(st.test).trim(), 10);
       const d = await api("records", { ds: S.ds, file: st.file, rec: st.type, test: TEST_RECS.includes(st.type) && isFinite(tn) ? tn : null, offset: st.offset, limit: st.limit });
       const types = Object.entries(d.counts);
@@ -1334,30 +1370,56 @@ async function findSharedId(filter) {
   const by = found.titles.filter((_, j) => found.by_id[j] > 0);
   return { label: by.length ? by.join(", ") : found.titles.join(", "), found };
 }
+/** The ID picker of one page and side: its choice is kept for that page alone. With `ds` (a dataset id,
+ *  or a function giving it) each ID shows how many of that file's parts have it, an ID the file lacks is
+ *  marked, and a page opened for the first time starts on the first ID the file has. Call `.forDs(id)`
+ *  when the page's file changes. */
 function keyPicker(side, ds) {
   S.mk = S.mk || {};
+  const chosen = () => S.mk[side] !== undefined;
   const cur = S.mk[side] || defaultKey();
   const opts = keyOptions();
   const isTests = !opts.some(([k]) => k === cur && k !== "tests");
-  const sel = select(opts, isTests ? "tests" : cur, () => sync());
-  const tests = h("input", { type: "text", value: isTests ? cur.replace(/^tests:/, "") : "", placeholder: "e.g. 500  or  501,502,503", title: "One test with a unique per-part value, or several tests whose values together identify the part (e.g. wafer, X, Y)", style: { width: "190px" }, oninput: () => sync() });
+  const sel = select(opts, isTests ? "tests" : cur, () => { picked = true; sync(); });
+  let picked = chosen();
+  const tests = h("input", { type: "text", value: isTests ? cur.replace(/^tests:/, "") : "", placeholder: "e.g. 500  or  501,502,503", title: "One test with a unique per-part value, or several tests whose values together identify the part (e.g. wafer, X, Y)", style: { width: "190px" }, oninput: () => { picked = true; sync(); } });
   const value = () => (sel.value === "tests" ? "tests:" + tests.value.trim() : sel.value);
-  function sync() { tests.hidden = sel.value !== "tests"; S.mk[side] = value(); }
+  function sync() { tests.hidden = sel.value !== "tests"; if (picked) S.mk[side] = value(); }
   sync();
-  const set = (k) => { sel.value = k; sync(); };
-  return { el: h("div", { class: "row tight" }, sel, tests), value, set };
+  const set = (k) => { sel.value = k; picked = true; sync(); };
+  // coverage in the page's file
+  let seq = 0;
+  const forDs = async (id) => {
+    if (id == null) return;
+    const mine = ++seq;
+    try {
+      const c = await api("id_coverage", { ds: id, keys: opts.filter(([k]) => k !== "tests").map(([k]) => k) });
+      if (mine !== seq) return;
+      const n = Object.fromEntries(c.keys.map((x) => [x.key, x]));
+      for (const o of sel.options) {
+        const x = n[o.value], base = (opts.find(([k]) => k === o.value) || [])[1] || o.textContent;
+        o.textContent = !x ? base : x.parts ? `${base} · ${x.parts.toLocaleString()} of ${c.parts.toLocaleString()} parts` : `${base} · not in this file`;
+      }
+      if (!picked) {
+        const first = c.keys.find((x) => x.parts > 0);
+        if (first && first.key !== sel.value) { sel.value = first.key; sync(); }
+      }
+    } catch (e) {}
+  };
+  forDs(typeof ds === "function" ? ds() : ds);
+  return { el: h("div", { class: "row tight" }, sel, tests), value, set, forDs };
 }
 function viewMatch(el) {
-  el.append(h("h1", {}, "Match & merge"), h("p", { class: "lead" }, "Find the same physical parts in two files: by PRR part text or part ID, by die X/Y, or by datalogged PTR results (one test holding a unique wafer + X/Y code, or wafer, X and Y in separate tests). Matched parts become a part set you can filter on, compare, split out, merge and chart side by side. To follow one part, or many parts over several files, use the Trace page."),
+  el.append(h("h1", {}, "Match parts"), h("p", { class: "lead" }, "Find the same physical parts in two files: by PRR part text or part ID, by die X/Y, or by datalogged PTR results (one test holding a unique wafer + X/Y code, or wafer, X and Y in separate tests). Matched parts become a part set you can filter on, compare, split out, merge and chart side by side. To follow one part, or many parts over several files, use the Trace page."),
     h("div", { class: "row" }, h("button", { onclick: () => go("trace/find") }, "Find one part…"), h("button", { onclick: () => go("trace/parttrace") }, "Part trace report…"), h("button", { onclick: () => go("export") }, "Merge files…")));
   const ids = S.datasets.map((d) => d.id);
   const st = S.m || (S.m = { a: S.ds, b: otherDs(S.ds), name: "match", fa: "", fb: "" });
   if (!ids.includes(st.a)) st.a = S.ds;
   if (!ids.includes(st.b) || st.b === st.a) st.b = otherDs(st.a);
   const two = S.datasets.length > 1;
-  const a = select(dsOptions(), String(st.a), (v) => (st.a = +v));
-  const b = select(dsOptions(), String(st.b), (v) => (st.b = +v));
-  const ka = keyPicker("a"), kb = keyPicker("b");
+  const a = select(dsOptions(), String(st.a), (v) => { st.a = +v; ka.forDs(st.a); });
+  const b = select(dsOptions(), String(st.b), (v) => { st.b = +v; kb.forDs(st.b); });
+  const ka = keyPicker("match_a", st.a), kb = keyPicker("match_b", st.b);
   const name = h("input", { type: "text", value: st.name, style: { width: "110px" }, title: "Used as $name in filters" });
   const fa = h("input", { type: "text", class: "filter-input", value: st.fa, placeholder: "optional, e.g. wafer = \"W01\"" });
   const fb = h("input", { type: "text", class: "filter-input", value: st.fb, placeholder: "optional" });
@@ -1377,25 +1439,59 @@ function viewMatch(el) {
   el.append(out, traceBox);
   if (S.mres && S.mres.a === st.a && S.mres.b === st.b && ids.includes(st.a) && ids.includes(st.b)) renderMatch(out, S.mres, traceBox);
 }
+/** A part as the part searches list it. */
+function partHitLabel(r) {
+  return [`part ${r.part_id}`, r.part_txt, r.x != null ? `${r.wafer ? r.wafer + " " : ""}X${r.x} Y${r.y}` : "", r.test_xy ? testXyLabel(r.test_xy) : "", `site ${r.site}`, `bin ${r.hbin}`].filter(Boolean).join(" · ");
+}
+/** The wafer, X and Y tests the part searches read (Settings). */
+function partSearchParams() {
+  const wc = waferCal();
+  return { wafer_test: wc.w, x_test: wc.x, y_test: wc.y, ox_test: wc.ox, oy_test: wc.oy, offset_mode: wc.mode, flip_x: wc.fx, flip_y: wc.fy };
+}
+/** One part search for the app (also the Part datalog's): part ID, PRR X/Y, part text, or wafer, X, Y from tests. */
+const PART_SEARCH = "part_id,xy,part_txt,test_xy";
 function viewFindPart(el) {
-  el.append(h("h1", {}, "Find a part"), h("p", { class: "lead" }, "Look one part up by its ID and see all its results, in one file or in two side by side. Type wafer, X and Y as W12X-2Y25 (12, -2, 25 also works)."));
+  el.append(h("h1", {}, "Find a part"), h("p", { class: "lead" }, "Type a part ID (233), PRR X/Y (3,-2), part text, or wafer, X, Y from tests as logged (W24X111Y146): the same search as the Part datalog. Click a match for all its results, then add it to the part datalog or show the same part in another file side by side."),
+    scopeLine("The search", true));
   const ids = S.datasets.map((d) => d.id);
-  const st = S.fp || (S.fp = { a: S.ds, b: null, value: "" });
+  const st = S.fp || (S.fp = { a: S.ds, q: "" });
   if (!ids.includes(st.a)) st.a = S.ds;
-  if (st.b != null && (!ids.includes(st.b) || st.b === st.a)) st.b = null;
-  const a = select(dsOptions(), String(st.a), (v) => (st.a = +v));
-  const b = select([["", "none"], ...dsOptions()], st.b == null ? "" : String(st.b), (v) => (st.b = v === "" ? null : +v));
-  const ka = keyPicker("fa"), kb = keyPicker("fb");
-  const box = h("div");
-  const tv = h("input", { type: "text", value: st.value, placeholder: "e.g. LOTA-W01-X3Y-2  or  11253  or  W1X3Y-2", style: { minWidth: "300px", flex: "1" }, onkeydown: (e) => { if (e.key === "Enter") run(); } });
-  const run = () => {
-    st.value = tv.value;
-    if (!tv.value.trim()) return toast("Type the part's ID", "bad");
-    trace(box, { a: st.a, b: st.b != null && st.b !== st.a ? st.b : null, key_a: ka.value(), key_b: kb.value(), value: tv.value });
+  const a = select(dsOptions(), String(st.a), (v) => { st.a = +v; ka.forDs(st.a); find(); });
+  const q = h("input", { type: "text", value: st.q || "", placeholder: "e.g. 233  or  3,-2  or  LOTA-W01-X3Y-2  or  W24X111Y146", style: { minWidth: "320px", flex: "1" }, onkeydown: (e) => { if (e.key === "Enter") find(); } });
+  const hits = h("div", { class: "hit-list" }), actions = h("div"), detail = h("div"), side = h("div");
+  const ka = keyPicker("fa", st.a);
+  const find = async () => {
+    st.q = q.value;
+    actions.replaceChildren(); detail.replaceChildren(); side.replaceChildren();
+    if (!q.value.trim()) return hits.replaceChildren();
+    try {
+      const r = await api("find_parts", Object.assign({ ds: st.a, q: q.value, by: PART_SEARCH, limit: 50 }, partSearchParams()));
+      hits.replaceChildren(!r.rows.length ? h("p", { class: "muted small" }, `No part of ${dsName(st.a)} matches.`) : h("p", { class: "muted small" }, r.total > r.rows.length ? `${r.total.toLocaleString()} matches, first ${r.rows.length} listed` : `${r.rows.length} match${r.rows.length > 1 ? "es" : ""}`),
+        ...r.rows.map((x) => h("button", { class: "hit", onclick: () => pick(x) }, partHitLabel(x))));
+      if (r.rows.length === 1) pick(r.rows[0]);
+    } catch (e) { showErr(hits, e); }
   };
-  el.append(h("div", { class: "controls" }, field("File", a), field("Identify parts by", ka.el)),
-    S.datasets.length > 1 ? h("div", { class: "controls" }, field("Also in file", b), field("Identify its parts by", kb.el)) : "",
-    h("div", { class: "controls" }, field("Part ID", tv), h("button", { class: "primary", onclick: run }, "Find")), box);
+  const pick = (r) => {
+    const others = S.datasets.filter((d) => d.id !== st.a);
+    const b = others.length ? select(others.map((d) => [String(d.id), d.name]), String(others[0].id), (v) => kb.forDs(+v)) : null;
+    const kb = keyPicker("fb", others.length ? others[0].id : null);
+    actions.replaceChildren(h("div", { class: "row" },
+      h("button", { onclick: () => addToDatalog(st.a, r) }, "Add to the part datalog"),
+      b ? h("span", { class: "row tight" }, h("span", { class: "muted small" }, "Same part in"), b, h("span", { class: "muted small" }, "by"), ka.el, h("span", { class: "muted small" }, "↔"), kb.el,
+        h("button", { onclick: () => trace(side, { a: st.a, b: +b.value, key_a: ka.value(), key_b: kb.value(), row_a: r.index }) }, "Show side by side")) : ""));
+    side.replaceChildren();
+    partDetail(detail, st.a, r.index, partHitLabel(r));
+  };
+  el.append(h("div", { class: "controls" }, field("File", a), field("Part", q), h("button", { class: "primary", onclick: find }, "Find")), hits, actions, side, detail);
+  if (st.q) find();
+}
+/** Adds a found part to the Part datalog's list (that file's), and says so. */
+function addToDatalog(ds, r) {
+  if (!S.dl || S.dl.ds !== ds) S.dl = { ds, parts: [], tests: S.dl ? S.dl.tests : [], modes: S.dl ? S.dl.modes : ["part_id", "xy", "part_txt"], format: S.dl ? S.dl.format : "txt" };
+  if (S.dl.parts.some((p) => p.index === r.index)) return toast("Already in the part datalog");
+  S.dl.parts.push(Object.assign({ mark: "" }, r));
+  setDs(ds);
+  toast(`Added part ${r.part_id} to the part datalog (${S.dl.parts.length} part${S.dl.parts.length > 1 ? "s" : ""})`, "good");
 }
 /** Builds a filter like  not pass and fail(1013)  into `input`. */
 function quickFilter(input, key) {
@@ -1444,10 +1540,8 @@ function renderMatch(out, m, traceBox) {
     const sideFilter = ((isA ? S.m.fa : S.m.fb) || "").trim();
     const other = isA ? m.b : m.a;
     const keys = isA ? { key_a: S.m.ka, key_b: S.m.kb } : { key_a: S.m.kb, key_b: S.m.ka };
-    const [dirP, dirF] = pathField("folder", nearDs(d, `${base}_${m.name}_split`), { title: "Choose output folder", placeholder: "output folder" });
     const res = h("div");
     const single = d && d.files === 1 && !d.derived;
-    const within = h("input", { type: "checkbox", checked: !!sideFilter });
     const scopeNote = sideFilter ? h("p", { class: "muted small" }, "Unmatched = parts within Filter ", label, " (", h("code", {}, sideFilter), ") that did not match.") : null;
     const markers = () => {
       runCompare(cmpOut, Object.assign({ mode: "group", a: id, select: set, vs: `not ${set}`, filter: scoped(sideFilter), match_by: "key", later: other }, keys));
@@ -1474,18 +1568,14 @@ function renderMatch(out, m, traceBox) {
       h("div", { class: "row" },
         h("button", { onclick: () => useFilter(id, andF(sideFilter, set)) }, "Analyse matched parts"),
         h("button", { onclick: () => useFilter(id, andF(sideFilter, `not ${set}`)) }, "Analyse unmatched parts")),
-      single ? h("div", { class: "row" }, dirF) : null,
-      single && sideFilter ? h("label", { class: "chk" }, within, ` write only parts within Filter ${label}`) : null,
-      single ? h("div", { class: "row" }, h("button", { class: "primary", onclick: async () => {
-        if (!dirP.value) return toast("Choose an output folder", "bad");
-        busy("Splitting…");
-        try {
-          const r = await api("split", { ds: id, by: "groups", groups: [{ name: "matched", expr: set }], rest: "unmatched", out_dir: dirP.value, prefix: base, filter: within.checked ? sideFilter : "" });
-          const t = h("div");
-          res.replaceChildren(resultLine(`${r.outputs.length} file(s) written to ${r.out_dir}`, r.out_dir), t);
-          table(t, [{ key: "name", label: "Output" }, { key: "parts", label: "Parts", num: true }, { key: "good", label: "Good", num: true }, { key: "path", label: "File" }], r.outputs, { search: false });
-        } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
-      } }, "Split: matched / unmatched STDF")) : h("p", { class: "muted small" }, "Splitting needs a dataset opened from a single file."),
+      single ? h("div", { class: "row" }, h("button", { title: "Opens Split on Merge, split & export with the groups filled in", onclick: () => {
+        // one split tool: its groups are filled in for this file
+        const d = (S.drafts ||= {}), k = (x) => `export:${id}:${x}`;
+        d[k("by")] = "groups";
+        d[k("groups")] = sideFilter ? [{ name: "matched", expr: andF(sideFilter, set) }, { name: "unmatched", expr: andF(sideFilter, `not ${set}`) }] : [{ name: "matched", expr: set }];
+        d[k("rest")] = sideFilter ? "" : "unmatched";
+        setDs(id); go("export");
+      } }, "Split into matched / unmatched STDF…")) : h("p", { class: "muted small" }, "Splitting needs a dataset opened from a single file."),
       res);
   };
   out.append(h("div", { class: "grid2" }, sideCard(m.a, "A"), sideCard(m.b, "B")), cmpOut);
@@ -1510,7 +1600,10 @@ function renderMatch(out, m, traceBox) {
   }
   ta.addEventListener("change", draw);
   tb.addEventListener("change", draw);
-  out.append(h("h2", {}, "Dual view: the same units in both files"),
+  out.append(h("div", { class: "row" }, h("h2", {}, "Dual view: the same units in both files"),
+    h("button", { title: "Every test, CORRELATED / OFFSET / UNCORRELATED, over the same units paired by the same IDs", onclick: () => {
+      Object.assign(S, { ucA: m.a, ucB: m.b, corrMode: "unit" }); Object.assign((S.mk ||= {}), { uc_a: S.m.ka, uc_b: S.m.kb }); go("correlation");
+    } }, "Unit correlation of these units →")),
     h("p", { class: "lead" }, "Each matched unit contributes its result for the A test and for the B test, so e.g. test 101 in A can be viewed against test 102 in B for exactly the same dies. Colors follow a field of either file, e.g. B's results colored by A's site."),
     h("div", { class: "controls" }, field("Test in A", ta), field("Test in B", tb), field("Color parts by", color), field("using the field of", side), h("button", { class: "primary", onclick: draw }, "Show")),
     chartOpts(draw), charts);
@@ -1730,8 +1823,8 @@ function viewCandidates(el) {
   const ids = S.datasets.map((d) => d.id);
   if (!ids.includes(st.a)) st.a = S.ds;
   if (!ids.includes(st.b) || st.b === st.a) st.b = otherDs(st.a);
-  const a = select(dsOptions(), String(st.a), (v) => (st.a = +v));
-  const b = select(dsOptions(), String(st.b), (v) => (st.b = +v));
+  const a = select(dsOptions(), String(st.a), (v) => { st.a = +v; ka.forDs(st.a); });
+  const b = select(dsOptions(), String(st.b), (v) => { st.b = +v; kb.forDs(st.b); });
   const good = h("input", { type: "text", class: "filter-input", value: st.good, placeholder: "e.g. hbin = 1  or  pass" });
   const test = h("input", { type: "text", value: st.test, placeholder: "e.g. 1013 (blank = any fail)", style: { width: "170px" } });
   const how = select([["fail", "fails it"], ["first", "fails it first"], ["only", "fails only it"]], st.how);
@@ -1757,9 +1850,9 @@ function viewCandidates(el) {
   const rangeNote = h("div", { class: "muted small", style: { maxWidth: "320px" } }, st.rangeNote || "");
   range.addEventListener("input", () => { st.rangeNote = ""; rangeNote.textContent = ""; });
   const extra = h("input", { type: "text", class: "filter-input", value: st.extra, placeholder: "optional extra filter on file 2" });
-  const ka = keyPicker("ca"), kb = keyPicker("cb");
+  const ka = keyPicker("ca", st.a), kb = keyPicker("cb", st.b);
   const name = h("input", { type: "text", value: st.name, style: { width: "130px" }, title: "Part set name, usable as $name in every filter" });
-  const coords = select([["auto", "auto (PRR X/Y, else tests)"], ["tests", "from tests (Wafer maps settings)"]], st.coords);
+  const coords = select([["auto", "auto (PRR X/Y, else die X/Y from tests)"], ["tests", "die X/Y from tests (Settings)"]], st.coords);
   const out = h("div"), traceBox = h("div");
   const badFilter = () => {
     const t = test.value.trim().replace(/:.*/, "");
@@ -1770,10 +1863,12 @@ function viewCandidates(el) {
     Object.assign(st, { a: +a.value, b: +b.value, good: good.value.trim(), test: test.value.trim(), how: how.value, range: range.value.trim(), incMarg: incMarg.checked, extra: extra.value, name: name.value.trim() || "bad_candidate", coords: coords.value });
     if (st.a === st.b) return toast("Pick two different files", "bad");
     if (st.range && !st.test) return toast("A value range needs the failing test", "bad");
-    const goodF = scoped(st.good), set = "$" + st.name;
-    loading(out, "Matching file 2's bad parts to file 1's good parts…");
+    const goodF0 = scoped(st.good), set = "$" + st.name;
+    // a set handed over (Retest trace) keeps its parts out of the reference too
+    const goodF = st.keep && st.leave ? andF(goodF0, `not $${st.leave}`) : goodF0;
+    loading(out, st.keep ? `Using $${st.keep} as the candidates…` : "Matching file 2's bad parts to file 1's good parts…");
     try {
-      const m = await api("candidate_sets", { a: st.a, b: st.b, key_a: ka.value(), key_b: kb.value(), filter_a: goodF, filter_b: badFilter(), test: st.test.replace(/:.*/, ""), range: st.range, include_marginal: st.incMarg, name: st.name });
+      const m = await api("candidate_sets", { a: st.a, b: st.b, key_a: ka.value(), key_b: kb.value(), filter_a: goodF, filter_b: badFilter(), test: st.test.replace(/:.*/, ""), range: st.keep ? "" : st.range, include_marginal: st.incMarg, name: st.name, keep_set: st.keep || "", leave_set: st.leave || "" });
       if (!m.n_cand) { out.replaceChildren(h("div", { class: "err" }, `None of the ${m.n_b.toLocaleString()} bad parts of file 2 (${badFilter()}) matched a good part of file 1 (${goodF || "all parts"})` + (m.n_marginal ? `, except ${m.n_marginal.toLocaleString()} marginal fails outside the range ${st.range} (tick "Include marginal fails" to use them).` : `. Check the identity (${m.key_a} ↔ ${m.key_b}) and the filters.`))); return; }
       // marginal fails are left out of both groups unless they count as candidates
       const popF = m.n_marginal && !m.include_marginal ? (goodF ? `(${goodF}) and not $${m.marginal}` : `not $${m.marginal}`) : goodF;
@@ -1788,7 +1883,12 @@ function viewCandidates(el) {
       renderCandidates(out, traceBox, { m, mk, cd, st, popF, set, keys: { key_a: ka.value(), key_b: kb.value() }, badF: badFilter() });
     } catch (e) { showErr(out, e); }
   };
+  // candidates handed over from Retest trace: shown, and dropped with ×
+  const keepBox = st.keep ? h("div", { class: "row tight small", style: { margin: "6px 0" } }, badge(`candidates: $${st.keep}`, "warn"), st.keepNote || "",
+    st.leave ? ` · $${st.leave} left out of every group` : "",
+    h("button", { class: "ghost small", title: "Find the candidates from file 2 instead", onclick: () => { st.keep = ""; st.leave = ""; st.keepNote = ""; S.bcLast = null; go("candidates"); } }, "× Find them from file 2 instead")) : "";
   el.append(
+    keepBox,
     h("div", { class: "controls" }, field("File 1 (good parts)", a), field("Good parts are", good), field("Identify parts by", ka.el)),
     h("div", { class: "controls" }, field("File 2 (became bad)", b), field("Bad parts failing test", h("div", { class: "row tight" }, test, how)), field("with its file-2 value in", h("div", {}, h("div", { class: "row tight" }, range, unitHint), rangeNote)), h("label", { class: "chk", title: "Off: file-2 fails outside the range ($marginal) are left out of both the candidates and the reference. On: they count as candidates." }, incMarg, "Include marginal fails as candidates"), field("Extra filter", extra), field("Identify parts by", kb.el)),
     h("div", { class: "controls" }, field("Mark them as", name), field("Die X/Y", coords), loadboardField(), h("button", { class: "primary", onclick: run }, "Find bad candidates")),
@@ -2293,7 +2393,7 @@ function viewRetest(el) {
       h("span", { class: "muted small" }, i === 0 ? "first run: the starting parts" : "a retest: of the rejects, or of good parts"))),
       h("button", { onclick: () => { st.runs.push(ids.find((x) => !st.runs.includes(x)) ?? ids[0]); drawRuns(); } }, "+ Add run"));
   };
-  const kp = keyPicker("rt");
+  const kp = keyPicker("rt", () => st.runs[0]);
   if (st.link == null) st.link = "part_txt";
   const link = select([["", "nothing (key only)"], ...keyOptions().filter(([k]) => k !== "tests")], st.link, (v) => (st.link = v));
   link.title = "Where a part has no key in a run (e.g. it failed before the WXY test), find it by this ID instead, from the last run it was found in. Never joins parts whose keys differ.";
@@ -2568,7 +2668,7 @@ function renderRetest(out, traceBox, d) {
     cardSlot.replaceChildren(...(hp ? [partCard(hp, drawFocus), idTrail(d, hp)] : []));
   };
   focusBox.append(h("div", { class: "row tight", style: { justifyContent: "space-between" } },
-    h("span", { class: "row tight" }, field("Find part", h("div", { class: "row tight" }, findIn, h("button", { onclick: findPart }, "Find"))), hits),
+    h("span", { class: "row tight" }, field("Find in traced parts", h("div", { class: "row tight" }, findIn, h("button", { onclick: findPart }, "Find"))), hits),
     h("button", { class: "small", title: "Clear the highlighted part, the parts table search and every chart zoom", onclick: resetView }, "↺ Reset view")),
     h("div", { class: "row tight", style: { marginTop: "6px" } }, focusDyn), cardSlot);
   const onPick = (el) => el.on && el.on("plotly_click", (ev) => { const k = ev.points && ev.points[0] && ev.points[0].customdata; if (typeof k === "string") focusPart(k, "chart"); });
@@ -2776,13 +2876,13 @@ function renderRetestCandidates(out, d) {
   if (!c || !c.good_runs.length) return;
   const rl = (k) => `Run ${k + 1}`, t0 = d.tests[0], a = d.runs[0].id;
   const later = d.runs[c.good_runs[0]].id;
-  const popF = c.n_marginal ? "pass and not $rt_marginal" : "pass";
+  const popF = c.n_marginal ? "pass and not $rt_passed_later" : "pass";
   const box = h("div"), mkBox = h("div");
   out.append(h("h2", {}, "Bad candidates from the retests of good parts"),
-    h("p", { class: "lead" }, `${c.good_runs.map(rl).join(", ")} retested good parts. Parts good in run 1 that failed ${t0.key} there and never passed again are the bad candidates ($rt_bad_candidate in run 1); those that passed again later are marginal ($rt_marginal, left out of the comparison); those passing every retest of good parts are confirmed good ($rt_confirmed_good). Find candidate tests ranks every run-1 test by how well it sets the candidates apart from the other good parts, as on the Bad candidates page.`), box, mkBox);
+    h("p", { class: "lead" }, `${c.good_runs.map(rl).join(", ")} retested good parts. Parts good in run 1 that failed ${t0.key} there and never passed again are the bad candidates ($rt_bad_candidate in run 1); those that passed again later are left out of the comparison ($rt_passed_later); those passing every retest of good parts are confirmed good ($rt_confirmed_good). Find candidate tests ranks every run-1 test by how well it sets the candidates apart from the other good parts, as on the Bad candidates page.`), box, mkBox);
   box.append(h("div", { class: "kpis" },
     kpi("Bad candidates", c.n_cand.toLocaleString(), `good in run 1, failed ${t0.key} on a retest of good parts, never passed after`),
-    kpi("Marginal", c.n_marginal.toLocaleString(), "failed it there, passed again later"),
+    kpi("Passed again later", c.n_marginal.toLocaleString(), `failed it there, passed a later retest ($rt_passed_later)`),
     kpi("Confirmed good", c.n_confirmed.toLocaleString(), "passed every retest of good parts"),
     c.n_other_fail ? kpi("Failed another test", c.n_other_fail.toLocaleString(), `on a retest of good parts, but not ${t0.key}`) : ""));
   if (!c.n_cand) { box.append(h("p", { class: "muted" }, `No good part of run 1 failed ${t0.key} on a retest of good parts without passing again.`)); return; }
@@ -2798,8 +2898,9 @@ function renderRetestCandidates(out, d) {
   box.append(h("div", { class: "row" },
     h("button", { class: "primary", onclick: find }, "Find candidate tests"),
     h("button", { onclick: () => useFilter(a, "$rt_bad_candidate") }, "Analyse the candidates ($rt_bad_candidate)"),
-    h("button", { title: "Profile run 1 against the first retest of good parts on the Bad candidates page (outlier scores, sites, wafer zones, focus tests)", onclick: () => {
-      S.bc = Object.assign(S.bc || {}, { a, b: later, good: "pass", test: String(t0.num), how: "fail", range: "", rangeNote: `from Retest trace: ${rl(c.good_runs[0])} retested good parts`, incMarg: false, extra: "", name: "bad_candidate", coords: "auto" });
+    h("button", { title: "Profile these same candidates on the Bad candidates page (outlier scores, sites, wafer zones, focus tests): $rt_bad_candidate as found over the whole chain, with $rt_passed_later left out", onclick: () => {
+      S.bc = Object.assign(S.bc || {}, { a, b: later, good: "pass", test: String(t0.num), how: "fail", range: "", rangeNote: "", incMarg: false, extra: "", name: "bad_candidate", coords: "auto",
+        keep: "rt_bad_candidate", leave: c.n_marginal ? "rt_passed_later" : "", keepNote: `from Retest trace: good in run 1, failed ${t0.key} on a retest of good parts (${c.good_runs.map(rl).join(", ")}), never passed after` });
       S.bcLast = null; go("candidates");
     } }, "Full profile in Bad candidates →")));
 }
@@ -2933,23 +3034,18 @@ async function viewHome(el) {
   right.append(h("details", { class: "card pad adv" }, h("summary", {}, "Open by path"),
     pathBox, h("button", { onclick: () => loadPaths(pathBox.value.split(/\r?\n/).map((x) => x.trim().replace(/^"|"$/g, "")).filter(Boolean)) }, "Open")));
 
-  right.append(h("h2", {}, "What can I do?"));
-  const tips = [
-    ["overview", "Overview", "Yield, bin pareto, site & wafer yield, fail pareto; bars split by site"],
-    ["explorer", "Test explorer", "Histogram, box, CDF and trend of any test vs limits"],
-    ["wafer", "Wafer maps", "Bin or test-value maps per wafer"],
-    ["compare", "Compare", "Lot vs lot, or a group of parts vs the rest"],
-    ["trace/parttrace", "Trace", "Each part's history across files as an Excel report, retest chains, one part"],
-    ["qual", "Drift report", "Endurance and 25x loop mean drift by test and site, as Excel reports"],
-    ["correlation", "Correlation", "Tester-to-tester correlation, test-to-test matrix"],
-    ["anova", "ANOVA", "Which tests differ by site, wafer or lot"],
-    ["anomaly", "Abnormal parts", "PAT, robust z, wafer NNR, Isolation Forest"],
-    ["ml", "Machine learning", "What drives fails? PCA & clustering"],
-    ["records", "Records", "Part table, part datalog and every raw STDF record"],
-    ["data", "Edit, merge & export", "Trim, merge, split, match parts, CSV, HTML report"],
-    ["investigation", "Experimental", "Failure investigation, bad candidates, signature check"],
+  // a few next steps for what is open (the side bar lists every page)
+  const files = S.datasets.filter((d) => !d.derived);
+  const tips = !has ? [
+    ["", "Open STDF files", "Ctrl+O, drag them here, or drop them on the .exe; try synthetic_samples/ without data"],
+    ["settings", "Settings", "Part identification, die X/Y tests and offsets, loadboard test"],
+  ] : [
+    ["overview", "Overview", "Yield, bins, sites and fail pareto of the current file"],
+    ["explorer", "Test explorer", "Distribution, Cpk and trend of any test"],
+    ...(files.length > 1 ? [["compare", "Compare files", "Lot vs lot or tester vs tester, every test ranked"], ["trace/parttrace", "Trace parts across files", "Each part's history as an Excel report, or a retest chain"]] : [["records", "Records", "Every part and raw record of the file"]]),
   ];
-  right.append(h("div", { class: "tips" }, tips.map(([k, t, d]) => h("button", { class: "tip", disabled: !has, onclick: () => go(k) }, h("b", {}, t), h("span", {}, d)))));
+  right.append(h("h2", {}, "Next steps"));
+  right.append(h("div", { class: "tips" }, tips.map(([k, t, d]) => h("button", { class: "tip", onclick: () => (k ? go(k) : openFiles()) }, h("b", {}, t), h("span", {}, d)))));
 }
 
 function dirname(p) { const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\")); return i > 0 ? p.slice(0, i) : p; }
@@ -2982,9 +3078,12 @@ async function loadPaths(paths, opts) {
   try {
     const r = await api("load", { paths, merge: !!S.optMerge && paths.length > 1, dedup: S.optDedup || "", sort: S.optSort || "time" });
     await refreshDatasets(r.ids[r.ids.length - 1]);
+    const again = [...new Set(r.already || [])];
+    if (again.length) toast(`Already open: ${again.map(dsName).join(", ")}`, "", 6000);
     if (r.skipped) toast(`Skipped ${r.skipped} file${r.skipped > 1 ? "s" : ""} that ${r.skipped > 1 ? "are" : "is"} not STDF`, "", 6000);
     for (const e of r.errors || []) toast(`Could not read ${e.name}: ${e.error}`, "bad", 10000);
-    if (!opts.quiet) toast(`Opened ${r.ids.length} dataset${r.ids.length > 1 ? "s" : ""}`, "good");
+    const fresh = r.ids.filter((id) => !again.includes(id)).length;
+    if (!opts.quiet && fresh) toast(`Opened ${fresh} dataset${fresh > 1 ? "s" : ""}`, "good");
     // on the home screen the user picks the page: stay there, with the new dataset listed
     go(S.view === "home" ? "home" : "overview");
   } catch (e) {
@@ -3010,6 +3109,16 @@ async function uploadFiles(files, skipped) {
   // copies lose their file time, so put them in time order before uploading
   if ((S.optSort || "time") === "time") files.sort((a, b) => a.lastModified - b.lastModified);
   if (skipped) toast(`Skipped ${skipped} file${skipped > 1 ? "s" : ""} that ${skipped > 1 ? "are" : "is"} not STDF`, "", 6000);
+  // a file dropped again while its copy is open: not copied or opened twice
+  const open = [];
+  for (const f of [...files]) {
+    try {
+      const r = await api("open_upload", { name: f.name, size: f.size });
+      if (r.ds != null) { open.push(r.ds); files.splice(files.indexOf(f), 1); }
+    } catch (e) {}
+  }
+  if (open.length) toast(`Already open: ${[...new Set(open)].map(dsName).join(", ")}`, "", 6000);
+  if (!files.length) { setDs(open[open.length - 1]); return go(S.view === "home" ? "home" : "overview"); }
   const total = files.reduce((a, f) => a + f.size, 0);
   let done = 0;
   const paths = [];
@@ -3072,17 +3181,40 @@ function toast(msg, kind, ms) {
 }
 
 // ---- Split & export
+/** Where to save: with the app's own dialogs there is no path box, the save button asks (askPath) and
+ *  saves at once; in a browser without them, a path box. Returns [input holding the path, element]. */
 function pathField(kind, value, opts) {
   opts = opts || {};
   const inp = h("input", { type: "text", value: value || "", placeholder: opts.placeholder || "", style: { minWidth: "320px", flex: "1" } });
-  const btn = h("button", { onclick: async () => {
-    try {
-      const r = kind === "folder" ? await api("pick_folder", { title: opts.title }) : await api("pick_save", { title: opts.title, name: opts.name || "", ext: opts.ext || "" });
-      if (r.path) { inp.value = r.path; inp.dispatchEvent(new Event("change")); }
-    } catch (e) { toast(e.message, "bad"); }
-  } }, "Browse…");
-  if (!(S.info && S.info.native_dialogs)) btn.hidden = true;
-  return [inp, h("div", { class: "pathfield" }, inp, btn)];
+  inp._pick = { kind, opts };
+  if (nativeDialogs()) return [inp, h("span", { hidden: true })];
+  return [inp, h("div", { class: "pathfield" }, inp)];
+}
+const nativeDialogs = () => !!(S.info && S.info.native_dialogs);
+/** The folder the last file was saved in (or the last folder chosen), kept for next time. */
+function lastDir() { try { return localStorage.getItem("sc-last-dir") || ""; } catch (e) { return ""; } }
+function setLastDir(d) { try { if (d) localStorage.setItem("sc-last-dir", d); } catch (e) {} }
+const baseOf = (p) => String(p || "").split(/[\\/]/).pop();
+/** Asks where to save for a path field: the save dialog (or folder picker) opens in the last folder used,
+ *  else the field's default folder, with the default file name. Returns the path, or "" when cancelled.
+ *  Without the app's dialogs, returns the typed path (a toast when it is empty). */
+async function askPath(inp) {
+  const { kind, opts } = inp._pick || { kind: "save", opts: {} };
+  if (!nativeDialogs()) {
+    if (!inp.value.trim()) toast(kind === "folder" ? "Choose an output folder" : "Choose where to save the file", "bad");
+    return inp.value.trim();
+  }
+  const dir = lastDir() || (kind === "folder" ? dirname(inp.value) : dirname(inp.value));
+  try {
+    const r = kind === "folder"
+      ? await api("pick_folder", { title: opts.title, dir })
+      : await api("pick_save", { title: opts.title, name: baseOf(inp.value) || opts.name || "", ext: opts.ext || "", dir });
+    if (!r.path) return "";
+    setLastDir(kind === "folder" ? r.path : dirname(r.path));
+    inp.value = r.path;
+    inp.dispatchEvent(new Event("change"));
+    return r.path;
+  } catch (e) { toast(e.message, "bad"); return ""; }
 }
 /** A save button with an arrow: the button saves the file; the arrow also offers "Save and open".
  *  `run(open)` does the save and opens the saved file when `open` is true. */
@@ -3128,7 +3260,7 @@ function mergeCard() {
       h("label", { class: "chk", title: "Each later file's part IDs are raised by the highest part ID written before it (e.g. file 1 ends at 481: file 2's part 1 becomes 482). Part IDs that are not numbers are counted up instead." }, renumber, "Renumber part IDs: each file continues from the previous file's last part ID"),
       h("div", { class: "row" }, pf,
         saveSplit("Save merged STDF", async (open) => {
-          if (!path.value) return toast("Choose where to save the merged file", "bad");
+          if (!(await askPath(path))) return;
           busy("Writing merged STDF…");
           try {
             const r = await api("merge_files", { ds: list.map((f) => f.id), path: path.value, renumber: renumber.checked });
@@ -3262,11 +3394,18 @@ function viewPartTrace(el) {
     dupes.replaceChildren(
       ...(rounded.length ? [warn("IDs may not be unique", `${rounded.map((f) => `${dsName(f.id)}: ${f.ids.rounded.toLocaleString()} parts`).join(" · ")} have a PTR ID above 16,777,216. STDF stores PTR results as 32-bit numbers, so these are rounded and different parts can share an ID. Keep part text or wafer, X, Y ticked as well.`)] : []),
       ...(open.length ? [warn("same part again", `${open.map((f) => `${dsName(f.id)}: ${f.ids.repeats.toLocaleString()} extra tests`).join(" · ")}. Each extra test takes one more row. If the repeats are intended, tick Last test only for that file.${ptr ? " With a PTR ID, first check these are repeats and not different parts with the same result, such as X and Y that need offsets: Last test only would merge them." : ""}`)] : []));
-    // tests that share one ID but not another are never merged: warned before the report is written
-    conflictBox.replaceChildren(...(info.conflicts ? [h("div", { class: "small", style: { margin: "8px 0" } },
-      h("div", { class: "row tight" }, badge("IDs disagree", "bad"), `${info.conflicts.toLocaleString()} tests share an ID with a part whose other ID differs, e.g. the same part text with another WXY. They are not merged: each keeps its own row, right after the other, with its ID cells red and an ID check note. Check the tests behind these IDs, or untick the ID you do not trust. When most parts disagree, a setting is usually wrong: X and Y without their offsets, for example (Settings, Check WXY against).`),
-      h("details", {}, h("summary", {}, info.conflicts > info.first_conflicts.length ? `The first ${info.first_conflicts.length}` : "Show them"),
-        h("ul", {}, info.first_conflicts.map((c) => h("li", {}, c.text, " (", [...new Set(c.files)].map(dsName).join(", "), ")")))))] : []));
+    // tests whose IDs disagree, warned before the report is written: W,X,Y (read from the part's
+    // memory) decides over WXY, and both over part text (a camera reading that can land on the wrong part)
+    const apart = info.conflicts - info.joined;
+    const cList = (kind) => info.first_conflicts.filter((c) => c.kind === kind);
+    const cBox = (n, kind, text) => (n ? [h("div", { class: "small", style: { margin: "8px 0" } },
+      h("div", { class: "row tight" }, badge(kind === "joined" ? "joined by the trusted ID" : "kept apart", kind === "joined" ? "warn" : "bad"), text),
+      cList(kind).length ? h("details", {}, h("summary", {}, n > cList(kind).length ? `The first ${cList(kind).length}` : "Show them"),
+        h("ul", {}, cList(kind).map((c) => h("li", {}, c.text, " (", [...new Set(c.files)].map(dsName).join(", "), ")")))) : "")] : []);
+    conflictBox.replaceChildren(
+      ...cBox(info.joined, "joined", `${info.joined.toLocaleString()} tests share a more trusted ID with a part but differ on a less trusted one, e.g. the same W,X,Y with another part text: a part text recorded on the wrong part. They are traced as that part, with red ID cells and an ID check note giving the other value.`),
+      ...cBox(apart, "apart", `${apart.toLocaleString()} tests share an ID with a part but are a different part: a more trusted ID differs (the same part text with another W,X,Y), or the shared ID is on several parts, so it is not unique (one W,X,Y on many part texts). Each keeps its own row, right after the other, with red ID cells and an ID check note.`),
+      ...(info.conflicts ? [h("div", { class: "muted small" }, "Trust order when IDs disagree: W,X,Y (read from the part's own memory), then WXY, then part text (read by a camera as the handler picks the part, so it can fall out of step). An all-zeros or all-ones W,X,Y is a corrupt read and matches nothing. When most parts disagree, a setting is usually wrong: X and Y without their offsets, for example (Settings, Check WXY against).")] : []));
     const pairs = info.pairs.map((x) => `${dsName(x.a)} and ${dsName(x.b)}: ${x.shared.toLocaleString()}`).join(" · ");
     note.replaceChildren(!tickedIds().length ? "Tick at least one ID." : info.groups.length ? `${info.in_several.toLocaleString()} parts are in more than one file. Shared parts by pair: ${pairs}.` : "No two open files share a part by the ticked IDs. Tick files to report them anyway, or tick another ID.");
   }
@@ -3311,14 +3450,14 @@ function viewPartTrace(el) {
     const ids = ticked();
     if (!ids.length) return toast("Tick at least one file", "bad");
     if (!tickedIds().length) return toast("Tick at least one ID", "bad");
-    if (!path.value) return toast("Choose where to save the report", "bad");
+    if (!(await askPath(path))) return;
     st.path = path.value;
     busy("Writing the part trace…");
     try {
       const r = await api("part_trace_export", { runs: ids.map((id) => ({ ds: id, name: label(id), last_only: !!st.last[id] })), keys: tickedIds().map(([, k]) => k), filter: scoped(S.filter), path: path.value, ids: idSpec() });
       const s = r.summary;
       const left = s.runs.reduce((a, x) => a + x.left_out, 0);
-      res.replaceChildren(resultLine(`Saved ${r.path}: ${s.parts.toLocaleString()} parts, ${s.in_several.toLocaleString()} in more than one file, ${s.rows.toLocaleString()} rows${left ? `, ${left.toLocaleString()} earlier tests left out` : ""}${s.conflicts ? `, ${s.conflicts.toLocaleString()} kept apart because their IDs disagree` : ""}${s.id_problems ? `, ${s.id_problems.toLocaleString()} ID audit problems` : ""}`, r.path));
+      res.replaceChildren(resultLine(`Saved ${r.path}: ${s.parts.toLocaleString()} parts, ${s.in_several.toLocaleString()} in more than one file, ${s.rows.toLocaleString()} rows${left ? `, ${left.toLocaleString()} earlier tests left out` : ""}${s.conflicts ? `, ${s.conflicts.toLocaleString()} with IDs that disagree` : ""}${s.id_problems ? `, ${s.id_problems.toLocaleString()} ID audit problems` : ""}`, r.path));
     } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
   };
   const scope = scoped(S.filter);
@@ -3383,7 +3522,7 @@ function viewQual(el) {
     } catch (e) { showErr(eOut, e); }
   };
   const eSave = async () => {
-    if (!ePath.value) return toast("Choose where to save the report", "bad");
+    if (!(await askPath(ePath))) return;
     busy("Writing the endurance report…");
     try {
       const r = await api("endurance_export", Object.assign(eParams(), { path: ePath.value }));
@@ -3392,7 +3531,7 @@ function viewQual(el) {
   };
   const eTRes = h("div");
   const eTrimSave = async () => {
-    if (!eTPath.value) return toast("Choose where to save the trimmed STDF", "bad");
+    if (!(await askPath(eTPath))) return;
     busy("Writing the trimmed STDF…");
     try {
       const r = await api("endurance_trim_save", Object.assign(eParams(), { path: eTPath.value }));
@@ -3443,7 +3582,7 @@ function viewQual(el) {
   };
   const cSave = async () => {
     if (cA.value === cB.value) return toast("Pick two different files", "bad");
-    if (!cPath.value) return toast("Choose where to save the report", "bad");
+    if (!(await askPath(cPath))) return;
     busy("Writing the 25x loop compare…");
     try {
       const r = await api("loop_compare_export", Object.assign(cParams(), { path: cPath.value }));
@@ -3460,7 +3599,13 @@ function viewQual(el) {
   if (files().length > 1 && cA.value !== cB.value) cCheck();
 }
 // ---- Part datalog: pick parts, pick tests, write their results
-const DL_MODES = [["part_id", "Part ID"], ["xy", "X/Y"], ["part_txt", "Part text"], ["test_xy", "Die X/Y from tests"]];
+const DL_MODES = [["part_id", "Part ID"], ["xy", "PRR X/Y"], ["part_txt", "Part text"], ["test_xy", "W,X,Y from tests"]];
+/** Wafer, X and Y from tests as the part list shows them: the raw values as logged, W24X111Y146 (no offsets). */
+function testXyLabel(t) {
+  if (!t.raw) return "";
+  const [x, y] = t.raw;
+  return t.wafer && t.wafer !== "all" ? wxyText(t.wafer, x, y) : `X${x}Y${y}`;
+}
 /** A search box that shows the top matches while typing; clicking one (or
  *  Enter for the first) hands it to `pick`. `find(q)` resolves to
  *  [{label, value}]. */
@@ -3488,18 +3633,18 @@ function viewDatalog(el) {
   if (!S.dl || S.dl.ds !== S.ds) S.dl = { ds: S.ds, parts: [], tests: S.dl ? S.dl.tests : [], modes: S.dl ? S.dl.modes : ["part_id", "xy", "part_txt"], format: S.dl ? S.dl.format : "txt" };
   const st = S.dl;
   if (typeof st.tests === "string") st.tests = st.tests.split(",").map((x) => x.trim()).filter(Boolean);
-  el.append(h("h1", {}, "Part datalog"), h("p", { class: "lead" }, `Pick parts of ${ds ? ds.name : "the dataset"} and the tests you want, then get every result with its limits as easy-to-read text or CSV. Switch the dataset at the top to use another file.`));
+  el.append(h("h1", {}, "Part datalog"), h("p", { class: "lead" }, `Pick parts of ${ds ? ds.name : "the dataset"} and the tests you want, then get every result with its limits as easy-to-read text or CSV. Switch the dataset at the top to use another file.`), scopeLine("Part search", true));
   const wc = waferCal();
-  const calParams = () => ({ wafer_test: wc.w, x_test: wc.x, y_test: wc.y, ox_test: wc.ox, oy_test: wc.oy, offset_mode: wc.mode, flip_x: wc.fx, flip_y: wc.fy });
+  const calParams = partSearchParams;
   const findParts = (q, limit) => api("find_parts", Object.assign({ ds: S.ds, q, by: st.modes.join(","), limit }, calParams()));
-  const label = (r) => [`part ${r.part_id}`, r.part_txt, r.x != null ? `${r.wafer ? r.wafer + " " : ""}X${r.x} Y${r.y}` : "", r.test_xy ? `tests: ${r.test_xy.wafer} X${r.test_xy.x} Y${r.test_xy.y}` : "", `site ${r.site}`, `bin ${r.hbin}`].filter(Boolean).join(" · ");
+  const label = partHitLabel;
   const has = (r) => st.parts.some((p) => p.index === r.index);
   const add = (rows) => { let n = 0; for (const r of rows) if (!has(r)) { st.parts.push(Object.assign({ mark: "" }, r)); n++; } drawList(); return n; };
   // 1 · find parts: ticked ways to match, live top 3, full list, pasted list
-  const modes = h("div", { class: "row tight" }, DL_MODES.map(([k, l]) => h("label", { class: "chk", title: k === "test_xy" ? `Wafer, X and Y from tests ${[wc.w, wc.x, wc.y].filter(Boolean).join(" / ")}${wc.ox ? `, offsets ${wc.ox} / ${wc.oy}` : ""} (change them on the Settings page)` : "" },
+  const modes = h("div", { class: "row tight" }, DL_MODES.map(([k, l]) => h("label", { class: "chk", title: k === "test_xy" ? `Wafer, X and Y from tests ${[wc.w, wc.x, wc.y].filter(Boolean).join(" / ")}, the raw values as logged, e.g. W24X111Y146 or 24, 111, 146 (change the tests on the Settings page)` : k === "xy" ? "X and Y of the PRR record (empty in files that log X and Y as tests)" : "" },
     h("input", { type: "checkbox", checked: st.modes.includes(k), onchange: (e) => { st.modes = DL_MODES.map(([m]) => m).filter((m) => (m === k ? e.target.checked : st.modes.includes(m))); } }), l)),
     h("button", { class: "ghost small", onclick: () => go("settings"), title: "Tests for die X/Y" }, "Settings…"));
-  const q = h("input", { type: "text", class: "filter-input", placeholder: "type a part ID (233), X/Y (3,-2  ·  W01 3,-2  ·  X3Y-2) or part text", style: { minWidth: "460px" } });
+  const q = h("input", { type: "text", class: "filter-input", placeholder: "type a part ID (233), X/Y (3,-2  ·  W01 3,-2  ·  W1X3Y-2) or part text", style: { minWidth: "460px" } });
   const hits = h("div"), listBox = h("div"), out = h("div");
   const partSearch = typeahead(q, async (text) => {
     if (!st.modes.length) return [];
@@ -3575,8 +3720,9 @@ function viewDatalog(el) {
   const native = S.info && S.info.native_dialogs;
   const saveAs = async () => {
     try {
-      const p = await api("pick_save", { title: "Save datalog", name: `${base()}.${ext()}`, ext: ext() });
+      const p = await api("pick_save", { title: "Save datalog", name: `${base()}.${ext()}`, ext: ext(), dir: lastDir() || (ds && ds.paths.length ? dirname(ds.paths[0]) : "") });
       if (!p.path) return;
+      setLastDir(dirname(p.path));
       const r = await make(p.path);
       out.replaceChildren(resultLine(`Saved ${r.path}`, r.path), h("p", { class: "muted small" }, note(r)));
     } catch (e) { toast(e.message, "bad"); }
@@ -3622,7 +3768,7 @@ function touchCard(est) {
 const TRIM_PAGE = 200;
 function viewTrim(el) {
   const ds = S.datasets.find((d) => d.id === S.ds);
-  el.append(h("h1", {}, "Edit & trim"), h("p", { class: "lead" }, `Choose the parts of ${ds ? ds.name : "the dataset"} to keep or remove, number the parts that stay if you like, and save a new STDF file. The file you opened is not changed.`));
+  el.append(h("h1", {}, "Edit & trim"), h("p", { class: "lead" }, `Choose the parts of ${ds ? ds.name : "the dataset"} to keep or remove, number the parts that stay if you like, and save a new STDF file. The file you opened is not changed.`), scopeLine("The part list", true));
   if (!ds) { el.append(h("p", { class: "muted" }, "Open an STDF file first.")); return; }
   if (!S.trim || S.trim.ds !== S.ds) S.trim = { ds: S.ds, sel: new Set(), anchor: null, page: 0, q: "", show: "all", action: "keep", renumber: false, method: "rules", op: "replace", numbers: "", by: "id", filter: "", result: "any", sites: null, touchText: "", quota: "", quotaDecided: "" };
   const body = h("div");
@@ -3827,7 +3973,7 @@ function drawTrim(body, ds, data, yields, est) {
   const sep = srcDir.includes("\\") ? "\\" : "/";
   const [pathBox, pathF] = pathField("save", srcDir ? srcDir + sep + base + "_trim.stdf" : "", { title: "Save trimmed STDF", name: base + "_trim.stdf", ext: "stdf" });
   const saveBtnGroup = saveSplit("Save trimmed STDF", async (open) => {
-    if (!pathBox.value) return toast("Choose where to save the trimmed STDF", "bad");
+    if (!(await askPath(pathBox))) return;
     busy("Writing trimmed STDF…");
     try {
       const r = await api("trim_save", { ds: S.ds, rows: [...sel], action: st.action, renumber: st.renumber, path: pathBox.value });
@@ -3933,17 +4079,14 @@ function drawTrim(body, ds, data, yields, est) {
 
 // ---- Settings: defaults used across the views, kept in this browser profile
 function viewSettings(el) {
-  el.append(h("h1", {}, "Settings"), h("p", { class: "lead" }, "Defaults used across the views, saved on this PC. A view's own fields still override them for that analysis."));
+  el.append(h("h1", {}, "Settings"), h("p", { class: "lead" }, "Shared settings, saved on this PC. Every page uses them: change one here and it changes everywhere. Pages show the value they use, with a link back here."));
   const sec = (title, note, ...kids) => h("div", { class: "card pad section" }, h("h2", { style: { marginTop: 0 } }, title), note ? h("p", { class: "muted small" }, note) : null, ...kids);
   const saved = () => { S.rtLast = null; saveCfg(); toast("Saved", "good", 1500); };
-  const sort = select([["time", "by test start time (MIR), else file time"], ["name", "by file name (run2 before run10)"], ["none", "as given"]], S.optSort, (v) => { S.optSort = v; saved(); });
-  const dedup = select([["", "keep every test (incl. retests)"], ["last", "keep the last test of each part"], ["first", "keep the first test of each part"]], S.optDedup || "", (v) => { S.optDedup = v; saved(); });
   // threads for loading several files: 0 = one per core (the server keeps the setting)
   const threadHint = h("span", { class: "muted small" }, "");
   const threads = h("input", { type: "number", min: "0", max: "256", value: "0", style: { width: "80px" }, title: "Threads used to read several files at once. 0 = one per core on this PC.",
     onchange: async (e) => { try { const r = await api("parse_threads", { threads: Number(e.target.value) || 0 }); threads.value = String(r.threads); threadHint.textContent = `0 = auto (${r.cores} cores here)`; toast(`Loading uses ${r.using} thread(s)`, "good", 1500); } catch (err) { toast(err.message, "bad"); } } });
   api("parse_threads", {}).then((r) => { threads.value = String(r.threads); threadHint.textContent = `0 = auto (${r.cores} cores here)`; }).catch(() => {});
-  const merge = h("input", { type: "checkbox", checked: !!S.optMerge, onchange: (e) => { S.optMerge = e.target.checked; saved(); } });
   const ignore = h("input", { type: "checkbox", checked: S.cfg.ignoreIds !== false, onchange: (e) => { S.cfg.ignoreIds = e.target.checked; saved(); } });
   // the IDs may change: pickers forget their choice, and the order list shows what is usable
   const idChanged = () => { S.mk = {}; paintIds(); };
@@ -4004,7 +4147,7 @@ function viewSettings(el) {
     S.lbTest = "5100"; saveCfg(); go("settings");
   };
   el.append(
-    sec("Opening files", null, h("div", { class: "controls" }, field("Order of opened files", sort), field("Retested parts", dedup), field("Threads for loading files", h("span", { class: "row tight" }, threads, threadHint)), h("label", { class: "chk" }, merge, "Combine the files I open into one dataset"))),
+    sec("Opening files", "The order of opened files, retested parts and combining files are set on Home, next to where files are opened.", h("div", { class: "controls" }, field("Threads for loading files", h("span", { class: "row tight" }, threads, threadHint)), h("button", { class: "ghost", onclick: () => go("home") }, "Opening options on Home…"))),
     sec("Part identification", "How the same physical part is found across files, in this order. The first usable ID is the default on pages that match by one ID. The Part trace report uses part text, WXY and wafer, X, Y together: each one the files log is ticked, and a part is found by any of them. Leave a test blank if the program does not log it, or untick trace to leave it out of tracing only.",
       idBox,
       h("label", { class: "chk", style: { marginTop: "10px" }, title: "Identity tests differ by position or board only, so they would top marker rankings and first-fail picks for no physical reason" }, ignore, "Ignore the identification tests in analytics (rankings, signatures, first fails)")),
@@ -4030,7 +4173,7 @@ function viewExport(el) {
   const srcDir = ds && ds.paths.length ? dirname(ds.paths[0]) : "";
   const sep = srcDir.includes("\\") ? "\\" : "/";
   const near = (name) => (srcDir ? srcDir + sep + name : "");
-  el.append(h("h1", {}, "Merge, split & export"), mergeCard(), h("p", { class: "lead" }, `Dataset: ${ds ? ds.name : "–"}` + (S.filter ? ` · filter: ${S.filter}` : " · all parts (set a part filter at the top to export a subset)")));
+  el.append(h("h1", {}, "Merge, split & export"), mergeCard(), h("p", { class: "lead" }, `Dataset: ${ds ? ds.name : "–"}`), scopeLine("The report, CSV, extract and split below write"));
 
   // report
   const [repPath, repField] = pathField("save", near(base + "_report.html"), { title: "Save HTML report", name: base + "_report.html", ext: "html" });
@@ -4038,22 +4181,24 @@ function viewExport(el) {
   el.append(h("div", { class: "card pad section" }, h("h2", {}, "HTML report"),
     h("p", { class: "muted" }, "A single self-contained file (works offline) with all analyses. Share it by e-mail or on a drive."),
     h("div", { class: "row" }, repField, h("button", { class: "primary", onclick: async () => {
-      if (!repPath.value) return toast("Choose where to save the report", "bad");
+      if (!(await askPath(repPath))) return;
       busy("Building report…");
       try { const r = await api("save_report", P({ path: repPath.value })); repOut.replaceChildren(resultLine(`Saved ${r.path}`, r.path)); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
     } }, "Save report")), repOut));
 
   // CSV
   const [csvPath, csvField] = pathField("save", near(base + ".csv"), { title: "Save CSV", name: base + ".csv", ext: "csv" });
-  const csvTests = h("input", { type: "text", placeholder: "all tests, or e.g. 1000, 1010, VDD_LEAK", style: { minWidth: "260px" } });
+  const dk = (k) => `export:${S.ds}:${k}`;
+  const csvTests = draft(dk("csvTests"), h("input", { type: "text", placeholder: "all tests, or e.g. 1000, 1010, VDD_LEAK", style: { minWidth: "260px" } }));
   const csvOut = h("div");
   el.append(h("div", { class: "card pad section" }, h("h2", {}, "CSV (parts × tests)"),
     h("p", { class: "muted" }, "One row per part with PRR fields and test values. Opens in Excel, JMP, Python…"),
     h("div", { class: "row" }, field("Tests", csvTests)),
     h("div", { class: "row" }, csvField, h("button", { class: "primary", onclick: async () => {
-      if (!csvPath.value) { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(S.filter)}&tests=${encodeURIComponent(csvTests.value)}&t=${encodeURIComponent(window.STDF_TOKEN)}`; return; }
+      if (!nativeDialogs() && !csvPath.value.trim()) { location.href = `/api/export.csv?ds=${S.ds}&filter=${encodeURIComponent(scoped(S.filter))}&tests=${encodeURIComponent(csvTests.value)}&t=${encodeURIComponent(window.STDF_TOKEN)}`; return; }
+      if (!(await askPath(csvPath))) return;
       busy("Writing CSV…");
-      try { const r = await api("export_csv_file", { ds: String(S.ds), filter: S.filter, tests: csvTests.value, path: csvPath.value }); csvOut.replaceChildren(resultLine(`Saved ${r.path}`, r.path)); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
+      try { const r = await api("export_csv_file", { ds: String(S.ds), filter: scoped(S.filter), tests: csvTests.value, path: csvPath.value }); csvOut.replaceChildren(resultLine(`Saved ${r.path}`, r.path)); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
     } }, "Export CSV")), csvOut));
 
   if (!single) {
@@ -4064,24 +4209,26 @@ function viewExport(el) {
   const [exPath, exField] = pathField("save", near(base + "_selection.stdf"), { title: "Save selected parts as STDF", name: base + "_selection.stdf", ext: "stdf" });
   const exOut = h("div");
   el.append(h("div", { class: "card pad section" }, h("h2", {}, "Extract selected parts to a new STDF"),
-    h("p", { class: "muted" }, S.filter ? `Parts matching: ${S.filter}` : "Set a part filter at the top first (e.g. part_id in (12, 57) or hbin = 5)."),
+    h("p", { class: "muted" }, S.filter ? `Parts matching: ${scoped(S.filter)}` : "Set a part filter at the top first (e.g. part_id in (12, 57) or hbin = 5).", " To pick parts one by one, by row or by quota instead, use ", h("a", { href: "#data/trim", onclick: (e) => { e.preventDefault(); go("trim"); } }, "Edit & trim"), "."),
     h("div", { class: "row" }, exField, (() => { const b = saveSplit("Extract", async (open) => {
-      if (!exPath.value) return toast("Choose where to save the file", "bad");
+      if (!(await askPath(exPath))) return;
       busy("Writing STDF…");
       try { const r = await api("export_stdf", P({ path: exPath.value })); exOut.replaceChildren(resultLine(`Wrote ${r.parts} parts to ${r.path}`, r.path)); if (open) loadPaths([r.path]); } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
     }); b.querySelectorAll("button").forEach((x) => (x.disabled = !S.filter)); return b; })()), exOut));
 
   // split
   const by = select([["hbin", "hard bin"], ["sbin", "soft bin"], ["site", "site"], ["head", "head"], ["wafer", "wafer"], ["pass", "pass / fail"], ["part_id", "part ID (one file per part)"], ["part_txt", "part text (one file per PART_TXT)"], ["xy", "die X,Y (one file per die)"], ["test", "PTR result (one file per value of a test)…"], ["list", "a list of parts I paste…"], ["groups", "my own groups (filters)…"]], "hbin", () => renderGroups());
-  const splitTest = testInput("spt", "", "e.g. 501 (a logged wafer number)");
-  const listKey = select([["part_id", "PRR part ID"], ["part_txt", "PRR part text"], ["xy", "PRR X/Y (x|y)"], ["tests", "PTR test result(s)…"]], "part_id", () => { listTests.hidden = listKey.value !== "tests"; });
-  const listTests = h("input", { type: "text", value: "500", placeholder: "e.g. 500 or 501,502,503", style: { width: "170px" }, hidden: true });
-  const listBox = h("textarea", { rows: 5, class: "paths", placeholder: "one part per line (or comma separated)\n12\n57\n103" });
-  const listName = h("input", { type: "text", value: "listed", style: { width: "140px" } });
+  draft(dk("by"), by);
+  const splitTest = draft(dk("splitTest"), testInput("spt", "", "e.g. 501 (a logged wafer number)"));
+  const listKey = draft(dk("listKey"), select([["part_id", "PRR part ID"], ["part_txt", "PRR part text"], ["xy", "PRR X/Y"], ["tests", "PTR test result(s)…"]], "part_id", () => { listTests.hidden = listKey.value !== "tests"; }));
+  const listTests = draft(dk("listTests"), h("input", { type: "text", value: "500", placeholder: "e.g. 500 or 501,502,503", style: { width: "170px" }, hidden: listKey.value !== "tests" }));
+  const listBox = draft(dk("listBox"), h("textarea", { rows: 5, class: "paths", placeholder: "one part per line (or comma separated)\n12\n57\n103" }));
+  const listName = draft(dk("listName"), h("input", { type: "text", value: "listed", style: { width: "140px" } }));
   const [dirPath, dirField] = pathField("folder", near(base + "_split"), { title: "Choose output folder", placeholder: "output folder" });
   const groupsBox = h("div");
-  const groups = [{ name: "group1", expr: "site in (1,2)" }, { name: "fails", expr: "not pass" }];
-  const rest = h("input", { type: "text", value: "rest", placeholder: "(leave empty to drop unmatched parts)" });
+  // the groups are kept as they are edited, per dataset
+  const groups = ((S.drafts ||= {})[dk("groups")] ||= [{ name: "group1", expr: "site in (1,2)" }, { name: "fails", expr: "not pass" }]);
+  const rest = draft(dk("rest"), h("input", { type: "text", value: "rest", placeholder: "(leave empty to drop unmatched parts)" }));
   function renderGroups() {
     groupsBox.replaceChildren();
     if (by.value === "test") { groupsBox.append(h("div", { class: "row" }, field("Test", splitTest), field("Parts without a result go to", rest)), h("div", { class: "muted small" }, "One file per distinct result, e.g. split by a datalogged wafer number.")); return; }
@@ -4099,10 +4246,10 @@ function viewExport(el) {
     h("p", { class: "muted" }, "Records are copied byte-for-byte; bin/part-count summaries are recalculated for each file." + (S.filter ? " Only parts matching the current filter are written." : "")),
     h("div", { class: "row" }, field("Split by", by)), groupsBox,
     h("div", { class: "row" }, dirField, h("button", { class: "primary", onclick: async () => {
-      if (!dirPath.value) return toast("Choose an output folder", "bad");
+      if (!(await askPath(dirPath))) return;
       busy("Splitting…");
       try {
-        const r = await api("split", { ds: S.ds, filter: S.filter, by: by.value, groups, rest: rest.value, out_dir: dirPath.value, prefix: base, test: splitTest.value, list: listBox.value, list_key: listKey.value === "tests" ? "tests:" + listTests.value : listKey.value, list_name: listName.value });
+        const r = await api("split", { ds: S.ds, filter: scoped(S.filter), by: by.value, groups, rest: rest.value, out_dir: dirPath.value, prefix: base, test: splitTest.value, list: listBox.value, list_key: listKey.value === "tests" ? "tests:" + listTests.value : listKey.value, list_name: listName.value });
         const t = h("div");
         spOut.replaceChildren(resultLine(`${r.outputs.length} file(s) written to ${r.out_dir}`, r.out_dir), t);
         table(t, [{ key: "name", label: "Output" }, { key: "parts", label: "Parts", num: true }, { key: "good", label: "Good", num: true }, { key: "path", label: "File" }], r.outputs, { search: r.outputs.length > 15 });

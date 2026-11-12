@@ -906,7 +906,7 @@ fn run() -> Result<()> {
             }
             for c in found.conflicts.iter().take(20) {
                 eprintln!(
-                    "warning: IDs disagree, kept as two rows: {} ({} and {})",
+                    "warning: IDs disagree: {} ({} and {})",
                     c.text(),
                     runs[c.other.0].name,
                     runs[c.at.0].name
@@ -956,7 +956,7 @@ fn run() -> Result<()> {
             }
             let s = parttrace::export_audited(&runs, &out, &l.filter, &id_audit)?;
             println!(
-                "{} parts, {} in more than one file, {} rows, {} kept apart -> {}",
+                "{} parts, {} in more than one file, {} rows, {} with IDs that disagree -> {}",
                 s.parts,
                 s.in_several,
                 s.rows,
@@ -1493,6 +1493,7 @@ fn run() -> Result<()> {
                         r_min,
                         offset_pct,
                         min_n: 5,
+                        keys: None,
                     },
                 );
                 println!(

@@ -18,6 +18,87 @@ pub struct Entry {
     pub sets: IndexMap<String, Arc<Vec<bool>>>,
 }
 
+/// The IDs unit correlation pairs parts by, from `key_a` and `key_b` (as the Match page's pickers),
+/// or None for its own part ID or wafer + X/Y.
+fn unit_keys(
+    pp: &P,
+    a: &Dataset,
+    b: &Dataset,
+) -> Result<Option<(data::matching::KeySpec, data::matching::KeySpec)>> {
+    let ka = pp.str("key_a");
+    if ka.trim().is_empty() {
+        return Ok(None);
+    }
+    let kb = pp.str_or("key_b", &ka);
+    Ok(Some((
+        data::matching::KeySpec::parse(&ka, a)?,
+        data::matching::KeySpec::parse(&kb, b)?,
+    )))
+}
+
+/// Two paths name the same file: separators unified, and case ignored on Windows.
+fn same_path(a: &str, b: &str) -> bool {
+    let n = |p: &str| {
+        let p = std::fs::canonicalize(p)
+            .map(|c| c.to_string_lossy().to_string())
+            .unwrap_or_else(|_| p.to_string())
+            .replace('\\', "/");
+        if cfg!(windows) {
+            p.to_lowercase()
+        } else {
+            p
+        }
+    };
+    n(a) == n(b)
+}
+
+/// Where the page stores copies of files dropped on the window (a browser gives a page a dropped
+/// file's contents, never its path).
+fn uploads_dir() -> std::path::PathBuf {
+    crate::desktop::cache_dir().join("uploads")
+}
+
+fn is_upload(p: &str) -> bool {
+    std::path::Path::new(p).starts_with(uploads_dir())
+}
+
+impl Registry {
+    /// Every file an open dataset reads.
+    fn open_paths(&self) -> Vec<(usize, String)> {
+        let v = self.items.read().unwrap();
+        v.iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.as_ref().map(|e| (i, e)))
+            .flat_map(|(i, e)| e.paths.iter().map(move |p| (i, p.clone())))
+            .collect()
+    }
+
+    /// Deletes the dropped-file copies among `paths` that no open dataset reads any more, with
+    /// the folder each was stored in.
+    pub fn drop_uploads(&self, paths: &[String]) {
+        let open = self.open_paths();
+        for p in paths.iter().filter(|p| is_upload(p)) {
+            if open.iter().any(|(_, o)| o == p) {
+                continue;
+            }
+            let path = std::path::Path::new(p);
+            let _ = std::fs::remove_file(path);
+            if let Some(dir) = path.parent().filter(|d| *d != uploads_dir()) {
+                // the folder of one upload: empty once its file is gone
+                let _ = std::fs::remove_dir(dir);
+            }
+        }
+    }
+
+    /// On exit: deletes the dropped-file copies this window opened. Other windows keep theirs; a
+    /// copy left by a crash goes a day later, when the app next starts.
+    pub fn drop_all_uploads(&self) {
+        let paths: Vec<String> = self.open_paths().into_iter().map(|(_, p)| p).collect();
+        self.items.write().unwrap().iter_mut().for_each(|e| *e = None);
+        self.drop_uploads(&paths);
+    }
+}
+
 /// The outcome of matching the parts of two datasets, kept for tracing and
 /// paired (dual) charts.
 pub struct MatchLink {
@@ -242,6 +323,12 @@ impl TestXy {
             None => Some("all".to_string()),
         }
     }
+    /// X and Y as the tests logged them: no offsets, no flips.
+    fn raw_xy(&self, ds: &Dataset, row: usize) -> Option<(i16, i16)> {
+        let (x, y) = (ds.value(self.tx, row), ds.value(self.ty, row));
+        let ok = |v: f64| v.is_finite() && v.abs() < 32767.0;
+        (ok(x) && ok(y)).then(|| (x.round() as i16, y.round() as i16))
+    }
     /// Position within the stepping field: X/Y before the offsets are added.
     fn field_xy(&self, ds: &Dataset, row: usize) -> Option<(i64, i64)> {
         self.tox.or(self.toy)?;
@@ -436,7 +523,10 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             let mut v = reg.items.write().unwrap();
             match v.get_mut(id) {
                 Some(slot) if slot.is_some() => {
-                    *slot = None;
+                    let paths = slot.take().map(|e| e.paths).unwrap_or_default();
+                    drop(v);
+                    // a dropped file's copy goes when nothing reads it any more
+                    reg.drop_uploads(&paths);
                     Ok(json!({"removed": id}))
                 }
                 _ => bail!("dataset {id} not loaded"),
@@ -524,7 +614,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
                 bail!("native dialogs are not available on this platform – type a path instead");
             }
             Ok(
-                json!({"path": crate::desktop::pick_folder(&pp.str_or("title", "Choose a folder")).map(|p| p.to_string_lossy().to_string())}),
+                json!({"path": crate::desktop::pick_folder(&pp.str_or("title", "Choose a folder"), &pp.str("dir")).map(|p| p.to_string_lossy().to_string())}),
             )
         }
         "pick_save" => {
@@ -532,7 +622,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
                 bail!("native dialogs are not available on this platform – type a path instead");
             }
             Ok(
-                json!({"path": crate::desktop::pick_save(&pp.str_or("title", "Save as"), &pp.str("name"), &pp.str("ext")).map(|p| p.to_string_lossy().to_string())}),
+                json!({"path": crate::desktop::pick_save(&pp.str_or("title", "Save as"), &pp.str("name"), &pp.str("ext"), &pp.str("dir")).map(|p| p.to_string_lossy().to_string())}),
             )
         }
         "reveal" => {
@@ -921,6 +1011,25 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             if paths.is_empty() {
                 bail!("no STDF files found ({skipped} other file(s) skipped)");
             }
+            // a file already open (on its own, not merged) is not opened again; merging open files
+            // into one dataset is still allowed
+            let merging = pp.bool("merge", false) && paths.len() > 1;
+            let open = if merging { vec![] } else { reg.open_paths() };
+            let single = |id: usize| open.iter().filter(|(i, _)| *i == id).count() == 1;
+            let mut already = vec![];
+            let paths: Vec<String> = paths
+                .into_iter()
+                .filter(|p| match open.iter().find(|(i, o)| single(*i) && same_path(o, p)) {
+                    Some((i, _)) => {
+                        already.push(*i);
+                        false
+                    }
+                    None => true,
+                })
+                .collect();
+            if paths.is_empty() {
+                return Ok(json!({"ids": already.clone(), "errors": [], "skipped": skipped, "already": already}));
+            }
             let sort = pp.str("sort");
             let opt = LoadOptions {
                 dedup: match pp.str("dedup").as_str() {
@@ -983,7 +1092,46 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             }
             let paths = ok_paths;
             reg.session.remember(&paths);
-            Ok(json!({"ids": ids, "errors": errors, "skipped": skipped}))
+            Ok(json!({"ids": ids, "errors": errors, "skipped": skipped, "already": already}))
+        }
+        // a file about to be dropped on the window that is open already, from an earlier drop:
+        // the same name and size as an open copy
+        "open_upload" => {
+            let name = pp.str("name");
+            let size = pp.0.get("size").and_then(|v| v.as_u64()).unwrap_or(u64::MAX);
+            let safe = crate::server::safe_name(&name);
+            let hit = reg.open_paths().into_iter().find(|(i, p)| {
+                let path = std::path::Path::new(p);
+                is_upload(p)
+                    && reg.open_paths().iter().filter(|(j, _)| j == i).count() == 1
+                    && path.file_name().is_some_and(|n| n.to_string_lossy() == safe)
+                    && std::fs::metadata(path).is_ok_and(|m| m.len() == size)
+            });
+            Ok(json!({"ds": hit.map(|(i, _)| i)}))
+        }
+        // how many parts of a file have each ID (an ID picker shows it)
+        "id_coverage" => {
+            let id = pp.usize("ds", 0);
+            let (ds, _) = reg.get(id)?;
+            let empty = vec![];
+            let keys = p.get("keys").and_then(|v| v.as_array()).unwrap_or(&empty);
+            let out: Vec<Value> = keys
+                .iter()
+                .filter_map(|k| k.as_str())
+                .map(|spec| {
+                    let parts = data::matching::KeySpec::parse(spec, &ds).map_or(0, |k| {
+                        (0..ds.n_parts())
+                            .filter(|&r| {
+                                k.key(&ds, r).is_some_and(|v| {
+                                    crate::analysis::retest::placeholder(&v).is_none()
+                                })
+                            })
+                            .count()
+                    });
+                    json!({"key": spec, "parts": parts})
+                })
+                .collect();
+            Ok(json!({"parts": ds.n_parts(), "keys": out}))
         }
         "datalog" => {
             let id = pp.usize("ds", 0);
@@ -1156,10 +1304,11 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             } else {
                 None
             };
-            let custom = |r: usize| -> Option<(String, i16, i16)> {
-                let t = txy.as_ref()?;
-                let (x, y) = t.xy(&ds, r)?;
-                Some((t.wafer(&ds, r).unwrap_or_default(), x, y))
+            // wafer, X and Y as the tests logged them: no offsets, as an engineer reads them
+            let custom = |r: usize| -> Vec<(String, i16, i16)> {
+                let Some(t) = txy.as_ref() else { return vec![] };
+                let w = t.wafer(&ds, r).unwrap_or_default();
+                t.raw_xy(&ds, r).map(|(x, y)| (w, x, y)).into_iter().collect()
             };
             let custom_ref: Option<crate::datalog::CustomXy> =
                 if txy.is_some() { Some(&custom) } else { None };
@@ -1178,8 +1327,11 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             Ok(json!({
                 "rows": rows.iter().take(limit).map(|&i| {
                     let mut v = part_json(&ds, i);
-                    if let Some((w, x, y)) = custom(i) {
-                        v["test_xy"] = json!({"wafer": w, "x": x, "y": y});
+                    if let Some(t) = txy.as_ref() {
+                        let w = t.wafer(&ds, i).unwrap_or_default();
+                        if let Some((x, y)) = t.raw_xy(&ds, i) {
+                            v["test_xy"] = json!({"wafer": w, "raw": [x, y]});
+                        }
                     }
                     v
                 }).collect::<Vec<_>>(),
@@ -1346,8 +1498,12 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
                 r_min: pp.f64("r_min", 0.9),
                 offset_pct: pp.f64("offset_pct", 5.0),
                 min_n: 5,
+                keys: unit_keys(&pp, &da, &db)?,
             };
-            let rep = correlation::unit_correlation(&da, &ra, &db, &rb, &opt);
+            let mut rep = correlation::unit_correlation(&da, &ra, &db, &rb, &opt);
+            if let Some((ka, kb)) = &opt.keys {
+                rep.match_by = format!("{} ↔ {}", ka.describe(&da), kb.describe(&db));
+            }
             let first = rep
                 .tests
                 .first()
@@ -1769,6 +1925,7 @@ fn chart(reg: &Registry, pp: &P) -> Result<Value> {
                 r_min: pp.f64("r_min", 0.9),
                 offset_pct: pp.f64("offset_pct", 5.0),
                 min_n: 5,
+                keys: unit_keys(pp, &ds, &db)?,
             };
             let key = pp.str("test");
             let t = test_ref(&ds, &key)?;
@@ -2052,7 +2209,8 @@ fn candidate_sets_op(reg: &Registry, pp: &P) -> Result<Value> {
     let m = match_parts(&da, &ra, &ka, &db, &rb, &kb);
     // classify each matched unit by its file-2 value
     let mut class: HashMap<&str, bool> = HashMap::new(); // key → in range
-    let (mut cand_pairs, mut marg_pairs) = (vec![], vec![]);
+    let (mut cand_pairs, mut marg_pairs): (Vec<(usize, usize, String)>, Vec<(usize, usize, String)>) =
+        (vec![], vec![]);
     for p in &m.pairs {
         let inside = range
             .as_ref()
@@ -2094,11 +2252,34 @@ fn candidate_sets_op(reg: &Registry, pp: &P) -> Result<Value> {
             None => {}
         }
     }
+    // candidates handed over from another page (e.g. Retest trace's $rt_bad_candidate, found over
+    // the whole retest chain): kept as they are, not found again from file 2
+    let keep = pp.str("keep_set").trim().trim_start_matches('$').to_string();
+    if !keep.is_empty() {
+        let Some(ks) = reg.set(a, &keep) else {
+            bail!("part set ${keep} is not in {}: run the page that makes it again", reg.name(a))
+        };
+        cand = vec![false; da.n_parts()];
+        for &r in &ra {
+            cand[r] = ks[r];
+        }
+        marg = vec![false; da.n_parts()];
+        cand_pairs.retain(|p| ks[p.0]);
+        marg_pairs.clear();
+        cand_b = vec![false; db.n_parts()];
+        marg_b = vec![false; db.n_parts()];
+        for p in &cand_pairs {
+            cand_b[p.1] = true;
+        }
+    }
+    // parts another page leaves out of every group (e.g. $rt_passed_later)
+    let leave = pp.str("leave_set").trim().trim_start_matches('$').to_string();
+    let left_out = (!leave.is_empty()).then(|| reg.set(a, &leave)).flatten();
     // good in file 1, passing in file 2, and not among the bad
     let rp = reg.rows(b, &db, &pp.str_or("pass_b", "pass"))?;
     let mc = match_parts(&da, &ra, &ka, &db, &rp, &kb);
     let conf: Vec<bool> = (0..da.n_parts())
-        .map(|r| mc.in_a[r] && !cand[r] && !marg[r])
+        .map(|r| mc.in_a[r] && !cand[r] && !marg[r] && !left_out.as_ref().is_some_and(|s| s[r]))
         .collect();
     let conf_b: Vec<bool> = (0..db.n_parts())
         .map(|r| mc.in_b[r] && !cand_b[r] && !marg_b[r])
@@ -2145,7 +2326,7 @@ fn candidate_sets_op(reg: &Registry, pp: &P) -> Result<Value> {
         "link": link, "name": name, "marginal": marg_name, "confirmed": conf_name, "a": a, "b": b,
         "key_a": m.key_a, "key_b": m.key_b, "n_a": ra.len(), "n_b": rb.len(), "only_b": m.only_b,
         "matched": m.pairs.len(), "pairs": n_cand, "n_cand": n_cand, "n_marginal": n_marg, "n_confirmed": n_conf,
-        "n_pass_b": rp.len(), "include_marginal": include,
+        "n_pass_b": rp.len(), "include_marginal": include, "kept": (!keep.is_empty()).then_some(keep.clone()),
         "range": range.as_ref().map(|(t, r)| json!({"test": db.tests[*t].key, "units": disp_units, "stored_units": db.tests[*t].units,
             "res_scal": db.tests[*t].res_scal, "lo": r.lo.map(|v| n(v * disp)), "hi": r.hi.map(|v| n(v * disp))})),
         "rows": cand_pairs.iter().take(limit).map(row).collect::<Vec<_>>(),
@@ -3187,10 +3368,10 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
 
     // bad candidates: good in run 1, then failing the (first) traced test on
     // a retest of good parts and never passing after ($rt_bad_candidate);
-    // passing again later ($rt_marginal); passing every retest of good parts
+    // passing again later ($rt_passed_later); passing every retest of good parts
     // ($rt_confirmed_good). Marked in run 1, where their values were good.
     let mut cand_sets: IndexMap<&str, Vec<bool>> =
-        ["rt_bad_candidate", "rt_marginal", "rt_confirmed_good"]
+        ["rt_bad_candidate", "rt_passed_later", "rt_confirmed_good"]
             .into_iter()
             .map(|n| (n, vec![false; d1.n_parts()]))
             .collect();
@@ -3210,7 +3391,7 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
             .copied()
             .find(|&k| p.status[k] == Status::Fail && p.rows[k].is_some_and(|r| fails_on(0, k, r)));
         let set = match first_bad {
-            Some(k) if p.status[k + 1..].contains(&Status::Pass) => "rt_marginal",
+            Some(k) if p.status[k + 1..].contains(&Status::Pass) => "rt_passed_later",
             Some(_) => "rt_bad_candidate",
             None if ks.iter().all(|&k| p.status[k] == Status::Pass) => "rt_confirmed_good",
             None => {
@@ -3222,7 +3403,7 @@ fn retest_op(reg: &Registry, pp: &P) -> Result<Value> {
     }
     let cand_count = |n: &str| cand_sets[n].iter().filter(|&&b| b).count();
     let candidates = json!({"good_runs": good_runs.iter().collect::<Vec<_>>(), "n_cand": cand_count("rt_bad_candidate"),
-        "n_marginal": cand_count("rt_marginal"), "n_confirmed": cand_count("rt_confirmed_good"), "n_other_fail": other_fail});
+        "n_marginal": cand_count("rt_passed_later"), "n_confirmed": cand_count("rt_confirmed_good"), "n_other_fail": other_fail});
     for (name, f) in cand_sets {
         reg.put_set(ids[0], name, f);
     }
@@ -4235,7 +4416,7 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
         .conflicts
         .iter()
         .take(50)
-        .map(|c| json!({"text": c.text(), "files": [id(c.at.0), id(c.other.0)]}))
+        .map(|c| json!({"kind": c.kind, "text": c.text(), "files": [id(c.at.0), id(c.other.0)]}))
         .collect();
     Ok(json!({
         "titles": d.titles,
@@ -4245,6 +4426,7 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
         "in_several": d.in_several,
         "by_id": d.by_id,
         "conflicts": d.conflicts.len(),
+        "joined": d.conflicts.iter().filter(|c| c.kind == "joined").count(),
         "first_conflicts": conflicts,
     }))
 }

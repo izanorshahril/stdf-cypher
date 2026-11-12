@@ -103,14 +103,9 @@ async fn export_csv(
 /// Largest upload the dashboard stores. The page only sends STDF files, so this is a backstop against a runaway write.
 const MAX_UPLOAD: u64 = 8 << 30;
 
-/// Receive a dropped file (raw body) and store it in the cache folder.
-async fn upload(Query(q): Query<HashMap<String, String>>, body: Body) -> Response {
-    let name = q
-        .get("name")
-        .cloned()
-        .unwrap_or_else(|| "upload.stdf".into());
-    let safe: String = name
-        .chars()
+/// A dropped file's name as its stored copy is named.
+pub fn safe_name(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || "._-".contains(c) {
                 c
@@ -118,7 +113,16 @@ async fn upload(Query(q): Query<HashMap<String, String>>, body: Body) -> Respons
                 '_'
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Receive a dropped file (raw body) and store it in the cache folder.
+async fn upload(Query(q): Query<HashMap<String, String>>, body: Body) -> Response {
+    let name = q
+        .get("name")
+        .cloned()
+        .unwrap_or_else(|| "upload.stdf".into());
+    let safe = safe_name(&name);
     let dir = crate::desktop::cache_dir().join("uploads");
     let res: Result<String> = async {
         tokio::fs::create_dir_all(&dir).await?;
@@ -303,6 +307,7 @@ pub async fn run(
     guard: Guard,
 ) -> Result<()> {
     let watch = reg.clone();
+    let done = reg.clone();
     axum::serve(listener, router(reg, guard))
         .with_graceful_shutdown(async move {
             let ctrl_c = tokio::signal::ctrl_c();
@@ -320,6 +325,8 @@ pub async fn run(
             }
         })
         .await?;
+    // copies of files dropped on this window are not needed once it closes
+    done.drop_all_uploads();
     Ok(())
 }
 

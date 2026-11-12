@@ -51,6 +51,23 @@ pub fn id_title(k: &KeySpec, ds: &Dataset) -> String {
     }
 }
 
+/// How far an ID is trusted when two disagree, lowest first. Wafer, X and Y are read from the part's
+/// own memory (EEPROM) during the test, so they decide; they are wrong only when that memory is
+/// corrupt, and an all-zeros or all-ones value is a placeholder that matches nothing. A WXY test
+/// comes from the same memory. PRR part text is logged for more parts (it does not depend on the
+/// test sequence) but comes from a camera reading the code on the device as the handler picks it
+/// up, which can fall out of step and land on the wrong part.
+fn trust_rank(k: &KeySpec) -> u8 {
+    match k {
+        KeySpec::WxyTests { .. } => 0,
+        KeySpec::Tests(_) => 1,
+        KeySpec::PartTxt => 2,
+        KeySpec::WaferXy => 3,
+        KeySpec::Xy => 4,
+        KeySpec::PartId => 5,
+    }
+}
+
 /// The columns of each file.
 const GROUP_TITLES: [&str; 5] = [
     "Part ID",
@@ -142,9 +159,12 @@ pub struct RunStats {
     pub with: Vec<usize>,
 }
 
-/// Two tests that share one ID but disagree on another, so they were not merged.
+/// Two tests that share one ID but disagree on another. `joined`: the shared ID is the more trusted
+/// one (W,X,Y over WXY over part text), so they are one part and the other ID is marked; `apart`:
+/// the ID that differs is the more trusted one, so they are two parts.
 #[derive(Debug, Clone, Serialize)]
 pub struct Conflict {
+    pub kind: &'static str,
     /// the ID they share, and its value
     pub by: String,
     pub value: String,
@@ -159,10 +179,27 @@ pub struct Conflict {
 
 impl Conflict {
     pub fn text(&self) -> String {
+        let how = if self.kind == "joined" {
+            format!("one part, by {}", self.by)
+        } else {
+            format!("two parts, by {}", self.field)
+        };
         format!(
-            "{} {}: {} {} and {}",
+            "{} {}: {} {} and {}; {how}",
             self.by, self.value, self.field, self.theirs, self.mine
         )
+    }
+
+    /// The note on the part's row in the report.
+    pub fn note(&self) -> String {
+        if self.kind == "joined" {
+            format!(
+                "matched by {}; {} {} also logged",
+                self.by, self.field, self.mine
+            )
+        } else {
+            format!("same {} as another row, other {}", self.by, self.field)
+        }
     }
 }
 
@@ -173,7 +210,7 @@ pub struct Summary {
     pub parts: usize,
     /// parts found in more than one file
     pub in_several: usize,
-    /// tests kept apart because their IDs disagree
+    /// tests whose IDs disagree: joined by the more trusted ID, or kept apart
     pub conflicts: usize,
     /// problems the ID audit found, listed on their own sheet
     pub id_problems: usize,
@@ -241,6 +278,13 @@ fn ids_of(run: &Run, n: usize, r: usize) -> (Vec<Option<String>>, Vec<Option<Str
 fn collect(runs: &[Run], audit: &Audit) -> Parts {
     let titles = id_titles(runs);
     let n = titles.len();
+    // the ID positions, most trusted first
+    let mut trust: Vec<usize> = (0..n).collect();
+    trust.sort_by_key(|&i| {
+        runs.iter()
+            .find_map(|r| r.keys.get(i).and_then(Option::as_ref))
+            .map_or(u8::MAX, trust_rank)
+    });
     let mut entries: Vec<Entry> = vec![];
     let mut index: Vec<HashMap<String, Vec<usize>>> = vec![HashMap::new(); n];
     let mut stats = Vec::with_capacity(runs.len());
@@ -298,13 +342,47 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
                 }
             }
             cands.sort_unstable();
-            let (fit, clash): (Vec<usize>, Vec<usize>) =
-                cands.iter().partition(|&&c| agree(&entries[c].vals, &ids));
-            let target = match fit.first() {
-                Some(&t) => {
+            // a part an ID points at is this part unless a more trusted ID says otherwise
+            let differs = |e: &[Entry], c: usize, j: usize| matches!((&ids[j], &e[c].vals[j]), (Some(a), Some(b)) if a != b);
+            let mut pick = None;
+            'pick: for (at, &i) in trust.iter().enumerate() {
+                let Some(v) = &ids[i] else { continue };
+                let by_it: Vec<usize> = cands
+                    .iter()
+                    .copied()
+                    .filter(|&c| {
+                        entries[c].vals[i].as_ref() == Some(v)
+                            && !trust[..at].iter().any(|&j| differs(&entries, c, j))
+                    })
+                    .collect();
+                // a part every ID agrees with first
+                if let Some(&c) = by_it
+                    .iter()
+                    .find(|&&c| !trust.iter().any(|&j| differs(&entries, c, j)))
+                {
+                    pick = Some((c, i));
+                    break 'pick;
+                }
+                // else the trusted ID overrides a less trusted one, but only when it points at
+                // one part and that part is not in this file under the other value: an ID on
+                // several parts, or twice in one file, is not unique (e.g. X and Y without their
+                // offsets), so it decides nothing
+                if let [c] = by_it[..] {
+                    if !entries[c].hits.iter().any(|h| h.0 == k as u32) {
+                        pick = Some((c, i));
+                        break 'pick;
+                    }
+                }
+            }
+            let target = match pick {
+                Some((t, by)) => {
                     // parts found by different IDs that turn out to be one: merge them
-                    for &c in &fit[1..] {
-                        if !agree(&entries[t].vals, &entries[c].vals) {
+                    for &c in &cands {
+                        if c == t
+                            || entries[c].into.is_some()
+                            || !agree(&entries[c].vals, &ids)
+                            || !agree(&entries[t].vals, &entries[c].vals)
+                        {
                             continue;
                         }
                         let other = std::mem::take(&mut entries[c].hits);
@@ -323,39 +401,55 @@ fn collect(runs: &[Run], audit: &Audit) -> Parts {
                         e.flagged |= flagged;
                         e.conflict |= conflict;
                     }
+                    // joined by its most trusted ID while a less trusted one differs, e.g. the
+                    // same W,X,Y with another part text (a part text recorded on the wrong part)
+                    if let Some(&field) = trust.iter().find(|&&j| differs(&entries, t, j)) {
+                        entries[t].conflict = true;
+                        let at = entries[t].hits.last().copied().unwrap_or_default();
+                        conflicts.push(Conflict {
+                            kind: "joined",
+                            by: titles[by].clone(),
+                            value: entries[t].texts[by].clone().unwrap_or_default(),
+                            field: titles[field].clone(),
+                            mine: ids[field].clone().unwrap_or_default(),
+                            theirs: entries[t].vals[field].clone().unwrap_or_default(),
+                            at: (k, r),
+                            other: (at.0 as usize, at.1 as usize),
+                        });
+                    }
                     t
                 }
                 None => {
                     entries.push(Entry {
                         vals: vec![None; n],
                         texts: vec![None; n],
-                        follows: clash.first().copied(),
+                        follows: cands.first().copied(),
                         ..Default::default()
                     });
                     entries.len() - 1
                 }
             };
-            // kept apart: it shares an ID with a part but disagrees on another, and no part fits.
-            // (One that joins its part while an ID also points at another part is an ID on two
-            // parts: the ID audit lists those.)
-            for &c in clash.iter().take(usize::from(fit.is_empty())) {
-                entries[c].conflict = true;
-                entries[target].conflict = true;
-                let by = (0..n).find(|&i| ids[i].is_some() && ids[i] == entries[c].vals[i]);
-                let field = (0..n).find(
-                    |&i| matches!((&ids[i], &entries[c].vals[i]), (Some(a), Some(b)) if a != b),
-                );
-                if let (Some(by), Some(field)) = (by, field) {
-                    let at = entries[c].hits.last().copied().unwrap_or_default();
-                    conflicts.push(Conflict {
-                        by: titles[by].clone(),
-                        value: entries[c].texts[by].clone().unwrap_or_default(),
-                        field: titles[field].clone(),
-                        mine: ids[field].clone().unwrap_or_default(),
-                        theirs: entries[c].vals[field].clone().unwrap_or_default(),
-                        at: (k, r),
-                        other: (at.0 as usize, at.1 as usize),
-                    });
+            // kept apart: it shares an ID with a part whose more trusted ID differs, e.g. the same
+            // part text with another W,X,Y
+            if pick.is_none() {
+                if let Some(&c) = cands.first() {
+                    entries[c].conflict = true;
+                    entries[target].conflict = true;
+                    let by = (0..n).find(|&i| ids[i].is_some() && ids[i] == entries[c].vals[i]);
+                    let field = trust.iter().copied().find(|&j| differs(&entries, c, j));
+                    if let (Some(by), Some(field)) = (by, field) {
+                        let at = entries[c].hits.last().copied().unwrap_or_default();
+                        conflicts.push(Conflict {
+                            kind: "apart",
+                            by: titles[by].clone(),
+                            value: entries[c].texts[by].clone().unwrap_or_default(),
+                            field: titles[field].clone(),
+                            mine: ids[field].clone().unwrap_or_default(),
+                            theirs: entries[c].vals[field].clone().unwrap_or_default(),
+                            at: (k, r),
+                            other: (at.0 as usize, at.1 as usize),
+                        });
+                    }
                 }
             }
             let e = &mut entries[target];
@@ -596,7 +690,7 @@ fn write_book(
     }
     let mut notes: HashMap<usize, String> = HashMap::new();
     for c in &conflicts {
-        let note = format!("same {} as another row, other {}", c.by, c.field);
+        let note = c.note();
         for (k, r) in [c.at, c.other] {
             if let Some(&i) = part_of.get(&(k as u32, r as u32)) {
                 notes.entry(i).or_insert_with(|| note.clone());
@@ -1844,7 +1938,7 @@ mod tests {
         assert_eq!(f.conflicts.len(), 1);
         assert_eq!(
             f.conflicts[0].text(),
-            "Part_Text P1: PTR 1 3001002 and 3005005"
+            "Part_Text P1: W,X,Y W3X1Y2 and W3X5Y5; two parts, by W,X,Y"
         );
         let s = export(&runs, &book, "").unwrap();
         assert_eq!((s.parts, s.conflicts), (3, 1));
@@ -1927,5 +2021,81 @@ mod tests {
         export(&runs, &book, "").unwrap();
         let x = part(&book, "xl/worksheets/sheet1.xml");
         assert_eq!(cell(&x, "B2").unwrap(), "W,X,Y");
+    }
+
+    #[test]
+    fn w_x_y_decides_when_the_part_text_was_recorded_on_the_wrong_part() {
+        let d = tempfile::tempdir().unwrap();
+        let book = d.path().join("trace.xlsx");
+        let nan = f32::NAN;
+        let one = with_ids(&[
+            ("P1", 3001002.0, 3.0, 1.0, 2.0),
+            ("P2", 3001003.0, 3.0, 1.0, 3.0),
+        ]);
+        // the handler's camera fell a part behind: P1's die logged with P2's text
+        let two = with_ids(&[("P2", 3001002.0, 3.0, 1.0, 2.0)]);
+        let runs = [by("one", &one, &IDS), by("two", &two, &IDS)];
+        let f = detect(&runs);
+        assert_eq!(f.in_several, 1);
+        assert_eq!(f.conflicts.len(), 1);
+        assert_eq!(f.conflicts[0].kind, "joined");
+        assert_eq!(
+            f.conflicts[0].text(),
+            "W,X,Y W3X1Y2: Part_Text P1 and P2; one part, by W,X,Y"
+        );
+        let s = export(&runs, &book, "").unwrap();
+        assert_eq!((s.parts, s.rows, s.conflicts), (2, 2, 1));
+        let x = part(&book, "xl/worksheets/sheet1.xml");
+        // P1's row holds the second file's test, marked; P2 stays alone
+        assert_eq!(cell(&x, "A3").unwrap(), "P1");
+        assert_eq!(cell(&x, "J3").unwrap(), "1");
+        assert!(cell(&x, "D3").unwrap().starts_with("matched by W,X,Y"));
+        assert_eq!(cell(&x, "A4").unwrap(), "P2");
+        assert!(!x.contains(r#"<c r="J4""#));
+        // WXY outranks part text too, and W,X,Y outranks WXY
+        let three = with_ids(&[("P2", 3001002.0, nan, nan, nan)]);
+        let f = detect(&[by("one", &one, &IDS), by("three", &three, &IDS)]);
+        assert_eq!((f.in_several, f.conflicts[0].kind), (1, "joined"));
+        let four = with_ids(&[("", 3001003.0, 3.0, 1.0, 2.0)]);
+        let f = detect(&[by("one", &one, &IDS), by("four", &four, &IDS)]);
+        assert_eq!(
+            f.conflicts[0].text(),
+            "W,X,Y W3X1Y2: PTR 1 3001002 and 3001003; one part, by W,X,Y"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_w_x_y_of_all_ones_matches_nothing_and_part_text_takes_over() {
+        let one = with_ids(&[
+            ("P1", f32::NAN, 255.0, 255.0, 255.0),
+            ("P2", f32::NAN, 255.0, 255.0, 255.0),
+        ]);
+        let two = with_ids(&[("P1", f32::NAN, 3.0, 1.0, 2.0)]);
+        let f = detect(&[by("one", &one, &IDS), by("two", &two, &IDS)]);
+        assert_eq!(
+            (f.in_several, f.conflicts.len(), f.files[0].repeats),
+            (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_w_x_y_on_several_parts_decides_nothing() {
+        // raw X and Y without their offsets: one W,X,Y on two dies of each file
+        let one = with_ids(&[
+            ("P1", f32::NAN, 3.0, 1.0, 2.0),
+            ("P2", f32::NAN, 3.0, 1.0, 2.0),
+        ]);
+        let two = with_ids(&[
+            ("P2", f32::NAN, 3.0, 1.0, 2.0),
+            ("P1", f32::NAN, 3.0, 1.0, 2.0),
+        ]);
+        let runs = [by("one", &one, &IDS), by("two", &two, &IDS)];
+        let f = detect(&runs);
+        // P1 and P2 are kept apart in each file and found again by their part texts
+        assert_eq!(f.in_several, 2);
+        assert!(f.conflicts.iter().all(|c| c.kind == "apart"));
+        let d = tempfile::tempdir().unwrap();
+        let s = export(&runs, &d.path().join("t.xlsx"), "").unwrap();
+        assert_eq!((s.parts, s.rows), (2, 2));
     }
 }

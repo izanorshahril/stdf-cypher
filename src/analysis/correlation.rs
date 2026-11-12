@@ -24,6 +24,8 @@ pub struct UnitCorrOptions {
     /// max |mean diff| as % of limit range (or in sigma of A when no limits)
     pub offset_pct: f64,
     pub min_n: usize,
+    /// pair parts by these IDs (file A's, file B's) instead of `match_by`
+    pub keys: Option<(crate::data::matching::KeySpec, crate::data::matching::KeySpec)>,
 }
 
 impl Default for UnitCorrOptions {
@@ -33,6 +35,7 @@ impl Default for UnitCorrOptions {
             r_min: 0.9,
             offset_pct: 5.0,
             min_n: 5,
+            keys: None,
         }
     }
 }
@@ -91,7 +94,9 @@ pub fn unit_correlation(
     rows_b: &[usize],
     opt: &UnitCorrOptions,
 ) -> UnitCorrReport {
-    let by = if opt.match_by == "auto" {
+    let by = if opt.keys.is_some() {
+        "keys"
+    } else if opt.match_by == "auto" {
         let has_xy = rows_a.iter().take(50).any(|&r| a.parts[r].x != -32768);
         if has_xy {
             "xy"
@@ -102,13 +107,24 @@ pub fn unit_correlation(
         opt.match_by.as_str()
     };
     // last occurrence wins (final retest)
+    // a part without the ID, or with a placeholder, pairs with nothing
+    let key = |ds: &Dataset, r: usize, k: Option<&crate::data::matching::KeySpec>| match k {
+        Some(k) => k
+            .key(ds, r)
+            .filter(|v| crate::analysis::retest::placeholder(v).is_none()),
+        None => Some(unit_key(ds, r, by)),
+    };
     let mut ma: HashMap<String, usize> = HashMap::new();
     for &r in rows_a {
-        ma.insert(unit_key(a, r, by), r);
+        if let Some(k) = key(a, r, opt.keys.as_ref().map(|k| &k.0)) {
+            ma.insert(k, r);
+        }
     }
     let mut mb: HashMap<String, usize> = HashMap::new();
     for &r in rows_b {
-        mb.insert(unit_key(b, r, by), r);
+        if let Some(k) = key(b, r, opt.keys.as_ref().map(|k| &k.1)) {
+            mb.insert(k, r);
+        }
     }
     let mut pairs: Vec<(usize, usize)> = ma
         .iter()

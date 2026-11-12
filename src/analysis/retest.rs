@@ -91,6 +91,10 @@ pub fn placeholder(v: &str) -> Option<String> {
     if comps.iter().all(|c| ONES.contains(c)) {
         return Some("all ones".into());
     }
+    // a byte of all ones in every part of a wafer, X, Y read from a corrupt memory
+    if comps.len() > 1 && comps.iter().all(|c| *c == "255") {
+        return Some("all ones".into());
+    }
     let mut ch = v.chars();
     let c = ch.next()?;
     (v.chars().count() >= 8 && ch.all(|x| x == c)).then(|| format!("'{c}' repeated"))

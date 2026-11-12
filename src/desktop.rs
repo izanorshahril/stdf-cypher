@@ -476,11 +476,20 @@ mod dialogs {
         }
         d.pick_files().unwrap_or_default()
     }
-    pub fn pick_folder(title: &str) -> Option<PathBuf> {
-        base().set_title(title).pick_folder()
+    /// Starts in `dir` when it is an existing folder.
+    fn at(d: rfd::FileDialog, dir: &str) -> rfd::FileDialog {
+        let p = std::path::Path::new(dir);
+        if !dir.is_empty() && p.is_dir() {
+            d.set_directory(p)
+        } else {
+            d
+        }
     }
-    pub fn pick_save(title: &str, name: &str, ext: &str) -> Option<PathBuf> {
-        let mut d = base().set_title(title).set_file_name(name);
+    pub fn pick_folder(title: &str, dir: &str) -> Option<PathBuf> {
+        at(base().set_title(title), dir).pick_folder()
+    }
+    pub fn pick_save(title: &str, name: &str, ext: &str, dir: &str) -> Option<PathBuf> {
+        let mut d = at(base().set_title(title).set_file_name(name), dir);
         if !ext.is_empty() {
             d = d.add_filter(ext.to_uppercase(), &[ext]);
         }
@@ -494,10 +503,10 @@ mod dialogs {
     pub fn pick_files(_dir: Option<PathBuf>) -> Vec<PathBuf> {
         vec![]
     }
-    pub fn pick_folder(_title: &str) -> Option<PathBuf> {
+    pub fn pick_folder(_title: &str, _dir: &str) -> Option<PathBuf> {
         None
     }
-    pub fn pick_save(_title: &str, _name: &str, _ext: &str) -> Option<PathBuf> {
+    pub fn pick_save(_title: &str, _name: &str, _ext: &str, _dir: &str) -> Option<PathBuf> {
         None
     }
 }

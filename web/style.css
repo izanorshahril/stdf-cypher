@@ -369,3 +369,9 @@ tr.row-warn td { background: color-mix(in srgb, var(--warn) 9%, transparent); }
 .id-checks { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
 .id-check { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 .id-check.dim { opacity: 0.6; }
+
+/* which parts an action uses */
+.scope-line { margin: 6px 0 10px; }
+/* part search hits */
+.hit-list { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin: 8px 0; }
+.hit-list .hit { text-align: left; }
