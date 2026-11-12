@@ -84,7 +84,7 @@ impl Audit {
 /// e.g. 00000000 or FFFFFFFF).
 pub fn placeholder(v: &str) -> Option<String> {
     const ONES: &[&str] = &["-1", "65535", "4294967295", "2147483647", "-2147483648", "18446744073709551615", "-32768", "32767"];
-    let comps: Vec<&str> = v.split('|').collect();
+    let comps = crate::data::matching::components(v);
     if comps.iter().all(|c| *c == "0") {
         return Some("all zeros".into());
     }

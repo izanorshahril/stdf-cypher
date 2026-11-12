@@ -611,7 +611,7 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
                         .split(['\n', '\r', ',', '\t'])
                         .map(|s| s.trim())
                         .filter(|s| !s.is_empty())
-                        .map(data::matching::norm_key)
+                        .map(|s| key.norm_input(s))
                         .collect();
                     if wanted.is_empty() {
                         bail!("paste at least one part ID or value");
@@ -1037,16 +1037,34 @@ pub fn run(reg: &Registry, op: &str, p: &Value) -> Result<Value> {
             let yf = summary::yield_by(&ds, &r, "file");
             let fp: Vec<summary::FailPareto> =
                 summary::fail_pareto(&ds, &r).into_iter().take(50).collect();
-            let mut figs = json!({
-                "hbin": viz::bin_pareto(&hb, true),
-                "sbin": viz::bin_pareto(&sb, false),
-                "site": viz::yield_bar(&ys, "Yield by site", "site"),
-            });
+            // bars split by site, when asked and there is more than one site
+            let by_site = pp.bool("by_site", false) && ys.len() > 1;
+            let mut figs = if by_site {
+                json!({
+                    "hbin": viz::bin_pareto_by_site(&ds, &r, true),
+                    "sbin": viz::bin_pareto_by_site(&ds, &r, false),
+                    "site": viz::yield_bar(&ys, "Yield by site", "site"),
+                })
+            } else {
+                json!({
+                    "hbin": viz::bin_pareto(&hb, true),
+                    "sbin": viz::bin_pareto(&sb, false),
+                    "site": viz::yield_bar(&ys, "Yield by site", "site"),
+                })
+            };
             if ds.wafers.len() > 1 {
-                figs["wafer"] = viz::yield_bar(&yw, "Yield by wafer", "wafer");
+                figs["wafer"] = if by_site {
+                    viz::yield_bar_by_site(&ds, &r, "Yield by wafer and site", "wafer")
+                } else {
+                    viz::yield_bar(&yw, "Yield by wafer", "wafer")
+                };
             }
             if ds.sources.len() > 1 {
-                figs["file"] = viz::yield_bar(&yf, "Yield by file", "file");
+                figs["file"] = if by_site {
+                    viz::yield_bar_by_site(&ds, &r, "Yield by file and site", "file")
+                } else {
+                    viz::yield_bar(&yf, "Yield by file", "file")
+                };
             }
             if !ds.wafers.is_empty() {
                 figs["wafermap"] =
@@ -4163,9 +4181,23 @@ fn id_list(v: Option<&Value>) -> Vec<usize> {
 /// share none; files that do (retests) can still be merged.
 /// Which open files hold the same parts. Datasets made in the app are left out: they are subsets of
 /// a file that is open anyway, so they would always look linked to it.
+/// The ID specs of a part trace: `keys` as a list (["part_txt", "tests:80149", ...]), or one `key`.
+fn part_trace_keys(pp: &P) -> Vec<String> {
+    match pp.0.get("keys").and_then(|v| v.as_array()) {
+        Some(list) => list
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        None => vec![pp.str_or("key", "part_txt")],
+    }
+}
+
+/// Which open files hold the same parts, by any of the IDs `keys`, and where the IDs disagree.
 fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
-    use crate::parttrace::{detect, key_for, Candidate};
-    let key = pp.str_or("key", "part_txt");
+    use crate::parttrace::{detect, key_for, Run};
+    let specs = part_trace_keys(pp);
     let filter = pp.str("filter");
     let open: Vec<(usize, String, Arc<Dataset>)> = {
         let v = reg.items.read().unwrap();
@@ -4177,35 +4209,43 @@ fn part_trace_detect_op(reg: &Registry, pp: &P) -> Result<Value> {
             })
             .collect()
     };
-    let keys: Vec<(data::matching::KeySpec, bool)> =
-        open.iter().map(|(_, _, ds)| key_for(&key, ds)).collect();
-    let cands: Vec<Candidate> = open
+    let runs: Vec<Run> = open
         .iter()
-        .zip(&keys)
-        .map(|((id, _, ds), (key, _))| {
-            Ok(Candidate {
+        .map(|(id, name, ds)| {
+            Ok(Run {
+                name: name.clone(),
                 ds,
-                key: key.clone(),
+                keys: specs.iter().map(|k| key_for(k, ds)).collect(),
                 rows: reg.rows(*id, ds, &filter)?,
+                last_only: false,
             })
         })
         .collect::<Result<_>>()?;
-    let d = detect(&cands);
+    let d = detect(&runs);
+    let id = |i: usize| open[i].0;
     let files: Vec<Value> = open
         .iter()
         .zip(&d.files)
-        .zip(&keys)
-        .map(|(((id, name, ds), st), (_, missing))| {
+        .map(|((id, name, ds), st)| {
             let s = ds.sources.first().cloned().unwrap_or_default();
-            json!({"id": id, "name": name, "start_t": s.start_t, "lot": s.lot_id, "tester": s.node_nam, "ids": st, "key_missing": missing})
+            json!({"id": id, "name": name, "start_t": s.start_t, "lot": s.lot_id, "tester": s.node_nam, "ids": st})
         })
         .collect();
-    let id = |i: usize| open[i].0;
+    let conflicts: Vec<Value> = d
+        .conflicts
+        .iter()
+        .take(50)
+        .map(|c| json!({"text": c.text(), "files": [id(c.at.0), id(c.other.0)]}))
+        .collect();
     Ok(json!({
+        "titles": d.titles,
         "files": files,
         "pairs": d.pairs.iter().map(|p| json!({"a": id(p.a), "b": id(p.b), "shared": p.shared})).collect::<Vec<_>>(),
         "groups": d.groups.iter().map(|g| g.iter().map(|&i| id(i)).collect::<Vec<_>>()).collect::<Vec<_>>(),
         "in_several": d.in_several,
+        "by_id": d.by_id,
+        "conflicts": d.conflicts.len(),
+        "first_conflicts": conflicts,
     }))
 }
 
@@ -4292,7 +4332,10 @@ fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
         .iter()
         .map(|(id, _, _)| reg.get(*id).map(|d| d.0))
         .collect::<Result<_>>()?;
-    let key = pp.str_or("key", "part_txt");
+    let specs = part_trace_keys(pp);
+    if specs.is_empty() {
+        bail!("tick at least one ID to identify parts by");
+    }
     let filter = pp.str("filter");
     let runs: Vec<Run> = picked
         .iter()
@@ -4305,12 +4348,14 @@ fn part_trace_export_op(reg: &Registry, pp: &P) -> Result<Value> {
                     name.clone()
                 },
                 ds,
-                key: key_for(&key, ds).0,
+                keys: specs.iter().map(|k| key_for(k, ds)).collect(),
                 rows: reg.rows(*id, ds, &filter)?,
                 last_only: *last_only,
             })
         })
         .collect::<Result<_>>()?;
+    let mut runs = runs;
+    crate::parttrace::drop_unused_ids(&mut runs, &specs);
     let found = match part_trace_ids(pp) {
         Some(tests) => {
             let files: Vec<AuditFile> = runs

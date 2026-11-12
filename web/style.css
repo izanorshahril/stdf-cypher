@@ -360,3 +360,12 @@ tr.row-warn td { background: color-mix(in srgb, var(--warn) 9%, transparent); }
 .id-what { flex: 1 1 220px; min-width: 0; }
 .id-tests { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; flex: 2 1 320px; }
 .id-move { margin-left: auto; }
+
+/* a page of tabs: each tab's own title is under the page's */
+.tab-body > h1:first-child { display: none; }
+.page-tabs { margin-top: 4px; }
+/* Part trace: the IDs to identify parts by */
+.id-pick { margin-bottom: 10px; }
+.id-checks { display: flex; flex-direction: column; gap: 4px; margin: 6px 0; }
+.id-check { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.id-check.dim { opacity: 0.6; }

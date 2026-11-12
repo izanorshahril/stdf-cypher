@@ -20,6 +20,44 @@ pub enum KeySpec {
     Xy,
     WaferXy,
     Tests(Vec<usize>),
+    /// wafer, X and Y logged in three tests, written as W12X-2Y25; with offset tests, X and Y are
+    /// the die coordinates (the offsets added, or taken off with `sub`)
+    WxyTests {
+        w: usize,
+        x: usize,
+        y: usize,
+        offsets: Option<(usize, usize)>,
+        sub: bool,
+    },
+}
+
+/// A key of wafer, X and Y as text: W12X-2Y25. Letters rather than a separator such as |, which
+/// reads as "or" in a filter.
+pub fn wxy_text(w: &str, x: &str, y: &str) -> String {
+    format!("W{w}X{x}Y{y}")
+}
+
+/// The numbers of a key such as W12X-2Y25, 12_-2_-25 or 12|-2|-25; the text itself otherwise.
+pub fn components(v: &str) -> Vec<&str> {
+    if let Some(c) = split_wxy(v) {
+        return c;
+    }
+    v.split(['|', '_']).collect()
+}
+
+/// W12X-2Y25 (or X3Y-2) split into its numbers.
+fn split_wxy(v: &str) -> Option<Vec<&str>> {
+    let num = |s: &str| !s.is_empty() && s.trim_start_matches('-').parse::<f64>().is_ok();
+    let (head, y) = v.rsplit_once(['Y', 'y'])?;
+    let (head, x) = head.rsplit_once(['X', 'x'])?;
+    if !num(x) || !num(y) {
+        return None;
+    }
+    if head.is_empty() {
+        return Some(vec![x, y]);
+    }
+    let w = head.strip_prefix(['W', 'w'])?;
+    (!w.is_empty()).then(|| vec![w, x, y])
 }
 
 /// Canonical text for a number, so 12, 12.0 and "012" compare equal.
@@ -40,20 +78,67 @@ pub fn norm(s: &str) -> String {
     }
 }
 
-/// Canonical text for a whole key ("1 | 10 | 12" -> "1|10|12").
+/// Canonical text for a whole key typed without knowing its kind: W12X-2Y25 stays in that form,
+/// numbers separated by | , ; or _ are joined by _ ("1 | 10 | 12" -> "1_10_12").
 pub fn norm_key(s: &str) -> String {
-    s.split(['|', ',', ';'])
+    let s = s.trim();
+    if let Some(c) = split_wxy(s) {
+        let c: Vec<String> = c.into_iter().map(norm).collect();
+        return match c.as_slice() {
+            [x, y] => format!("X{x}Y{y}"),
+            [w, x, y] => wxy_text(w, x, y),
+            _ => unreachable!("two or three numbers"),
+        };
+    }
+    s.split(['|', ',', ';', '_'])
         .map(norm)
         .collect::<Vec<_>>()
-        .join("|")
+        .join("_")
 }
 
 impl KeySpec {
-    /// `part_id`, `part_txt`, `xy`, `wafer_xy`, or a test list such as
-    /// `tests:500` / `tests:501,502,503` (the `tests:` prefix is optional).
+    /// `part_id`, `part_txt`, `xy`, `wafer_xy`, a test list such as `tests:500` or
+    /// `tests:501,502,503` (the `tests:` prefix is optional), or wafer, X and Y tests as
+    /// `w_x_y:80100,80101,80102`, with X and Y offset tests after them for die coordinates
+    /// (`w_x_y_sub:` takes the offsets off).
     pub fn parse(s: &str, ds: &Dataset) -> Result<KeySpec> {
         let s = s.trim();
-        Ok(match s.to_lowercase().as_str() {
+        let find = |list: &str| {
+            list.split([',', ';', '+'])
+                .map(|q| q.trim())
+                .filter(|q| !q.is_empty())
+                .map(|q| {
+                    ds.find_test(q)
+                        .ok_or_else(|| anyhow!("test '{q}' not found in {}", ds.name))
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let lower = s.to_lowercase();
+        for (prefix, sub) in [("w_x_y_sub:", true), ("w_x_y:", false)] {
+            if lower.starts_with(prefix) {
+                let t = find(&s[prefix.len()..])?;
+                return match *t.as_slice() {
+                    [w, x, y] => Ok(KeySpec::WxyTests {
+                        w,
+                        x,
+                        y,
+                        offsets: None,
+                        sub,
+                    }),
+                    [w, x, y, ox, oy] => Ok(KeySpec::WxyTests {
+                        w,
+                        x,
+                        y,
+                        offsets: Some((ox, oy)),
+                        sub,
+                    }),
+                    _ => bail!(
+                        "list the wafer, X and Y tests, then optionally the X and Y offset tests"
+                    ),
+                };
+            }
+        }
+        Ok(match lower.as_str() {
             "part_id" | "partid" | "id" => KeySpec::PartId,
             "part_txt" | "txt" => KeySpec::PartTxt,
             "xy" => KeySpec::Xy,
@@ -64,15 +149,7 @@ impl KeySpec {
                     .strip_prefix("tests:")
                     .or_else(|| s.strip_prefix("test:"))
                     .unwrap_or(s);
-                let tests = list
-                    .split([',', ';', '+'])
-                    .map(|q| q.trim())
-                    .filter(|q| !q.is_empty())
-                    .map(|q| {
-                        ds.find_test(q)
-                            .ok_or_else(|| anyhow!("test '{q}' not found in {}", ds.name))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let tests = find(list)?;
                 if tests.is_empty() {
                     bail!("list one or more test numbers for the key");
                 }
@@ -82,18 +159,53 @@ impl KeySpec {
     }
 
     pub fn describe(&self, ds: &Dataset) -> String {
+        let nums = |t: &[usize]| {
+            t.iter()
+                .map(|&i| ds.tests[i].num.to_string())
+                .collect::<Vec<_>>()
+                .join(" + ")
+        };
         match self {
             KeySpec::PartId => "PRR part ID".into(),
             KeySpec::PartTxt => "PRR part text".into(),
             KeySpec::Xy => "PRR X/Y".into(),
             KeySpec::WaferXy => "wafer + PRR X/Y".into(),
-            KeySpec::Tests(t) => format!(
-                "PTR {}",
-                t.iter()
-                    .map(|&i| ds.tests[i].num.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            ),
+            KeySpec::Tests(t) => format!("PTR {}", nums(t)),
+            KeySpec::WxyTests {
+                w,
+                x,
+                y,
+                offsets,
+                sub,
+            } => {
+                let base = format!("PTR W, X, Y ({})", nums(&[*w, *x, *y]));
+                match offsets {
+                    Some((ox, oy)) => format!(
+                        "{base}, offsets {} {}",
+                        if *sub { "taken off" } else { "added" },
+                        nums(&[*ox, *oy])
+                    ),
+                    None => base,
+                }
+            }
+        }
+    }
+
+    /// A value typed by a user in this key's canonical form: 12|-2|25, 12,-2,25 or w12x-2y25 for
+    /// wafer, X and Y read as W12X-2Y25.
+    pub fn norm_input(&self, s: &str) -> String {
+        match self {
+            KeySpec::PartId | KeySpec::PartTxt => norm(s),
+            _ => {
+                let k = norm_key(s);
+                let c: Vec<&str> = components(&k);
+                match (self, c.as_slice()) {
+                    (KeySpec::WxyTests { .. } | KeySpec::WaferXy, [w, x, y]) => wxy_text(w, x, y),
+                    (KeySpec::Xy, [x, y]) => format!("X{x}Y{y}"),
+                    (KeySpec::Tests(_), c) => c.join("_"),
+                    _ => k,
+                }
+            }
         }
     }
 
@@ -107,11 +219,10 @@ impl KeySpec {
                 if p.x == -32768 || p.y == -32768 {
                     return None;
                 }
-                let xy = format!("{}|{}", p.x, p.y);
                 if matches!(self, KeySpec::WaferXy) {
-                    format!("{}|{xy}", norm(ds.wafer_name(p)))
+                    wxy_text(&norm(ds.wafer_name(p)), &p.x.to_string(), &p.y.to_string())
                 } else {
-                    xy
+                    format!("X{}Y{}", p.x, p.y)
                 }
             }
             KeySpec::Tests(ts) => {
@@ -123,10 +234,50 @@ impl KeySpec {
                     }
                     parts.push(num_key(v));
                 }
-                parts.join("|")
+                parts.join("_")
+            }
+            KeySpec::WxyTests { .. } => {
+                let [w, x, y] = self.wxy(ds, row)?;
+                wxy_text(&num_key(w), &num_key(x), &num_key(y))
             }
         };
         (!s.is_empty()).then_some(s)
+    }
+
+    /// Wafer, X and Y of a part, from a wafer, X, Y key: the offsets applied where the part has
+    /// them. None for other keys, or when a test has no result.
+    pub fn wxy(&self, ds: &Dataset, row: usize) -> Option<[f64; 3]> {
+        let KeySpec::WxyTests {
+            w,
+            x,
+            y,
+            offsets,
+            sub,
+        } = self
+        else {
+            return None;
+        };
+        let (w, x, y) = (ds.value(*w, row), ds.value(*x, row), ds.value(*y, row));
+        if !(w.is_finite() && x.is_finite() && y.is_finite()) {
+            return None;
+        }
+        let sign = if *sub { -1.0 } else { 1.0 };
+        let off = |t: usize| {
+            Some(ds.value(t, row))
+                .filter(|v| v.is_finite())
+                .map_or(0.0, |v| v * sign)
+        };
+        let (dx, dy) = offsets.map_or((0.0, 0.0), |(ox, oy)| (off(ox), off(oy)));
+        Some([w, x + dx, y + dy])
+    }
+
+    /// The tests the key reads, for checks such as 32-bit rounding.
+    pub fn tests(&self) -> Vec<usize> {
+        match self {
+            KeySpec::Tests(t) => t.clone(),
+            KeySpec::WxyTests { w, x, y, .. } => vec![*w, *x, *y],
+            _ => vec![],
+        }
     }
 }
 
@@ -211,7 +362,7 @@ pub fn match_parts(
 
 /// Rows of `ds` whose key equals `value` (normalized), in test order.
 pub fn find(ds: &Dataset, k: &KeySpec, value: &str) -> Vec<usize> {
-    let want = norm_key(value);
+    let want = k.norm_input(value);
     (0..ds.n_parts())
         .filter(|&r| k.key(ds, r).as_deref() == Some(want.as_str()))
         .collect()

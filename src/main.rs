@@ -85,10 +85,12 @@ enum Cmd {
         /// the workbook to write (.xlsx)
         #[arg(short, long)]
         out: PathBuf,
-        /// how parts are identified: part_txt, tests:80149, tests:80100,80101,80102 (a combination),
-        /// part_id, wafer_xy or xy
-        #[arg(long, default_value = "part_txt")]
-        key: String,
+        /// an ID parts are found by, repeated for several: part_txt, tests:80149 (one test),
+        /// w_x_y:80100,80101,80102 (wafer, X, Y), tests:501,502 (any combination), part_id,
+        /// wafer_xy or xy. Tests sharing any ID are the same part; tests whose IDs disagree are
+        /// kept apart. Default: part text, --wxy-test and --wxy-tests (with --offset-tests)
+        #[arg(long)]
+        key: Vec<String>,
         /// a name for each file's columns, e.g. "V93K first,V93K retest" (default: file names)
         #[arg(long, value_delimiter = ',')]
         names: Vec<String>,
@@ -105,6 +107,9 @@ enum Cmd {
         /// X and Y offset tests, when die X and Y are the tests with these added
         #[arg(long, value_delimiter = ',')]
         offset_tests: Vec<String>,
+        /// die X and Y are the tests with the offsets taken off rather than added
+        #[arg(long)]
+        subtract_offsets: bool,
         #[command(flatten)]
         l: LoadArgs,
     },
@@ -815,9 +820,10 @@ fn run() -> Result<()> {
             wxy_test,
             wxy_tests,
             offset_tests,
+            subtract_offsets,
             l,
         } => {
-            use stdf_cypher::parttrace::{self, Candidate, Run};
+            use stdf_cypher::parttrace::{self, Run};
             if files.is_empty() {
                 bail!("no input files");
             }
@@ -828,6 +834,23 @@ fn run() -> Result<()> {
                     files.len()
                 );
             }
+            if wxy_tests.len() != 3 {
+                bail!("--wxy-tests takes the wafer, X and Y tests");
+            }
+            if !offset_tests.is_empty() && offset_tests.len() != 2 {
+                bail!("--offset-tests takes the X and Y offset tests");
+            }
+            let wt = [wxy_tests.clone(), offset_tests.clone()].concat().join(",");
+            let sub = if subtract_offsets { "_sub" } else { "" };
+            let specs: Vec<String> = if key.is_empty() {
+                vec![
+                    "part_txt".into(),
+                    format!("tests:{wxy_test}"),
+                    format!("w_x_y{sub}:{wt}"),
+                ]
+            } else {
+                key
+            };
             let dss: Vec<Dataset> = files
                 .iter()
                 .map(|f| load(std::slice::from_ref(f), &l))
@@ -840,73 +863,79 @@ fn run() -> Result<()> {
                         .file_name()
                         .map_or(ds.name.clone(), |n| n.to_string_lossy().to_string())
                 });
-                let (spec, missing) = parttrace::key_for(&key, ds);
-                if missing {
+                let keys: Vec<_> = specs.iter().map(|k| parttrace::key_for(k, ds)).collect();
+                if keys.iter().all(Option::is_none) {
                     eprintln!(
-                        "warning: {name} does not log {key}: its parts have no ID and are left out"
+                        "warning: {name} has none of the IDs ({}): its parts are left out",
+                        specs.join(", ")
                     );
                 }
                 runs.push(Run {
                     name,
                     ds,
-                    key: spec,
+                    keys,
                     rows: rows(ds, &l.filter)?,
                     last_only: last[i],
                 });
             }
-            let cands: Vec<Candidate> = runs
-                .iter()
-                .map(|r| Candidate {
-                    ds: r.ds,
-                    key: r.key.clone(),
-                    rows: r.rows.clone(),
-                })
-                .collect();
-            let found = parttrace::detect(&cands);
+            for k in parttrace::drop_unused_ids(&mut runs, &specs) {
+                eprintln!("note: no file logs {k}: it is left out");
+            }
+            let found = parttrace::detect(&runs);
             if files.len() > 1 && found.groups.is_empty() {
-                eprintln!("no two files share a part by this ID");
+                eprintln!("no two files share a part by these IDs");
             }
-            for (i, f) in found
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| f.rounded > 0)
-            {
+            for (i, f) in found.files.iter().enumerate() {
+                if f.rounded > 0 {
+                    eprintln!(
+                        "warning: {} has {} IDs above 16,777,216: STDF stores results as 32-bit floats, so these are rounded and different parts can share one",
+                        runs[i].name, f.rounded
+                    );
+                }
+                if f.repeats > 0 {
+                    let what = if last[i] {
+                        "keeping each part's last test"
+                    } else {
+                        "each takes one more row; --last-only keeps each part's last test"
+                    };
+                    eprintln!(
+                        "warning: {} tests a part more than once ({} extra tests): {what}",
+                        runs[i].name, f.repeats
+                    );
+                }
+            }
+            for c in found.conflicts.iter().take(20) {
                 eprintln!(
-                    "warning: {} has {} IDs above 16,777,216: STDF stores results as 32-bit floats, so these are rounded and different parts can share one",
-                    runs[i].name, f.rounded
+                    "warning: IDs disagree, kept as two rows: {} ({} and {})",
+                    c.text(),
+                    runs[c.other.0].name,
+                    runs[c.at.0].name
                 );
             }
-            for (i, f) in found
-                .files
-                .iter()
-                .enumerate()
-                .filter(|(_, f)| f.repeats > 0)
-            {
-                let what = if last[i] {
-                    "keeping each part's last test"
-                } else {
-                    "each takes one more row; --last-only keeps each part's last test"
-                };
+            if found.conflicts.len() > 20 {
                 eprintln!(
-                    "warning: {} tests a part more than once ({} extra tests): {what}",
-                    runs[i].name, f.repeats
+                    "warning: {} more parts with IDs that disagree",
+                    found.conflicts.len() - 20
                 );
             }
-            if wxy_tests.len() != 3 {
-                bail!("--wxy-tests takes the wafer, X and Y tests");
-            }
-            if !offset_tests.is_empty() && offset_tests.len() != 2 {
-                bail!("--offset-tests takes the X and Y offset tests");
-            }
+            // the audit compares only the IDs the trace uses
+            let uses = |k: &str| specs.iter().any(|s| s.eq_ignore_ascii_case(k));
             let tests = parttrace::IdTests {
-                wxy: wxy_test,
-                w: wxy_tests[0].clone(),
+                wxy: if uses(&format!("tests:{wxy_test}")) {
+                    wxy_test
+                } else {
+                    String::new()
+                },
+                w: if uses(&format!("w_x_y{sub}:{wt}")) {
+                    wxy_tests[0].clone()
+                } else {
+                    String::new()
+                },
                 x: wxy_tests[1].clone(),
                 y: wxy_tests[2].clone(),
                 offsets: (offset_tests.len() == 2)
                     .then(|| (offset_tests[0].clone(), offset_tests[1].clone())),
-                subtract: false,
+                subtract: subtract_offsets,
             };
             let audit_files: Vec<parttrace::AuditFile> = runs
                 .iter()
@@ -927,10 +956,11 @@ fn run() -> Result<()> {
             }
             let s = parttrace::export_audited(&runs, &out, &l.filter, &id_audit)?;
             println!(
-                "{} parts, {} in more than one file, {} rows -> {}",
+                "{} parts, {} in more than one file, {} rows, {} kept apart -> {}",
                 s.parts,
                 s.in_several,
                 s.rows,
+                s.conflicts,
                 out.display()
             );
             for r in &s.runs {
@@ -972,7 +1002,9 @@ fn run() -> Result<()> {
                 max_trim_pct: max_trim,
             };
             let e = qual::endurance(&ds, &r, &opts)?;
-            let name = file.file_name().map_or(ds.name.clone(), |n| n.to_string_lossy().to_string());
+            let name = file
+                .file_name()
+                .map_or(ds.name.clone(), |n| n.to_string_lossy().to_string());
             let w = qual::write_endurance(&e, &ds, &name, &l.filter, &out)?;
             println!(
                 "{} test-site rows, {} above {drift}% drift, {} with Cpk below {cpk} -> {}",
@@ -1000,7 +1032,10 @@ fn run() -> Result<()> {
             if let Some(p) = trimmed_stdf {
                 let keep = e.kept_rows();
                 if keep.is_empty() {
-                    bail!("no site is compared: there are no loops to write to {}", p.display());
+                    bail!(
+                        "no site is compared: there are no loops to write to {}",
+                        p.display()
+                    );
                 }
                 let t = trim::write(&file, &ds, &keep, false, &p)?;
                 println!("trimmed trial: {} parts -> {}", t.kept, p.display());
@@ -1024,14 +1059,23 @@ fn run() -> Result<()> {
             }
             let da = load(std::slice::from_ref(&old), &l)?;
             let db = load(std::slice::from_ref(&new), &l)?;
-            let file_name = |p: &Path, ds: &Dataset| p.file_name().map_or(ds.name.clone(), |n| n.to_string_lossy().to_string());
+            let file_name = |p: &Path, ds: &Dataset| {
+                p.file_name()
+                    .map_or(ds.name.clone(), |n| n.to_string_lossy().to_string())
+            };
             let a = qual::Side {
-                name: names.first().cloned().unwrap_or_else(|| file_name(&old, &da)),
+                name: names
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| file_name(&old, &da)),
                 rows: rows(&da, &l.filter)?,
                 ds: &da,
             };
             let b = qual::Side {
-                name: names.get(1).cloned().unwrap_or_else(|| file_name(&new, &db)),
+                name: names
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(|| file_name(&new, &db)),
                 rows: rows(&db, &l.filter)?,
                 ds: &db,
             };

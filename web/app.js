@@ -59,6 +59,8 @@ function traceBox(on, setOn) {
   return h("span", { class: "trace-on", title: "Trace parts with this test (part trace card, parts search, Retest trace). Untick when the program does not log it; wafer maps and analytics keep their own settings." },
     h("input", { type: "checkbox", checked: on, onchange: (e) => { setOn(e.target.checked); S.rtLast = null; saveCfg(); toast("Saved", "good", 1500); } }), "trace");
 }
+/** Wafer, X and Y as one ID: W12X-2Y25 (letters, not |, which reads as "or" in a filter). */
+const wxyText = (w, x, y) => `W${w}X${x}Y${y}`;
 /** Part trace fields a part can show (mini card, search): [key, label]. */
 function traceFields() {
   const t = idTests(true);
@@ -74,7 +76,7 @@ function traceValues(ids) {
   const die = (v, o) => (v == null ? null : o == null ? v : w.mode === "sub" ? v - o : v + o);
   const dx = die(ids.x_t, ids.ox), dy = die(ids.y_t, ids.oy), [tx, ty] = wxyBasis() === "die" ? [dx, dy] : [ids.x_t, ids.y_t];
   const out = { part_txt: ids.part_txt || "", part_id: ids.part_id || "", prr_xy: ids.x != null && ids.x !== NO_XY ? `${ids.x}, ${ids.y}` : "", wafer: ids.wafer || "",
-    wxy: num(ids.wxy), wxy_t: [ids.w, tx, ty].every((v) => v != null) ? [ids.w, tx, ty].map(num).join("|") : "", rev: num(ids.rev), lb: num(ids.lb) };
+    wxy: num(ids.wxy), wxy_t: [ids.w, tx, ty].every((v) => v != null) ? wxyText(...[ids.w, tx, ty].map(num)) : "", rev: num(ids.rev), lb: num(ids.lb) };
   for (const k of Object.keys(ids)) if (/^o\d+$/.test(k)) out[k] = num(ids[k]);
   return out;
 }
@@ -324,26 +326,28 @@ const VIEWS = {
   explorer: { label: "Test explorer", fn: viewExplorer },
   wafer: { label: "Wafer maps", fn: viewWafer },
   compare: { label: "Compare", fn: viewCompare },
-  match: { label: "Match, merge & trace", fn: viewMatch },
-  investigation: { label: "Failure investigation", fn: viewInvestigation },
-  candidates: { label: "Bad candidates", fn: viewCandidates },
-  signature: { label: "Signature check", fn: viewSignature },
-  retest: { label: "Retest trace", fn: viewRetest },
-  parttrace: { label: "Part trace", fn: viewPartTrace },
+  trace: { label: "Trace", fn: viewTrace },
+  qual: { label: "Drift report", fn: viewQual },
   correlation: { label: "Correlation", fn: viewCorrelation },
   anova: { label: "ANOVA", fn: viewAnova },
-  qual: { label: "Qualification drift", fn: viewQual },
   anomaly: { label: "Abnormal parts", fn: viewAnomaly },
   ml: { label: "Machine learning", fn: viewML },
   records: { label: "Records", fn: viewRecords },
-  datalog: { label: "Part datalog", fn: viewDatalog },
-  trim: { label: "Edit & trim", fn: viewTrim },
-  export: { label: "Merge, split & export", fn: viewExport },
+  data: { label: "Edit, merge & export", fn: viewData },
+  investigation: { label: "Failure investigation", fn: viewInvestigation },
+  candidates: { label: "Bad candidates", fn: viewCandidates },
+  signature: { label: "Signature check", fn: viewSignature },
   settings: { label: "Settings", fn: viewSettings, always: true },
+};
+// pages that became a tab of another page: [page, tab]
+const VIEW_TABS = {
+  parttrace: ["trace", "parttrace"], retest: ["trace", "retest"], findpart: ["trace", "find"],
+  parts: ["records", "parts"], datalog: ["records", "datalog"], raw: ["records", "raw"],
+  trim: ["data", "trim"], export: ["data", "export"], match: ["data", "match"],
 };
 
 // a heading above the first view of each group ("" = a plain separator)
-const NAV_GROUPS = { overview: "Explore", match: "Investigate", correlation: "Statistics", records: "Data & files", settings: "" };
+const NAV_GROUPS = { overview: "Explore", qual: "Investigate", records: "Data & files", investigation: "Experimental", settings: "" };
 function renderNav() {
   const nav = document.getElementById("nav");
   nav.replaceChildren();
@@ -354,14 +358,50 @@ function renderNav() {
   }
   nav.append(h("div", { class: "hint" }, S.datasets.length ? "The part filter and population at the top apply to every view." : "Open an STDF file to unlock the analyses."));
 }
-function go(view) {
-  if (view === "parts") view = "records";
+/** A view name, a tab name (parttrace) or page/tab (trace/retest) as [page, tab or undefined]; null when unknown. */
+function viewOf(name) {
+  const [v, t] = String(name || "").split("/");
+  if (VIEW_TABS[v]) return VIEW_TABS[v];
+  return VIEWS[v] ? [v, t] : null;
+}
+function go(name) {
+  const [view, tab] = viewOf(name) || ["home"];
+  if (tab) (S.tabs ||= {})[view] = tab;
   S.view = view;
-  try { history.replaceState(null, "", "#" + view); } catch (e) {}
+  try { history.replaceState(null, "", "#" + view + (S.tabs && S.tabs[view] ? "/" + S.tabs[view] : "")); } catch (e) {}
   renderNav();
   main.replaceChildren();
   if (!S.datasets.length && !VIEWS[view].always) { S.view = "home"; renderNav(); return viewHome(main); }
   VIEWS[view].fn(main);
+}
+/** A page of tabs [id, label, fn(el)]: the open tab is kept per page and in the address. Each tab's own h1 is hidden under the page's. */
+function tabbedPage(el, page, title, lead, tabs) {
+  const S_ = (S.tabs ||= {});
+  const bar = h("div", { class: "tabs page-tabs", role: "tablist" });
+  const body = h("div", { class: "tab-body" });
+  el.append(h("h1", {}, title), lead ? h("p", { class: "lead" }, lead) : "", bar, body);
+  const open = (k) => {
+    S_[page] = k;
+    try { history.replaceState(null, "", `#${page}/${k}`); } catch (e) {}
+    bar.replaceChildren(...tabs.map(([id, label]) => h("button", { class: id === k ? "active" : "", role: "tab", "aria-selected": String(id === k), onclick: () => open(id) }, label)));
+    body.replaceChildren();
+    tabs.find(([id]) => id === k)[2](body);
+  };
+  open(tabs.some(([k]) => k === S_[page]) ? S_[page] : tabs[0][0]);
+}
+function viewTrace(el) {
+  tabbedPage(el, "trace", "Trace", "Follow the same physical parts across files: an Excel report of every part's history, a retest chain run by run, or one part.", [
+    ["parttrace", "Part trace report", viewPartTrace],
+    ["retest", "Retest trace", viewRetest],
+    ["find", "Find a part", viewFindPart],
+  ]);
+}
+function viewData(el) {
+  tabbedPage(el, "data", "Edit, merge & export", "", [
+    ["trim", "Edit & trim", viewTrim],
+    ["export", "Merge, split & export", viewExport],
+    ["match", "Match & merge", viewMatch],
+  ]);
 }
 function otherDs(id) {
   const o = S.datasets.find((d) => d.id !== id);
@@ -375,7 +415,7 @@ async function viewOverview(el) {
   el.append(body);
   loading(body);
   try {
-    const d = await api("overview", P());
+    const d = await api("overview", P({ by_site: !!S.cfg.ovSite }));
     const o = d.overview;
     body.replaceChildren();
     body.append(h("div", { class: "kpis" },
@@ -388,6 +428,9 @@ async function viewOverview(el) {
       kpi("Retests", o.retests.toLocaleString()),
       kpi("Lot", o.lots.join(", ") || "–", o.part_typ),
       kpi("Program", o.job || "–", o.tester)));
+    // more than one site: the bin and yield bars can be split by site
+    if (o.sites > 1) body.append(h("div", { class: "row tight" }, h("label", { class: "chk", title: "Bins as the % of each site's parts, and yield by wafer and file, one bar per site" },
+      h("input", { type: "checkbox", checked: !!S.cfg.ovSite, onchange: (e) => { S.cfg.ovSite = e.target.checked; saveCfg(); go("overview"); } }), `Split the bars by site (${o.sites} sites)`)));
     const g = h("div", { class: "grid2" });
     for (const k of ["hbin", "sbin", "site", "wafer", "file"]) {
       if (!d.figures[k]) continue;
@@ -1133,13 +1176,11 @@ function mlPca(el) {
 
 // ---- Records
 function viewRecords(el) {
-  el.append(h("h1", {}, "Records"), h("p", { class: "lead" }, "Every STDF record of the current dataset. The part table summarises each PRR with its first failing test; the record viewer shows any record type field by field, straight from the file."));
-  const tabs = h("div", { class: "tabs" });
-  const body = h("div");
-  el.append(tabs, body);
-  const modes = [["parts", "Part table (PRR)"], ["raw", "Record viewer (all types)"]];
-  const setMode = (m) => { S.recMode = m; tabs.replaceChildren(...modes.map(([k, l]) => h("button", { class: k === m ? "active" : "", onclick: () => setMode(k) }, l))); body.replaceChildren(); (m === "raw" ? recRaw : recParts)(body); };
-  setMode(S.recMode || "parts");
+  tabbedPage(el, "records", "Records", "Every STDF record of the current dataset. The part table summarises each PRR with its first failing test; the part datalog writes the results of the parts and tests you pick; the record viewer shows any record type field by field, straight from the file.", [
+    ["parts", "Part table (PRR)", recParts],
+    ["datalog", "Part datalog", viewDatalog],
+    ["raw", "Record viewer (all types)", recRaw],
+  ]);
 }
 
 const NO_XY = -32768;
@@ -1268,13 +1309,13 @@ function idOrderAll() { return [...new Set([...(S.cfg.idOrder || []).filter((k) 
 /** The IDs in the order set in Settings: [id, API key, label], leaving out those with no test set or with trace off. */
 function idChoices() {
   const t = idTests(true), num = (v) => String(v || "").trim(), wxy = num(t.wxy), wt = [t.w, t.x_t, t.y_t].map(num);
-  // on the die basis X and Y are relative to their offsets, so the offsets are part of the ID
-  const off = wxyBasis() === "die" ? [t.ox, t.oy].map(num).filter(Boolean) : [];
+  // on the die basis the ID holds die X and Y: the X and Y tests with their offsets applied
+  const off = wxyBasis() === "die" && num(t.ox) && num(t.oy) ? [t.ox, t.oy].map(num) : [];
   const wk = [...wt, ...off];
   const all = {
     part_txt: ["part_txt", "PRR part text (ULT)"],
     wxy: wxy ? [`tests:${wxy}`, `PTR WXY (test ${wxy})`] : null,
-    w_x_y: wt.every(Boolean) ? [`tests:${wk.join(",")}`, `PTR wafer + X + Y${off.length ? " + offsets" : ""} (tests ${wk.join(", ")})`] : null,
+    w_x_y: wt.every(Boolean) ? [`w_x_y${off.length && waferCal().mode === "sub" ? "_sub" : ""}:${wk.join(",")}`, `PTR wafer, X, Y${off.length ? " with offsets" : ""} (tests ${wk.join(", ")}), as W12X-2Y25`] : null,
     part_id: ["part_id", "PRR part ID"],
     wafer_xy: ["wafer_xy", "PRR wafer + X/Y"],
     xy: ["xy", "PRR X/Y only"],
@@ -1284,14 +1325,14 @@ function idChoices() {
 /** The ways to identify parts for a picker: [API key, label]. */
 function keyOptions() { return [...idChoices().map(([, k, l]) => [k, l]), ["tests", "Other PTR test(s)…"]]; }
 function defaultKey() { return idChoices()[0][1]; }
-/** The first ID in the order by which two open files share parts: { key, label, found }, or null. */
+/** Whether open files share parts by part text, WXY or wafer, X, Y (any of them): { label, found }, or null. */
 async function findSharedId(filter) {
-  for (const [id, key, label] of idChoices()) {
-    if (!ID_STRONG.includes(id)) continue;
-    const found = await api("part_trace_detect", { key, filter });
-    if (found.groups.length) return { key, label, found };
-  }
-  return null;
+  const keys = idChoices().filter(([id]) => ID_STRONG.includes(id)).map(([, k]) => k);
+  if (!keys.length) return null;
+  const found = await api("part_trace_detect", { keys, filter });
+  if (!found.groups.length) return null;
+  const by = found.titles.filter((_, j) => found.by_id[j] > 0);
+  return { label: by.length ? by.join(", ") : found.titles.join(", "), found };
 }
 function keyPicker(side, ds) {
   S.mk = S.mk || {};
@@ -1307,7 +1348,8 @@ function keyPicker(side, ds) {
   return { el: h("div", { class: "row tight" }, sel, tests), value, set };
 }
 function viewMatch(el) {
-  el.append(h("h1", {}, "Match, merge & trace"), mergeCard(), h("p", { class: "lead" }, "Find the same physical parts in two files and follow them across: by PRR part text or part ID, by die X/Y, or by datalogged PTR results (one test holding a unique wafer + X/Y code, or wafer, X and Y in separate tests). Matched parts become a part set you can filter on, compare, split out and chart side by side."));
+  el.append(h("h1", {}, "Match & merge"), h("p", { class: "lead" }, "Find the same physical parts in two files: by PRR part text or part ID, by die X/Y, or by datalogged PTR results (one test holding a unique wafer + X/Y code, or wafer, X and Y in separate tests). Matched parts become a part set you can filter on, compare, split out, merge and chart side by side. To follow one part, or many parts over several files, use the Trace page."),
+    h("div", { class: "row" }, h("button", { onclick: () => go("trace/find") }, "Find one part…"), h("button", { onclick: () => go("trace/parttrace") }, "Part trace report…"), h("button", { onclick: () => go("export") }, "Merge files…")));
   const ids = S.datasets.map((d) => d.id);
   const st = S.m || (S.m = { a: S.ds, b: otherDs(S.ds), name: "match", fa: "", fb: "" });
   if (!ids.includes(st.a)) st.a = S.ds;
@@ -1328,15 +1370,32 @@ function viewMatch(el) {
     loading(out, "Matching parts…");
     try { S.mres = await api("match", { a: st.a, b: st.b, key_a: st.ka, key_b: st.kb, filter_a: st.fa, filter_b: st.fb, name: st.name }); renderMatch(out, S.mres, traceBox); } catch (e) { showErr(out, e); }
   };
-  if (!two) el.append(h("div", { class: "help" }, "Open a second STDF file (without 'combine') to match parts between files. You can still trace a part by its identity in this file below."));
+  if (!two) { el.append(h("div", { class: "help" }, "Open a second STDF file (without 'combine') to match parts between files.")); return; }
   el.append(h("div", { class: "controls" }, field("File A", a), field("Identify A parts by", ka.el), field("Filter A", fa), quickFilter(fa, "qa")),
     two ? h("div", { class: "controls" }, field("File B", b), field("Identify B parts by", kb.el), field("Filter B", fb), quickFilter(fb, "qb"), field("Part set name", name), h("button", { class: "primary", onclick: run }, "Match parts")) : "",
     two ? h("div", { class: "help" }, "Example – parts that were bin 1 in file A but failed test 1013 in file B: Filter A ", h("code", {}, "hbin = 1"), ", Filter B ", h("code", {}, "fail(1013)"), " (or ", h("code", {}, "first_fail = 1013"), ", or ", h("code", {}, "fail(1013) and n_fails = 1"), " for that test only). Then use “Find marker tests” on file A.") : "");
-  // trace a single unit by its identity
-  const tv = h("input", { type: "text", placeholder: "the A identity value, e.g. LOTA-W01-X3Y-2  or  11253  or  1|3|-2", style: { minWidth: "300px", flex: "1" }, onkeydown: (e) => { if (e.key === "Enter") doTrace(); } });
-  const doTrace = () => { sync(); trace(traceBox, { a: st.a, b: two && st.a !== st.b ? st.b : null, key_a: st.ka, key_b: st.kb, value: tv.value }); };
-  el.append(h("div", { class: "controls" }, field("Trace a part", tv), h("button", { onclick: doTrace }, "Trace"), h("span", { class: "muted small", style: { paddingBottom: "8px" } }, "Several test values: separate with | in the order of the tests.")), out, traceBox);
+  el.append(out, traceBox);
   if (S.mres && S.mres.a === st.a && S.mres.b === st.b && ids.includes(st.a) && ids.includes(st.b)) renderMatch(out, S.mres, traceBox);
+}
+function viewFindPart(el) {
+  el.append(h("h1", {}, "Find a part"), h("p", { class: "lead" }, "Look one part up by its ID and see all its results, in one file or in two side by side. Type wafer, X and Y as W12X-2Y25 (12, -2, 25 also works)."));
+  const ids = S.datasets.map((d) => d.id);
+  const st = S.fp || (S.fp = { a: S.ds, b: null, value: "" });
+  if (!ids.includes(st.a)) st.a = S.ds;
+  if (st.b != null && (!ids.includes(st.b) || st.b === st.a)) st.b = null;
+  const a = select(dsOptions(), String(st.a), (v) => (st.a = +v));
+  const b = select([["", "none"], ...dsOptions()], st.b == null ? "" : String(st.b), (v) => (st.b = v === "" ? null : +v));
+  const ka = keyPicker("fa"), kb = keyPicker("fb");
+  const box = h("div");
+  const tv = h("input", { type: "text", value: st.value, placeholder: "e.g. LOTA-W01-X3Y-2  or  11253  or  W1X3Y-2", style: { minWidth: "300px", flex: "1" }, onkeydown: (e) => { if (e.key === "Enter") run(); } });
+  const run = () => {
+    st.value = tv.value;
+    if (!tv.value.trim()) return toast("Type the part's ID", "bad");
+    trace(box, { a: st.a, b: st.b != null && st.b !== st.a ? st.b : null, key_a: ka.value(), key_b: kb.value(), value: tv.value });
+  };
+  el.append(h("div", { class: "controls" }, field("File", a), field("Identify parts by", ka.el)),
+    S.datasets.length > 1 ? h("div", { class: "controls" }, field("Also in file", b), field("Identify its parts by", kb.el)) : "",
+    h("div", { class: "controls" }, field("Part ID", tv), h("button", { class: "primary", onclick: run }, "Find")), box);
 }
 /** Builds a filter like  not pass and fail(1013)  into `input`. */
 function quickFilter(input, key) {
@@ -2345,11 +2404,11 @@ function idTrail(d, p) {
       row("Found by", p.runs.map((r, k) => h("td", { class: "muted small" }, found(r, k)))),
       row("Check", p.runs.map((r, k) => h("td", {}, ...checks(r, k)))))));
 }
-/** Parts table search: any trace value, and wafer X Y typed as 3|12|-4 (or with commas, spaces or slashes). */
+/** Parts table search: any trace value, and wafer X Y typed as W3X12Y-4 or 3, 12, -4 (or with spaces, slashes or |). */
 function rtSearch(r, q) {
   if (r._hay.includes(q)) return true;
   const m = /^\s*(-?\d+)[\s,;/|]+(-?\d+)[\s,;/|]+(-?\d+)\s*$/.exec(q);
-  return !!m && r._trace.wxy_t === `${m[1]}|${m[2]}|${m[3]}`;
+  return !!m && r._trace.wxy_t === wxyText(m[1], m[2], m[3]);
 }
 /** The WXY test against the wafer, X and Y tests, on the basis chosen in Settings: raw (the tests as logged, default) or die (the offset tests added). Reads as wafer, then X and Y zero-padded to three digits (17113138 = 17|113|138). Null without WXY and the three tests. */
 function wxyCheck(ids) {
@@ -2360,9 +2419,9 @@ function wxyCheck(ids) {
   const die = (v, o) => (v == null ? null : o == null ? v : w.mode === "sub" ? v - o : v + o);
   const wxy = String(Math.round(ids.wxy)), raw = enc(ids.w, ids.x_t, ids.y_t), dies = enc(ids.w, die(ids.x_t, ids.ox), die(ids.y_t, ids.oy));
   const basis = wxyBasis(), want = basis === "die" ? dies : raw, other = basis === "die" ? raw : dies;
-  if (want && wxy === want) return { ok: true, text: `= ${basis} W|X|Y`, title: basis === "die" ? "WXY matches the wafer, die X and Y (offset tests applied)." : "WXY matches the wafer, X and Y tests as logged." };
-  const hint = other && wxy === other ? ` It matches the ${basis === "die" ? "raw" : "die"} W|X|Y: change Check WXY against in Settings.` : "";
-  return { ok: false, text: `≠ ${basis} W|X|Y`, title: `WXY ${wxy} is not the ${basis} W|X|Y (${want || "no 2-digit wafer, 3-digit X and Y"}).${hint}` };
+  if (want && wxy === want) return { ok: true, text: `= ${basis} W,X,Y`, title: basis === "die" ? "WXY matches the wafer, die X and Y (offset tests applied)." : "WXY matches the wafer, X and Y tests as logged." };
+  const hint = other && wxy === other ? ` It matches the ${basis === "die" ? "raw" : "die"} W,X,Y: change Check WXY against in Settings.` : "";
+  return { ok: false, text: `≠ ${basis} W,X,Y`, title: `WXY ${wxy} is not the ${basis} W,X,Y (${want || "no 2-digit wafer, 3-digit X and Y"}).${hint}` };
 }
 /** The WXY check as a badge for the part card. */
 function wxyBadge(ids) {
@@ -2851,7 +2910,7 @@ async function viewHome(el) {
         const n = r.found.groups.reduce((a, g) => a + g.length, 0);
         shared.replaceChildren(h("div", { class: "card pad", style: { marginTop: "10px" } }, h("div", { class: "row tight" },
           h("span", {}, `${n} open files share parts by ${r.label}: ${r.found.in_several.toLocaleString()} parts are in more than one file.`),
-          h("button", { onclick: () => { (S.mk = S.mk || {}).pt = r.key; go("parttrace"); } }, "Trace them in Part trace"))));
+          h("button", { onclick: () => go("trace/parttrace") }, "Trace them in a Part trace report"))));
       }).catch(() => {});
     }
   }
@@ -2876,24 +2935,19 @@ async function viewHome(el) {
 
   right.append(h("h2", {}, "What can I do?"));
   const tips = [
-    ["overview", "Overview", "Yield, bin pareto, site & wafer yield, fail pareto"],
+    ["overview", "Overview", "Yield, bin pareto, site & wafer yield, fail pareto; bars split by site"],
     ["explorer", "Test explorer", "Histogram, box, CDF and trend of any test vs limits"],
     ["wafer", "Wafer maps", "Bin or test-value maps per wafer"],
     ["compare", "Compare", "Lot vs lot, or a group of parts vs the rest"],
-    ["match", "Match, merge & trace", "Same parts in two files; merge pieces of one lot"],
-    ["investigation", "Failure investigation", "One case: recovery window, bad candidates, signature, screening"],
-    ["candidates", "Bad candidates", "Good parts that went bad, and which tests set them apart"],
-    ["signature", "Signature check", "Learn rules from bad candidates, check them on good parts"],
-    ["retest", "Retest trace", "Follow parts through up to 8 runs, by site and value"],
-    ["parttrace", "Part trace", "Each part's history across files, as an Excel report"],
+    ["trace/parttrace", "Trace", "Each part's history across files as an Excel report, retest chains, one part"],
+    ["qual", "Drift report", "Endurance and 25x loop mean drift by test and site, as Excel reports"],
     ["correlation", "Correlation", "Tester-to-tester correlation, test-to-test matrix"],
     ["anova", "ANOVA", "Which tests differ by site, wafer or lot"],
-    ["qual", "Qualification drift", "Endurance and 25x loop mean drift by test and site, as Excel reports"],
     ["anomaly", "Abnormal parts", "PAT, robust z, wafer NNR, Isolation Forest"],
     ["ml", "Machine learning", "What drives fails? PCA & clustering"],
-    ["records", "Records", "Part table and every raw STDF record"],
-    ["datalog", "Part datalog", "Chosen tests of chosen parts as text or CSV"],
-    ["export", "Merge, split & export", "Merge or split STDF, CSV, HTML report"],
+    ["records", "Records", "Part table, part datalog and every raw STDF record"],
+    ["data", "Edit, merge & export", "Trim, merge, split, match parts, CSV, HTML report"],
+    ["investigation", "Experimental", "Failure investigation, bad candidates, signature check"],
   ];
   right.append(h("div", { class: "tips" }, tips.map(([k, t, d]) => h("button", { class: "tip", disabled: !has, onclick: () => go(k) }, h("b", {}, t), h("span", {}, d)))));
 }
@@ -3107,52 +3161,77 @@ function mergeCard() {
 }
 // ---- Part trace: each part's history across files, written to an Excel workbook
 function viewPartTrace(el) {
-  el.append(h("h1", {}, "Part trace"), h("p", { class: "lead" }, "One row per part and one group of columns per file: part ID, hard bin, site, first and last failing test. Files that hold the same parts are found and ticked for you. They can be in any order and from any lot: a part shows in every file that holds it, and the other columns stay blank."));
-  const st = S.pt || (S.pt = { order: [], on: {}, names: {}, last: {}, seen: [], path: "" });
+  el.append(h("h1", {}, "Part trace report"), h("p", { class: "lead" }, "One row per part and one group of columns per file: part ID, hard bin, site, first and last failing test. A part is found by every ID ticked below at once, so where one is missing (no part text in an engineering file, a part that failed before its WXY test) another fills the gap. Files that hold the same parts are found and ticked for you, in any order and from any lot: a part shows in every file that holds it, and the other columns stay blank."));
+  const st = S.pt || (S.pt = { order: [], on: {}, names: {}, last: {}, seen: [], path: "", ids: {} });
+  st.ids ||= {};
   const live = S.datasets.map((d) => d.id);
   st.order = [...st.order.filter((id) => live.includes(id)), ...live.filter((id) => !st.order.includes(id))];
-  const kp = keyPicker("pt");
-  let info = null;
+  const choices = idChoices();
+  // per ID: [files that log it, parts with it], from one look over every ID
+  let avail = null, info = null;
+  const idOn = (id) => st.ids[id] ?? (avail ? ID_STRONG.includes(id) && avail[id][1] > 0 : ID_STRONG.includes(id));
+  const tickedIds = () => choices.filter(([id]) => idOn(id) && (!avail || avail[id][0] > 0));
   const fileInfo = (id) => info && info.files.find((f) => f.id === id);
   const label = (id) => st.names[id] ?? dsName(id);
   const ticked = () => st.order.filter((id) => st.on[id]);
   const note = h("div", { class: "muted small" });
-  const dupes = h("div"), auditBox = h("div");
+  const idBox = h("div", { class: "id-pick" });
+  const dupes = h("div"), conflictBox = h("div"), auditBox = h("div");
   let auditSeq = 0;
-  const idSpec = () => { const t = idTests(true); return { wxy: t.wxy, w: t.w, x: t.x_t, y: t.y_t, ox: t.ox, oy: t.oy, die: wxyBasis() === "die", sub: waferCal().mode === "sub" }; };
-  // whether a part's part text, WXY and wafer, X, Y agree over the ticked files
+  // the audit compares only the ticked IDs among part text, WXY and wafer, X, Y
+  const idSpec = () => {
+    const t = idTests(true), on = (id) => tickedIds().some(([x]) => x === id);
+    return { wxy: on("wxy") ? t.wxy : "", w: on("w_x_y") ? t.w : "", x: t.x_t, y: t.y_t, ox: t.ox, oy: t.oy, die: wxyBasis() === "die", sub: waferCal().mode === "sub" };
+  };
   const runAudit = async () => {
     const mine = ++auditSeq, ids = ticked();
-    if (!ids.length) return auditBox.replaceChildren();
+    if (!ids.length || tickedIds().filter(([id]) => ID_STRONG.includes(id)).length < 2) return auditBox.replaceChildren();
     try {
       const a = await api("part_trace_audit", { ds: ids, ids: idSpec(), filter: scoped(S.filter) });
       if (mine !== auditSeq) return;
       if (!a.problems) {
-        auditBox.replaceChildren(h("div", { class: "muted small", style: { margin: "8px 0" } }, a.compared ? `ID audit: part text, WXY and wafer, X, Y agree on all ${a.compared.toLocaleString()} tests that have two or more of them. Missing values are not counted as problems.` : "ID audit: no part has two IDs to compare."));
+        auditBox.replaceChildren(h("div", { class: "muted small", style: { margin: "8px 0" } }, a.compared ? `ID audit: the ticked IDs agree on all ${a.compared.toLocaleString()} tests that have two or more of them. Missing values are not counted as problems.` : "ID audit: no part has two IDs to compare."));
         return;
       }
-      const hint = (a.wxy_differs ? " If WXY differs on most parts, check Check WXY against in Settings." : "") + (a.id_differs ? " If one W|X|Y has many part texts, X and Y probably need their offsets: set Check WXY against to die X/Y in Settings." : "");
+      const hint = (a.wxy_differs ? " If WXY differs on most parts, check Check WXY against in Settings." : "") + (a.id_differs ? " If one W,X,Y has many part texts, X and Y probably need their offsets: set Check WXY against to die X/Y in Settings." : "");
       auditBox.replaceChildren(h("div", { class: "small", style: { margin: "8px 0" } },
-        h("div", { class: "row tight" }, badge("IDs do not agree", "bad"), `${a.problems.toLocaleString()} problems on ${a.parts.toLocaleString()} tests of parts. These parts may be matched wrongly: their part text cell is red in the report, and the ID audit sheet lists every one.${hint}`),
+        h("div", { class: "row tight" }, badge("ID audit", "bad"), `${a.problems.toLocaleString()} problems on ${a.parts.toLocaleString()} tests of parts: their ID cells are red in the report, and the ID audit sheet lists every one.${hint}`),
         h("details", {}, h("summary", {}, a.problems > a.first.length ? `The first ${a.first.length}` : "Show them"),
           h("ul", {}, a.first.map((f) => h("li", {}, f.text, " (", f.files.map(dsName).join(", "), ")"))))));
     } catch (e) { if (mine === auditSeq) auditBox.replaceChildren(h("div", { class: "muted small" }, `ID audit failed: ${e.message}`)); }
   };
+  function drawIds() {
+    const n = st.order.length;
+    idBox.replaceChildren(h("b", {}, "Identify parts by"), h("span", { class: "muted small" }, " every ticked ID; each one is a column of the report. Untick one to leave it out of matching and of the report."),
+      h("div", { class: "id-checks" }, choices.map(([id, , lab], j) => {
+        const a = avail && avail[id];
+        const none = a && !a[0];
+        const k = info ? info.keys.indexOf(choices[j][1]) : -1;
+        const linked = k >= 0 ? info.by_id[k] : null;
+        const what = !a ? "looking…" : none ? "not in any open file" : [`in ${a[0]} of ${n} files`, `${a[1].toLocaleString()} parts`, linked != null ? `${linked.toLocaleString()} found in two or more files by it` : ""].filter(Boolean).join(" · ");
+        return h("label", { class: "chk id-check" + (none ? " dim" : ""), title: ID_STRONG.includes(id) ? "" : "Part IDs and X/Y often restart in every file: tick only when they are unique across these files" },
+          h("input", { type: "checkbox", checked: idOn(id) && !none, disabled: !!none, onchange: (e) => { st.ids[id] = e.target.checked; detect(); } }),
+          h("span", {}, lab), h("span", { class: "muted small" }, what));
+      })),
+      h("div", { class: "muted small" }, "Test numbers and their order are set in ", h("a", { href: "#settings", onclick: (e) => { e.preventDefault(); go("settings"); } }, "Settings, Part identification"), "."));
+  }
   const list = h("div", { class: "tbl-wrap" });
   const move = (i, j) => { [st.order[i], st.order[j]] = [st.order[j], st.order[i]]; draw(); };
   const groupOf = (id) => (info ? info.groups.findIndex((g) => g.includes(id)) : -1);
   const shareText = (f) => {
     if (!f) return "made in the app";
-    if (f.key_missing) return "does not log these tests: no IDs";
-    const parts = [`${f.ids.shared.toLocaleString()} of ${f.ids.distinct.toLocaleString()} IDs in other files`];
-    if (f.ids.no_id) parts.push(`${f.ids.no_id.toLocaleString()} parts without an ID (left out)`);
-    if (f.ids.placeholder) parts.push(`${f.ids.placeholder.toLocaleString()} placeholder IDs`);
+    if (!f.ids.has.some(Boolean)) return "has none of the ticked IDs: left out";
+    const parts = [`${f.ids.shared.toLocaleString()} of ${f.ids.distinct.toLocaleString()} parts in other files`];
+    if (f.ids.no_id) parts.push(`${f.ids.no_id.toLocaleString()} without an ID (left out)`);
+    if (f.ids.placeholder) parts.push(`${f.ids.placeholder.toLocaleString()} placeholder IDs (not matched)`);
     return parts.join(" · ");
   };
+  const idsOf = (f) => (!f ? "" : info.titles.map((t, j) => (f.ids.has[j] ? badge(t, f.ids.with[j] ? "neutral" : "warn") : null)).filter(Boolean));
   function draw() {
+    drawIds();
     const many = info && info.groups.length > 1;
     list.replaceChildren(h("table", {},
-      h("thead", {}, h("tr", {}, ["", "Order", "Column", "Name in the report", "Same part again", "File", "Lot", "Tester", "Parts", "Shared parts"].map((t) => h("th", {}, t)))),
+      h("thead", {}, h("tr", {}, ["", "Order", "Column", "Name in the report", "Same part again", "File", "Lot", "Tester", "Parts", "IDs", "Shared parts"].map((t) => h("th", {}, t)))),
       h("tbody", {}, st.order.map((id, i) => {
         const f = fileInfo(id), g = groupOf(id);
         const on = st.on[id];
@@ -3171,30 +3250,42 @@ function viewPartTrace(el) {
           h("td", {}, f ? f.lot : ""),
           h("td", {}, f ? f.tester : ""),
           h("td", {}, f ? f.ids.parts.toLocaleString() : ""),
+          h("td", { class: "small", style: { whiteSpace: "nowrap" } }, idsOf(f)),
           h("td", { class: "small" }, many && g >= 0 ? [badge(`group ${String.fromCharCode(65 + g)}`, "neutral"), " "] : "", f && !f.ids.shared ? badge("no shared parts", "warn") : "", f && !f.ids.shared ? " " : "", shareText(f)));
-
       }))));
-    if (!info) return dupes.replaceChildren();
-    const open = ticked().map(fileInfo).filter((f) => f && f.ids.repeats && !st.last[f.id]);
-    const rounded = ticked().map(fileInfo).filter((f) => f && f.ids.rounded);
+    if (!info) { dupes.replaceChildren(); conflictBox.replaceChildren(); return; }
+    const files = ticked().map(fileInfo).filter(Boolean);
+    const open = files.filter((f) => f.ids.repeats && !st.last[f.id]);
+    const rounded = files.filter((f) => f.ids.rounded);
     const warn = (label, text) => h("div", { class: "row tight small", style: { margin: "8px 0" } }, badge(label, "warn"), text);
+    const ptr = tickedIds().some(([, k]) => /^(tests|w_x_y)/.test(k));
     dupes.replaceChildren(
-      ...(rounded.length ? [warn("IDs may not be unique", `${rounded.map((f) => `${dsName(f.id)}: ${f.ids.rounded.toLocaleString()} parts`).join(" · ")} have an ID above 16,777,216. STDF stores PTR results as 32-bit numbers, so these are rounded and different parts can share an ID. Prefer part text or wafer + X + Y.`)] : []),
-      ...(open.length ? [warn("same part again", `${open.map((f) => `${dsName(f.id)}: ${f.ids.repeats.toLocaleString()} extra tests`).join(" · ")}. Each extra test takes one more row. If the repeats are intended, tick Last test only for that file.${kp.value().startsWith("tests:") ? " With a PTR ID, first check these are repeats and not different parts with the same result, such as X and Y that need offsets: Last test only would merge them." : ""}`)] : []));
+      ...(rounded.length ? [warn("IDs may not be unique", `${rounded.map((f) => `${dsName(f.id)}: ${f.ids.rounded.toLocaleString()} parts`).join(" · ")} have a PTR ID above 16,777,216. STDF stores PTR results as 32-bit numbers, so these are rounded and different parts can share an ID. Keep part text or wafer, X, Y ticked as well.`)] : []),
+      ...(open.length ? [warn("same part again", `${open.map((f) => `${dsName(f.id)}: ${f.ids.repeats.toLocaleString()} extra tests`).join(" · ")}. Each extra test takes one more row. If the repeats are intended, tick Last test only for that file.${ptr ? " With a PTR ID, first check these are repeats and not different parts with the same result, such as X and Y that need offsets: Last test only would merge them." : ""}`)] : []));
+    // tests that share one ID but not another are never merged: warned before the report is written
+    conflictBox.replaceChildren(...(info.conflicts ? [h("div", { class: "small", style: { margin: "8px 0" } },
+      h("div", { class: "row tight" }, badge("IDs disagree", "bad"), `${info.conflicts.toLocaleString()} tests share an ID with a part whose other ID differs, e.g. the same part text with another WXY. They are not merged: each keeps its own row, right after the other, with its ID cells red and an ID check note. Check the tests behind these IDs, or untick the ID you do not trust. When most parts disagree, a setting is usually wrong: X and Y without their offsets, for example (Settings, Check WXY against).`),
+      h("details", {}, h("summary", {}, info.conflicts > info.first_conflicts.length ? `The first ${info.first_conflicts.length}` : "Show them"),
+        h("ul", {}, info.first_conflicts.map((c) => h("li", {}, c.text, " (", [...new Set(c.files)].map(dsName).join(", "), ")")))))] : []));
     const pairs = info.pairs.map((x) => `${dsName(x.a)} and ${dsName(x.b)}: ${x.shared.toLocaleString()}`).join(" · ");
-    note.replaceChildren(info.groups.length ? `${info.in_several.toLocaleString()} parts are in more than one file. Shared parts by pair: ${pairs}.` : "No two open files share a part by this ID. Tick files to report them anyway, or try another ID.");
-    if (other) note.append(" ", h("button", { onclick: () => { kp.set(other.key); detect(); } }, `Use ${other.label}: ${other.found.in_several.toLocaleString()} shared parts`));
+    note.replaceChildren(!tickedIds().length ? "Tick at least one ID." : info.groups.length ? `${info.in_several.toLocaleString()} parts are in more than one file. Shared parts by pair: ${pairs}.` : "No two open files share a part by the ticked IDs. Tick files to report them anyway, or tick another ID.");
   }
-  let other = null, latest = 0;
+  let latest = 0;
   const detect = async () => {
     const mine = ++latest;
-    other = null;
-    if (kp.value() === "tests:") { info = null; note.textContent = "Type the test numbers that identify a part."; draw(); return; }
-    note.textContent = "Looking for shared parts…";
     try {
-      const found = await api("part_trace_detect", { key: kp.value(), filter: scoped(S.filter) });
+      if (!avail) {
+        note.textContent = "Looking for the IDs in the open files…";
+        const all = await api("part_trace_detect", { keys: choices.map(([, k]) => k), filter: scoped(S.filter) });
+        if (mine !== latest) return;
+        avail = Object.fromEntries(choices.map(([id], j) => [id, [all.files.filter((f) => f.ids.has[j]).length, all.files.reduce((a, f) => a + f.ids.with[j], 0)]]));
+      }
+      const keys = tickedIds().map(([, k]) => k);
+      if (!keys.length) { info = null; draw(); note.textContent = "Tick at least one ID."; return; }
+      note.textContent = "Looking for shared parts…";
+      const found = await api("part_trace_detect", { keys, filter: scoped(S.filter) });
       if (mine !== latest) return;
-      info = found;
+      info = Object.assign(found, { keys });
       // a file seen for the first time is ticked when it shares parts; after that the tick is the user's
       for (const f of info.files) {
         if (st.seen.includes(f.id)) continue;
@@ -3202,15 +3293,9 @@ function viewPartTrace(el) {
         st.on[f.id] = groupOf(f.id) >= 0;
       }
       runAudit();
-      if (!info.groups.length && st.order.length > 1) {
-        const alt = await findSharedId(scoped(S.filter));
-        if (mine !== latest) return;
-        other = alt;
-      }
       draw();
     } catch (e) { info = null; note.textContent = ""; toast(e.message, "bad"); draw(); }
   };
-  kp.el.addEventListener("change", detect);
   const startOf = (id) => { const f = fileInfo(id); return f && f.start_t ? f.start_t : Infinity; };
   const sorts = h("div", { class: "row tight" },
     h("button", { title: "Earliest test start (MIR) first", onclick: () => { st.order.sort((a, b) => startOf(a) - startOf(b)); draw(); } }, "Sort by test start time"),
@@ -3225,29 +3310,30 @@ function viewPartTrace(el) {
   const save = async () => {
     const ids = ticked();
     if (!ids.length) return toast("Tick at least one file", "bad");
+    if (!tickedIds().length) return toast("Tick at least one ID", "bad");
     if (!path.value) return toast("Choose where to save the report", "bad");
     st.path = path.value;
     busy("Writing the part trace…");
     try {
-      const r = await api("part_trace_export", { runs: ids.map((id) => ({ ds: id, name: label(id), last_only: !!st.last[id] })), key: kp.value(), filter: scoped(S.filter), path: path.value, ids: idSpec() });
+      const r = await api("part_trace_export", { runs: ids.map((id) => ({ ds: id, name: label(id), last_only: !!st.last[id] })), keys: tickedIds().map(([, k]) => k), filter: scoped(S.filter), path: path.value, ids: idSpec() });
       const s = r.summary;
       const left = s.runs.reduce((a, x) => a + x.left_out, 0);
-      res.replaceChildren(resultLine(`Saved ${r.path}: ${s.parts.toLocaleString()} parts, ${s.in_several.toLocaleString()} in more than one file, ${s.rows.toLocaleString()} rows${left ? `, ${left.toLocaleString()} earlier tests left out` : ""}${s.id_problems ? `, ${s.id_problems.toLocaleString()} ID problems` : ""}`, r.path));
+      res.replaceChildren(resultLine(`Saved ${r.path}: ${s.parts.toLocaleString()} parts, ${s.in_several.toLocaleString()} in more than one file, ${s.rows.toLocaleString()} rows${left ? `, ${left.toLocaleString()} earlier tests left out` : ""}${s.conflicts ? `, ${s.conflicts.toLocaleString()} kept apart because their IDs disagree` : ""}${s.id_problems ? `, ${s.id_problems.toLocaleString()} ID audit problems` : ""}`, r.path));
     } catch (e) { toast(e.message, "bad"); } finally { busy(null); }
   };
   const scope = scoped(S.filter);
   el.append(h("div", { class: "card pad section" },
-    h("div", { class: "row" }, field("Identify parts by", kp.el)),
+    idBox,
     scope ? h("div", { class: "row tight small" }, badge("part filter on", "warn"), `Only parts matching ${scope} are traced.`) : "",
-    sorts, list, dupes, auditBox, note,
+    sorts, list, conflictBox, dupes, auditBox, note,
     h("div", { class: "row", style: { marginTop: "10px" } }, pf, h("button", { class: "primary", onclick: save }, "Export to Excel")),
     res));
   draw();
   detect();
 }
-// ---- Qualification drift: endurance check of one file, 25x loop compare of two, per test and site
+// ---- Drift report (was Qualification drift): endurance check of one file, 25x loop compare of two, per test and site
 function viewQual(el) {
-  el.append(h("h1", {}, "Qualification drift"), h("p", { class: "lead" }, "Mean drift of every test on every site, written to Excel. Each site holds its own looped unit, so each site is its own trial. Drift = ABS(mean1 - mean2) / (USL - LSL)."));
+  el.append(h("h1", {}, "Drift report"), h("p", { class: "lead" }, "Mean drift of every test on every site, written to Excel. Each site holds its own looped unit, so each site is its own trial. Drift = ABS(mean1 - mean2) / (USL - LSL)."));
   const st = S.qual || (S.qual = { e: {}, c: {} });
   const files = () => S.datasets.filter((d) => d.paths && d.paths.length);
   const num = (v, step, w) => h("input", { type: "number", value: v, step: step || 1, min: 0, style: { width: (w || 70) + "px" } });
@@ -3884,7 +3970,7 @@ function viewSettings(el) {
   const ID_ROWS = {
     part_txt: { title: "PRR part text (ULT)", note: "Unit level traceability, the code read from the unit" },
     wxy: { title: "PTR WXY", note: "One test: wafer, X and Y in one result", ctl: () => [field("Test", traced("wxy", cfgIn("wxy", "none"))), field("Check WXY against", select([["raw", "raw W, X, Y tests"], ["die", "die X/Y (offsets added)"]], wxyBasis(), (v) => { S.cfg.wxyBasis = v; idChanged(); saved(); }))] },
-    w_x_y: { title: "PTR wafer + X + Y", note: "A combination: one test each, all must be logged. With Check WXY against die X/Y, the offset tests are part of it", ctl: () => [field("Wafer test", traced("w", inp("w", "none"))), field("X test", traced("x", inp("x", "X"))), field("Y test", traced("y", inp("y", "Y")))] },
+    w_x_y: { title: "PTR wafer + X + Y", note: "A combination: one test each, all must be logged. Written as W12X-2Y25; with Check WXY against die X/Y, X and Y are the die X and Y (the offset tests applied)", ctl: () => [field("Wafer test", traced("w", inp("w", "none"))), field("X test", traced("x", inp("x", "X"))), field("Y test", traced("y", inp("y", "Y")))] },
     part_id: { title: "PRR part ID", note: "Often restarts per file: use within one lot only" },
     wafer_xy: { title: "PRR wafer + X/Y", note: "Needs X/Y in the PRR" },
     xy: { title: "PRR X/Y only", note: "Same die position, on any wafer" },
@@ -3919,10 +4005,10 @@ function viewSettings(el) {
   };
   el.append(
     sec("Opening files", null, h("div", { class: "controls" }, field("Order of opened files", sort), field("Retested parts", dedup), field("Threads for loading files", h("span", { class: "row tight" }, threads, threadHint)), h("label", { class: "chk" }, merge, "Combine the files I open into one dataset"))),
-    sec("Part identification", "How the same physical part is found across files, in this order. The first usable ID is the default on every page, and Part trace tries part text, WXY and wafer + X + Y in this order to find files that share parts. Leave a test blank if the program does not log it, or untick trace to leave it out of tracing only.",
+    sec("Part identification", "How the same physical part is found across files, in this order. The first usable ID is the default on pages that match by one ID. The Part trace report uses part text, WXY and wafer, X, Y together: each one the files log is ticked, and a part is found by any of them. Leave a test blank if the program does not log it, or untick trace to leave it out of tracing only.",
       idBox,
       h("label", { class: "chk", style: { marginTop: "10px" }, title: "Identity tests differ by position or board only, so they would top marker rankings and first-fail picks for no physical reason" }, ignore, "Ignore the identification tests in analytics (rankings, signatures, first fails)")),
-    sec("Die coordinates from tests", "Offsets added to the X and Y tests rebuild die X/Y for Wafer maps, Bad candidates and the Part datalog. They do not change how parts are identified.",
+    sec("Die coordinates from tests", "Offsets added to the X and Y tests rebuild die X/Y for Wafer maps, Bad candidates and the Part datalog. They change how parts are identified only when Check WXY against is die X/Y: then wafer, X, Y is the die position.",
       h("div", { class: "controls" }, field("X offset test", traced("ox", inp("ox", "none"))), field("Y offset test", traced("oy", inp("oy", "none"))), field("Offset", omode), flip("fx", "flip X"), flip("fy", "flip Y"))),
     sec("Other trace fields", "Shown in the part trace card and the parts search of Retest trace.",
       h("div", { class: "controls" }, field("Test program revision test", traced("rev", cfgIn("rev", "none"))), field("Loadboard test", traced("lb", lb))),
@@ -4067,7 +4153,7 @@ document.getElementById("rename").addEventListener("click", () => S.datasets.len
 }
 document.getElementById("open").addEventListener("click", openFiles);
 document.getElementById("homebtn").addEventListener("click", () => go("home"));
-window.addEventListener("hashchange", () => { const v = location.hash.slice(1); if (VIEWS[v] && v !== S.view) go(v); });
+window.addEventListener("hashchange", () => { const v = location.hash.slice(1), w = viewOf(v); if (w && (w[0] !== S.view || (w[1] && w[1] !== (S.tabs || {})[w[0]]))) go(v); });
 window.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") { e.preventDefault(); openFiles(); } });
 // live connection: keeps the desktop app running while this window is open,
 // and receives files opened from Explorer while the app is running
@@ -4094,8 +4180,8 @@ SC.initTheme();
   // a saved loadboard test other than the default is set again on the server
   if (S.lbTest && S.lbTest !== "5100") api("loadboard", { test: S.lbTest }).catch(() => {});
   try { await refreshDatasets(); } catch (e) { main.append(h("div", { class: "err" }, String(e))); }
-  S.view = VIEWS[v] && (S.datasets.length || VIEWS[v].always) ? v : S.datasets.length ? "overview" : "home";
-  go(S.view);
+  const w = viewOf(v);
+  go(w && (S.datasets.length || VIEWS[w[0]].always) ? v : S.datasets.length ? "overview" : "home");
   connectEvents();
   await heartbeat();
   setInterval(heartbeat, 5000);

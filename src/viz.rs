@@ -805,6 +805,77 @@ pub fn bin_pareto(bins: &[BinCount], hard: bool) -> Value {
     json!({"data": data, "layout": l})
 }
 
+/// Bins as grouped bars, one bar per site: the % of that site's parts in each bin, so sites
+/// with different part counts compare. Bins in the order of the whole selection.
+pub fn bin_pareto_by_site(ds: &Dataset, rows: &[usize], hard: bool) -> Value {
+    use crate::analysis::summary::bins;
+    let all = bins(ds, rows, hard);
+    let xs: Vec<String> = all
+        .iter()
+        .map(|b| {
+            if b.name.is_empty() {
+                format!("{}", b.bin)
+            } else {
+                format!("{} {}", b.bin, b.name)
+            }
+        })
+        .collect();
+    let data: Vec<Value> = ds
+        .group_by(rows, "site")
+        .into_iter()
+        .enumerate()
+        .map(|(i, (site, r))| {
+            let mine = bins(ds, &r, hard);
+            let of = |bin: u16| mine.iter().find(|b| b.bin == bin);
+            let pct: Vec<f64> = all.iter().map(|b| of(b.bin).map_or(0.0, |m| m.pct)).collect();
+            let n: Vec<usize> = all.iter().map(|b| of(b.bin).map_or(0, |m| m.count)).collect();
+            json!({"type":"bar","name":format!("site {site}"),"x":xs,"y":pct,"customdata":n,"marker":{"color":slot(i)},
+                "hovertemplate":format!("site {site}<br>%{{x}}<br>%{{y:.2f}}% of the site's parts (%{{customdata}})<extra></extra>")})
+        })
+        .collect();
+    let mut l = base_layout(
+        if hard {
+            "Hard bins by site"
+        } else {
+            "Soft bins by site"
+        },
+        "",
+        "% of the site's parts",
+    );
+    l["xaxis"]["type"] = json!("category");
+    l["barmode"] = json!("group");
+    json!({"data": data, "layout": l})
+}
+
+/// Yield per group of `field` (wafer, file), one bar per site.
+pub fn yield_bar_by_site(ds: &Dataset, rows: &[usize], title: &str, field: &str) -> Value {
+    use crate::analysis::summary::yield_by;
+    let groups: Vec<String> = yield_by(ds, rows, field)
+        .into_iter()
+        .map(|g| g.group)
+        .collect();
+    let mut low: f64 = 100.0;
+    let data: Vec<Value> = ds
+        .group_by(rows, "site")
+        .into_iter()
+        .enumerate()
+        .map(|(i, (site, r))| {
+            let ys = yield_by(ds, &r, field);
+            let of = |g: &str| ys.iter().find(|y| y.group == g);
+            let y: Vec<Value> = groups.iter().map(|g| of(g).map_or(Value::Null, |v| json!(v.yield_pct))).collect();
+            low = ys.iter().map(|v| v.yield_pct).fold(low, f64::min);
+            let cd: Vec<Vec<usize>> = groups.iter().map(|g| of(g).map_or(vec![0, 0], |v| vec![v.pass, v.n])).collect();
+            json!({"type":"bar","name":format!("site {site}"),"x":groups,"y":y,"customdata":cd,"marker":{"color":slot(i)},
+                "hovertemplate":format!("site {site}<br>{field} %{{x}}<br>yield %{{y:.2f}}%<br>%{{customdata[0]}} / %{{customdata[1]}}<extra></extra>")})
+        })
+        .collect();
+    let mut l = base_layout(title, field, "yield %");
+    l["xaxis"]["type"] = json!("category");
+    l["barmode"] = json!("group");
+    l["yaxis"]["range"] = json!([(low - 10.0).max(0.0).floor(), 102]);
+    json!({"data": data, "layout": l})
+}
+
 pub fn yield_bar(rows: &[GroupYield], title: &str, field: &str) -> Value {
     let xs: Vec<String> = rows.iter().map(|r| r.group.clone()).collect();
     let data = vec![
